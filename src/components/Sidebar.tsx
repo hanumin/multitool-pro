@@ -33,7 +33,7 @@ export default function Sidebar({ activeModule, onModuleChange, collapsed, onTog
             <h1 className="text-sm font-semibold tracking-tight truncate" style={{ color: 'var(--fg)' }}>
               Bảng điều khiển
             </h1>
-            <p className="text-[9px] truncate" style={{ color: 'var(--fg-muted)' }}>v1.9.2</p>
+            <p className="text-[9px] truncate" style={{ color: 'var(--fg-muted)' }}>v1.9.3</p>
           </div>
         )}
         {/* Toggle collapse button */}

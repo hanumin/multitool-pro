@@ -98,7 +98,7 @@ function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [statusText, setStatusText] = useState('Sẵn sàng')
   const [autostart, setAutostart] = useState(false)
-  const [appVersion, setAppVersion] = useState('1.9.2')
+  const [appVersion, setAppVersion] = useState('1.9.3')
   const [changelogOpen, setChangelogOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsRefresh, setSettingsRefresh] = useState(0)

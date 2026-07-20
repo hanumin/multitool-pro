@@ -1840,6 +1840,7 @@ DEFAULT_PRINTER_SETTINGS = {
     "reminder_enabled": True,
     "last_print_date": None,
     "excluded_printers": [],            "page_count": {},  # {printer_name: total_pages} — nhập thủ công hoặc auto-increment
+            "page_count_timestamp": {},  # {printer_name: "dd/mm/yy HH:MM:SS"} — thời gian cập nhật cuối
 }
 
 def load_printer_settings():
@@ -1953,11 +1954,16 @@ def api_printers():
         for p in win32print.EnumPrinters(flags):
             name = p[2]
             pr_info = get_printer_info(name)
+            printer_info_driver = _get_cached_printer_info(name, pr_info.get('driver', ''))
             printers.append({
                 'name': name,
                 'status': pr_info['status'],
                 'is_default': False,  # sẽ gán sau
                 'is_laser': is_laser_printer(name),
+                'driver_type': printer_info_driver.get('driver_type', 'unknown'),
+                'driver_brand': printer_info_driver.get('brand', ''),
+                'tracking_method': printer_info_driver.get('tracking_method', 'eventlog'),
+                'supports_eventlog': printer_info_driver.get('supports_eventlog', True),
                 'jobs': pr_info['jobs'],
                 'driver': pr_info['driver'],
                 'port': pr_info['port'],
@@ -2096,6 +2102,11 @@ def api_printer_test(name):
 _eventlog_cache = {}
 _eventlog_cache_lock = threading.Lock()
 
+# ─── Printer driver type cache (sống 5 phút) ─────────────────────
+_printer_info_cache = {}
+_printer_info_cache_lock = threading.Lock()
+PRINTER_INFO_CACHE_TTL = 300  # 5 phút
+
 PRINTER_STATS_FILE = str(CONFIG_DIR / "printer_statistics.json")
 # Global state: lưu danh sách job của lần quét trước
 # Dùng để so sánh phát hiện job mới hoàn thành
@@ -2121,6 +2132,78 @@ def is_laser_printer(name):
     Dùng để bỏ qua reminder chống khô mực cho máy laser.
     """
     return 'laser' in name.lower()
+
+# ─── Printer Driver Type Detection ──────────────────────────────
+# GDI (host-based) printers like Brother HL-2240D often don't
+# generate Event ID 307 events. We need to detect this and use
+# alternative tracking methods (WMI, Get-PrintJob).
+_GDI_DRIVER_KEYWORDS = [
+    'gdi', 'host based', 'universal printing', 'class driver',
+    'brother hl-', 'brother dcp-', 'brother mfc-',  # Common Brother GDI laser
+    'samsung ml-', 'samsung scx-',  # Samsung GDI
+]
+
+def _detect_printer_info(printer_name=None, driver_name=None):
+    """
+    Phát hiện loại driver máy in và brand.
+    
+    Returns:
+        dict: {
+            "driver_type": "gdi" | "pcl" | "postscript" | "standard" | "unknown",
+            "brand": str (tên hãng nếu nhận dạng được),
+            "supports_eventlog": bool (True nếu máy in có thể tạo Event ID 307),
+            "tracking_method": "eventlog" | "wmi" | "manual" (phương pháp lý tưởng)
+        }
+    """
+    result = {
+        "driver_type": "unknown",
+        "brand": "",
+        "supports_eventlog": True,
+        "tracking_method": "eventlog"
+    }
+    
+    name_lower = (printer_name or "").lower()
+    driver_lower = (driver_name or "").lower()
+    combined = name_lower + " " + driver_lower
+    
+    # === Detect brand ===
+    brand_map = {
+        'brother': 'Brother', 'epson': 'EPSON', 'hp ': 'HP', 'hewlett-packard': 'HP',
+        'canon': 'Canon', 'samsung': 'Samsung', 'kyocera': 'Kyocera',
+        'ricoh': 'Ricoh', 'xerox': 'Xerox', 'lexmark': 'Lexmark',
+        'dell': 'Dell', 'fujitsu': 'Fujitsu', 'panasonic': 'Panasonic',
+        'oki': 'OKI', 'sharp': 'Sharp', 'toshiba': 'Toshiba',
+    }
+    for kw, brand in brand_map.items():
+        if kw in combined:
+            result["brand"] = brand
+            break
+    
+    # === Detect driver type ===
+    # GDI / host-based: cheap printers, rasterizes on host
+    is_gdi = any(kw in combined for kw in _GDI_DRIVER_KEYWORDS)
+    
+    if is_gdi:
+        result["driver_type"] = "gdi"
+        # GDI printers rarely generate Event ID 307
+        result["supports_eventlog"] = False
+        result["tracking_method"] = "wmi"
+    elif 'pcl' in combined or 'pcl6' in combined or 'pcl-6' in combined:
+        result["driver_type"] = "pcl"
+    elif 'postscript' in combined or 'ps ' in combined or '_ps' in combined:
+        result["driver_type"] = "postscript"
+    else:
+        result["driver_type"] = "standard"
+    
+    # Specific overrides based on known models
+    # Brother HL-2240D is GDI laser, does NOT generate Event ID 307
+    if 'hl-2240' in combined:
+        result["driver_type"] = "gdi"
+        result["supports_eventlog"] = False
+        result["tracking_method"] = "wmi"
+        result["brand"] = "Brother"
+    
+    return result
 
 def get_printing_activity():
     """
@@ -2918,14 +3001,78 @@ def api_printer_wmi_status():
 #   3. Manual entry (người dùng nhập thủ công trong settings) ← KHUYẾN NGHỊ
 # ═══════════════════════════════════════════════════════════════
 
+def _get_cached_printer_info(printer_name, driver_name=""):
+    """Lấy thông tin driver máy in (có cache 5 phút)"""
+    with _printer_info_cache_lock:
+        cached = _printer_info_cache.get(printer_name)
+        if cached and (time.time() - cached['cached_at']) < PRINTER_INFO_CACHE_TTL:
+            return cached['info']
+    
+    info = _detect_printer_info(printer_name, driver_name)
+    with _printer_info_cache_lock:
+        _printer_info_cache[printer_name] = {'info': info, 'cached_at': time.time()}
+    return info
+
+def _query_active_print_jobs(printer_name):
+    """
+    Đếm số job đang active trong spooler queue.
+    Dùng cho real-time detection (auto_increment), KHÔNG phải lịch sử.
+    
+    Lưu ý: Chỉ đếm jobs hiện tại, không trả về lịch sử trang đã in.
+    Dữ liệu lịch sử chỉ có từ EventLog (cho PCL/PostScript) hoặc manual count.
+    
+    Returns:
+        int (số jobs trong queue) hoặc None nếu lỗi
+    """
+    try:
+        ps_cmd = (
+            f'Get-PrintJob -PrinterName "{printer_name}" -ErrorAction SilentlyContinue | '
+            'Measure-Object | Select-Object -ExpandProperty Count'
+        )
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-Command', ps_cmd],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            count = int(result.stdout.strip())
+            if count > 0:
+                debug_log(f"Active jobs for {printer_name}: {count} (Get-PrintJob)")
+            return count
+    except Exception as e:
+        debug_log(f"Get-PrintJob error for {printer_name}: {e}")
+    
+    try:
+        try:
+            pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
+        except Exception:
+            try:
+                pythoncom.CoInitialize()
+            except Exception:
+                pass
+        
+        import win32com.client
+        wmi = win32com.client.Dispatch("WbemScripting.SWbemLocator").ConnectServer(".", "root\\CIMV2")
+        safe_name = printer_name.replace("'", "''")
+        query = f"SELECT * FROM Win32_PrintJob WHERE Name LIKE '%{safe_name}%'"
+        jobs = wmi.ExecQuery(query)
+        count = len(jobs)
+        if count > 0:
+            debug_log(f"Active jobs for {printer_name}: {count} (Win32_PrintJob)")
+        return count
+    except Exception as e:
+        debug_log(f"Win32_PrintJob error for {printer_name}: {e}")
+    
+    return None
+
 def query_printer_page_count_eventlogs(printer_name, port_name):
     """
     Đọc tổng số trang từ Event Logs Windows (PrintService/Operational).
     
-    Cơ chế Hybrid 3 lớp:
-    1. PrinterMonitor C# module (nếu đã compile) — nhanh nhất, chính xác nhất
-    2. PowerShell EventLog (Properties[7]) — fallback luôn available
-    3. Cache 30s TTL — tránh query lại quá thường xuyên
+    Cơ chế Hybrid 4 lớp:
+    1. PrinterMonitor C#/PS module (ưu tiên cao nhất)
+    2. PowerShell EventLog (Properties[7]) — dành cho PCL/PostScript printers (EPSON, HP...)
+    3. WMI + Get-PrintJob — dành cho GDI/host-based printers (Brother HL-2240D...)
+    4. Cache 30s TTL
     
     Args:
         printer_name: Tên máy in (VD: "EPSON L3210 Series")
@@ -2933,6 +3080,11 @@ def query_printer_page_count_eventlogs(printer_name, port_name):
     Returns:
         int (số trang) hoặc None nếu không đọc được
     """
+    # Lớp 0: Phát hiện loại driver printer
+    # GDI printers (Brother HL-2240D) often don't generate Event ID 307
+    printer_info = _get_cached_printer_info(printer_name)
+    is_gdi = (printer_info.get('driver_type') == 'gdi')
+    
     # Lớp 1: PrinterMonitor C# module (ưu tiên cao nhất, nhanh nhất)
     try:
         cs_result = query_printer_monitor_cs(printer_name, "query", timeout=10)
@@ -2953,52 +3105,66 @@ def query_printer_page_count_eventlogs(printer_name, port_name):
             debug_log(f"EventLog count CACHED for {printer_name}: {cached['count']}")
             return cached['count']
     
-    # Lớp 3: PowerShell EventLog trực tiếp (Properties[7])
+    # Lớp 3: PowerShell EventLog (chỉ cho PCL/PostScript printers, 
+    # GDI printers thường không tạo Event ID 307)
+    if not is_gdi:
+        try:
+            ps_cmd = (
+                'Get-WinEvent -FilterHashtable @{LogName="Microsoft-Windows-PrintService/Operational";'
+                'ID=307;StartTime=(Get-Date).AddDays(-30)} -ErrorAction SilentlyContinue | '
+                f'Where-Object {{ $_.Properties[4].Value -like "*{printer_name}*" }} | '
+                'Select-Object @{N="Pages";E={$_.Properties[7].Value}} | '
+                'Measure-Object -Property Pages -Sum | Select-Object -ExpandProperty Sum'
+            )
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', ps_cmd],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                count = int(float(result.stdout.strip()))
+                if count > 0:
+                    with _eventlog_cache_lock:
+                        _eventlog_cache[printer_name] = {'count': count, 'cached_at': time.time()}
+                    debug_log(f"EventLog count for {printer_name}: {count} (Properties[7], 30 days)")
+                    return count
+            
+            # Fallback: Properties[5] cho Windows cũ hơn
+            debug_log(f"Properties[7]=0, trying Properties[5] fallback...")
+            ps_cmd_fb = (
+                'Get-WinEvent -FilterHashtable @{LogName="Microsoft-Windows-PrintService/Operational";'
+                'ID=307;StartTime=(Get-Date).AddDays(-30)} -ErrorAction SilentlyContinue | '
+                f'Where-Object {{ $_.Properties[4].Value -like "*{printer_name}*" }} | '
+                'Select-Object @{N="Pages";E={$_.Properties[5].Value}} | '
+                'Measure-Object -Property Pages -Sum | Select-Object -ExpandProperty Sum'
+            )
+            result2 = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', ps_cmd_fb],
+                capture_output=True, text=True, timeout=10
+            )
+            if result2.returncode == 0 and result2.stdout.strip():
+                count = int(float(result2.stdout.strip()))
+                if count > 0:
+                    with _eventlog_cache_lock:
+                        _eventlog_cache[printer_name] = {'count': count, 'cached_at': time.time()}
+                    debug_log(f"EventLog count for {printer_name}: {count} (Properties[5] fallback, 30 days)")
+                    return count
+        except Exception as e:
+            debug_log(f"PowerShell EventLog query error: {e}")
+    else:
+        debug_log(f"Printer {printer_name} is GDI (host-based) — EventLog typically empty, using WMI fallback...")
     
-    # Lớp 2: PowerShell EventLog với Properties[7] (TotalPages, Windows 10/11)
-    try:
-        ps_cmd = (
-            'Get-WinEvent -FilterHashtable @{LogName="Microsoft-Windows-PrintService/Operational";'
-            'ID=307;StartTime=(Get-Date).AddDays(-30)} -ErrorAction SilentlyContinue | '
-            f'Where-Object {{ $_.Properties[4].Value -like "*{printer_name}*" }} | '
-            'Select-Object @{N="Pages";E={$_.Properties[7].Value}} | '
-            'Measure-Object -Property Pages -Sum | Select-Object -ExpandProperty Sum'
-        )
-        result = subprocess.run(
-            ['powershell', '-NoProfile', '-Command', ps_cmd],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            count = int(float(result.stdout.strip()))
-            if count > 0:
-                with _eventlog_cache_lock:
-                    _eventlog_cache[printer_name] = {'count': count, 'cached_at': time.time()}
-                debug_log(f"EventLog count for {printer_name}: {count} (Properties[7], 30 days)")
-                return count
-        
-        # Fallback: Properties[5] cho Windows cũ hơn (thường là Size, không phải pages)
-        debug_log(f"Properties[7]=0, trying Properties[5] fallback...")
-        ps_cmd_fb = (
-            'Get-WinEvent -FilterHashtable @{LogName="Microsoft-Windows-PrintService/Operational";'
-            'ID=307;StartTime=(Get-Date).AddDays(-30)} -ErrorAction SilentlyContinue | '
-            f'Where-Object {{ $_.Properties[4].Value -like "*{printer_name}*" }} | '
-            'Select-Object @{N="Pages";E={$_.Properties[5].Value}} | '
-            'Measure-Object -Property Pages -Sum | Select-Object -ExpandProperty Sum'
-        )
-        result2 = subprocess.run(
-            ['powershell', '-NoProfile', '-Command', ps_cmd_fb],
-            capture_output=True, text=True, timeout=10
-        )
-        if result2.returncode == 0 and result2.stdout.strip():
-            count = int(float(result2.stdout.strip()))
-            if count > 0:
-                with _eventlog_cache_lock:
-                    _eventlog_cache[printer_name] = {'count': count, 'cached_at': time.time()}
-                debug_log(f"EventLog count for {printer_name}: {count} (Properties[5] fallback, 30 days)")
-                return count
-    except Exception as e:
-        debug_log(f"PowerShell EventLog query error: {e}")
-    
+    # Lớp 4: WMI Get-PrintJob (chỉ cho real-time detection, không cho lịch sử)
+    # GHI CHÚ QUAN TRỌNG: Get-PrintJob chỉ trả về jobs ĐANG trong queue,
+    # không trả về lịch sử trang đã in. Với GDI printers (Brother HL-2240D),
+    # không có cách nào để đọc lịch sử hardware page counter từ Windows API.
+    # Giải pháp: dùng manual count (user nhập) + auto_increment (khi phát hiện in xong).
+    if is_gdi:
+        # GDI printers: không có cách đọc lịch sử → trả về None
+        # App sẽ fallback về manual count trong api_printer_page_count()
+        debug_log(f"GDI printer {printer_name}: EventLog không hoạt động, dùng manual count + auto_increment")
+    else:
+        # Non-GDI printers: EventLog đã query, nếu vẫn không có → thử WMI
+        pass
     return None
 
 @app.route("/api/printer/page-count")
@@ -3022,27 +3188,46 @@ def api_printer_page_count():
         printer_name = settings.get('selected_printer', '')
     
     if not printer_name:
-        return jsonify({'page_count': None, 'source': None, 'error': 'Chưa chọn máy in'})
+        return jsonify({'page_count': None, 'source': None, 'error': 'Chưa chọn máy in', 'driver_type': None, 'tracking_method': None})
     
     # 1. EventLogs (PowerShell) — 30 ngày gần nhất, đã cache 30s
+    now_str = datetime.now().strftime('%d/%m/%y %H:%M:%S')
     eventlog_count = query_printer_page_count_eventlogs(printer_name, port_name)
     
-    # 2. Manual count từ settings (lifetime total do user nhập hoặc auto-increment)
+    # 2. Lấy settings
     settings = load_printer_settings()
     manual_count = settings.get('page_count', {}).get(printer_name, 0) or 0
+    page_count_timestamps = settings.get('page_count_timestamp', {}) or {}
     
-    # Kết hợp: EventLog (30 ngày) + manual (lifetime) = ước lượng tốt nhất
-    # Nếu EventLog có data, dùng nó + manual để có lifetime gần đúng
+    # 2b. Lấy driver type info
+    printer_info = _get_cached_printer_info(printer_name)
+    driver_type = printer_info.get('driver_type', 'unknown')
+    tracking_method = printer_info.get('tracking_method', 'eventlog')
+    
+    # 3. Kết hợp: EventLog (30 ngày gần nhất, persistent) + manual (lifetime baseline)
+    #    - Nếu EventLog có data: dùng max(EventLog, manual) — ưu tiên số cao hơn
+    #      (manual là lifetime trước khi bật log, EventLog là dữ liệu thực tế)
+    #    - Khi app tắt, máy in vẫn ghi EventLog → khi mở lại app query được ngay
+    #    - Ví dụ: manual=1004, EventLog=2 → hiện 1004 (giữ manual vì cao hơn)
+    #             in thêm 10 trang → EventLog=12, manual=1004 → hiện 1004
+    #             in thêm 2000 trang → EventLog=2002, manual=1004 → hiện 2002
     if eventlog_count is not None and eventlog_count > 0:
-        # Ưu tiên EventLog vì chính xác hơn cho 30 ngày gần
-        # Nếu manual lớn hơn, có thể user đã nhập lifetime → giữ nguyên
+        # Cập nhật timestamp
+        page_count_timestamps[printer_name] = now_str
+        settings['page_count_timestamp'] = page_count_timestamps
+        save_printer_settings(settings)
+        
+        # Lấy số cao nhất: EventLog (thực tế) hoặc manual (lifetime)
         if manual_count > eventlog_count:
             total = manual_count
             source = 'manual'
         else:
             total = eventlog_count
             source = 'eventlog'
-        return jsonify({'page_count': total, 'source': source, 'printer': printer_name})
+        
+        debug_log(f"Page count for {printer_name}: {total} ({source}, EventLog={eventlog_count}, manual={manual_count}, updated {now_str})")
+        return jsonify({'page_count': total, 'source': source, 'printer': printer_name,
+                        'updated_at': now_str, 'eventlog_count': eventlog_count, 'manual_count': manual_count})
     
     # 2. WMI JobCountSinceLastReset (per-session counter)
     wmi_count = 0
@@ -3078,9 +3263,16 @@ def api_printer_page_count():
     if wmi_count > 0 or manual_count > 0:
         total = manual_count + wmi_count
         source = 'combined' if (wmi_count > 0 and manual_count > 0) else ('wmi' if wmi_count > 0 else 'manual')
-        return jsonify({'page_count': total, 'source': source, 'printer': printer_name})
+        return jsonify({
+            'page_count': total,
+            'source': source,
+            'printer': printer_name,
+            'driver_type': driver_type,
+            'tracking_method': tracking_method,
+            'updated_at': now_str
+        })
     
-    return jsonify({'page_count': None, 'source': None, 'printer': printer_name})
+    return jsonify({'page_count': None, 'source': None, 'printer': printer_name, 'driver_type': driver_type, 'tracking_method': tracking_method})
 
 # ═══════════════════════════════════════════════════════════════
 # IMPORT / EXPORT — Sao lưu và khôi phục dữ liệu

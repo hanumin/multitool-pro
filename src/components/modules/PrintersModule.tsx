@@ -836,6 +836,13 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                             LASER
                           </span>
                         )}
+                        {pr.driver_type === 'gdi' && (
+                          <span title="GDI (host-based): EventLog không hoạt động, dùng manual count"
+                            className="text-[8px] font-bold px-1.5 py-0.5 rounded"
+                            style={{ backgroundColor: '#ef444415', color: '#f87171', border: '1px solid #ef444425' }}>
+                            GDI
+                          </span>
+                        )}
                         {isTracking && (
                           <span className="text-[8px] font-bold px-1.5 py-0.5 rounded"
                             style={{ backgroundColor: '#22c55e15', color: '#4ade80', border: '1px solid #22c55e25' }}>
@@ -927,6 +934,24 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                             </div>
                           )}
                         </>
+                      )}
+                      {/* Driver type info */}
+                      {pr.driver_type && pr.driver_type !== 'standard' && (
+                        <div className="p-2 rounded-lg" style={{ backgroundColor: 'var(--input-bg)' }}>
+                          <div className="text-[8px] uppercase tracking-wider mb-0.5" style={{ color: 'var(--fg-dim)' }}>Loại driver</div>
+                          <div className="font-semibold flex items-center gap-1.5" style={{ color: pr.driver_type === 'gdi' ? '#f87171' : '#fbbf24' }}>
+                            {pr.driver_type === 'gdi' ? (
+                              <><span>🔴</span> GDI (Host-based)</>
+                            ) : (
+                              <><span>🟡</span> {pr.driver_type.toUpperCase()}</>
+                            )}
+                          </div>
+                          {pr.driver_type === 'gdi' && (
+                            <div className="text-[8px] mt-1" style={{ color: 'var(--fg-dim)' }}>
+                              EventLog không hoạt động. Sử dụng manual count + auto-increment.
+                            </div>
+                          )}
+                        </div>
                       )}
                     </div>
 

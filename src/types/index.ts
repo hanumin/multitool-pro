@@ -20,6 +20,10 @@ export interface Printer {
   status: string
   is_default: boolean
   is_laser?: boolean
+  driver_type?: string      // "gdi" | "pcl" | "postscript" | "standard" | "unknown"
+  driver_brand?: string    // "Brother" | "EPSON" | "HP" | ...
+  tracking_method?: string // "eventlog" | "wmi" | "manual"
+  supports_eventlog?: boolean
   jobs: number
   driver: string
   port: string
