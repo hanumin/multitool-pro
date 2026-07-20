@@ -1743,6 +1743,79 @@ def api_db_export():
 #   - printer_statistics.json: Thống kê in ấn (số lần, gần đây)
 # ═══════════════════════════════════════════════════════════════
 
+# ─── C# / PowerShell Printer Monitor Module ─────────────────
+# PrinterMonitor.exe is a .NET 8 console app that reads Windows
+# PrintService EventLog (Event ID 307) and returns JSON.
+# If not compiled, falls back to PrinterMonitor.ps1 (PowerShell).
+PRINTER_MONITOR_DIR = str(BASE_DIR / "printer-monitor")
+PRINTER_MONITOR_EXE = str(BASE_DIR / "printer-monitor" / "bin" / "Release" / "net8.0" / "win-x64" / "publish" / "PrinterMonitor.exe")
+PRINTER_MONITOR_PS1 = str(BASE_DIR / "printer-monitor" / "PrinterMonitor.ps1")
+
+def query_printer_monitor_cs(printer_name, action="query", timeout=15):
+    """
+    Gọi PrinterMonitor C# module hoặc PowerShell fallback.
+    
+    Args:
+        printer_name: Tên máy in (hoặc "" cho tất cả)
+        action: "query" | "stats" | "listen" | "install"
+        timeout: Timeout giây
+    Returns:
+        dict kết quả, hoặc None nếu cả 2 đều thất bại
+    """
+    import json as json_mod
+    
+    # Ưu tiên 1: C# exe (nếu đã compile)
+    if os.path.exists(PRINTER_MONITOR_EXE):
+        try:
+            cmd = [PRINTER_MONITOR_EXE, action]
+            if printer_name and action in ("query", "listen"):
+                cmd.append(printer_name)
+            if action == "listen":
+                cmd.append("30")
+            
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                data = json_mod.loads(result.stdout.strip())
+                debug_log(f"PrinterMonitor C# [{action}] for {printer_name}: OK")
+                return data
+            else:
+                debug_log(f"PrinterMonitor C# [{action}] failed: {result.stderr[:100]}")
+        except Exception as e:
+            debug_log(f"PrinterMonitor C# [{action}] error: {e}")
+    
+    # Ưu tiên 2: PowerShell script (luôn available trên Windows)
+    if os.path.exists(PRINTER_MONITOR_PS1):
+        try:
+            ps_args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", PRINTER_MONITOR_PS1,
+                       "-Command", action]
+            if printer_name:
+                ps_args += ["-PrinterName", printer_name]
+            if action == "listen":
+                ps_args += ["-Duration", "30"]
+            
+            result = subprocess.run(
+                ["powershell"] + ps_args,
+                capture_output=True, text=True, timeout=timeout
+            )
+            if result.stdout.strip():
+                # PowerShell may output multiple JSON lines; take the last one
+                lines = [l.strip() for l in result.stdout.split('\n') if l.strip()]
+                for line in reversed(lines):
+                    try:
+                        data = json_mod.loads(line)
+                        debug_log(f"PrinterMonitor PS1 [{action}] for {printer_name}: OK")
+                        return data
+                    except json_mod.JSONDecodeError:
+                        continue
+            else:
+                debug_log(f"PrinterMonitor PS1 [{action}] no output")
+        except Exception as e:
+            debug_log(f"PrinterMonitor PS1 [{action}] error: {e}")
+    
+    return None
+
 # Đường dẫn file dữ liệu — tất cả đều trong %APPDATA%/multitool-pro/
 PRINTER_LOG_FILE = str(CONFIG_DIR / "print_log.json")           # Log in cuối (ít dùng)
 PRINTER_HISTORY_FILE = str(CONFIG_DIR / "print_history.json")   # Lịch sử in (dùng chính)
@@ -1766,7 +1839,7 @@ DEFAULT_PRINTER_SETTINGS = {
     "remind_minutes": 15,
     "reminder_enabled": True,
     "last_print_date": None,
-    "excluded_printers": [],
+    "excluded_printers": [],            "page_count": {},  # {printer_name: total_pages} — nhập thủ công hoặc auto-increment
 }
 
 def load_printer_settings():
@@ -2018,10 +2091,15 @@ def api_printer_test(name):
 #   - Chỉ lưu được SỐ LẦN in, không phải SỐ TRANG (không đọc được từ USB)
 # ═══════════════════════════════════════════════════════════════
 
+# Cache cho EventLog page count — tránh query PowerShell mỗi 5 giây
+# Format: {printer_name: {count: int, cached_at: float}}
+_eventlog_cache = {}
+_eventlog_cache_lock = threading.Lock()
+
 PRINTER_STATS_FILE = str(CONFIG_DIR / "printer_statistics.json")
 # Global state: lưu danh sách job của lần quét trước
 # Dùng để so sánh phát hiện job mới hoàn thành
-# Format: {printer_name: {job_id: {status: int, doc: string}}}
+# Format: {printer_name: {job_id: {status: int, doc: string, total_pages: int}}}
 _printer_prev_jobs = {}
 
 # Global state: track last known JobCountSinceLastReset per printer
@@ -2114,13 +2192,15 @@ def detect_completed_print_jobs():
             try:
                 handle = win32print.OpenPrinter(name)
                 try:
-                    jobs = win32print.EnumJobs(handle, 0, 100, 1)
+                    jobs = win32print.EnumJobs(handle, 0, 100, 2)  # Level 2 = JOB_INFO_2 (có TotalPages)
                     current_jobs[name] = {}
                     for j in jobs:
                         jid = j.get('JobId', 0)
                         status = j.get('Status', 0)
                         doc = j.get('pDocument', '')
-                        current_jobs[name][jid] = {'status': status, 'doc': doc}
+                        # Lấy TotalPages từ JOB_INFO_2
+                        pages = j.get('TotalPages', 0) or 0
+                        current_jobs[name][jid] = {'status': status, 'doc': doc, 'total_pages': pages}
                 finally:
                     win32print.ClosePrinter(handle)
             except Exception:
@@ -2132,10 +2212,13 @@ def detect_completed_print_jobs():
                 new_jobs = current_jobs.get(name, {})
                 for jid, old_data in old_jobs.items():
                     if jid not in new_jobs:
+                        # Ghi nhận TotalPages từ job đã hoàn thành
+                        old_pages = old_data.get('total_pages', 0) or 0
                         results.append({
                             'printer': name,
                             'document': old_data.get('doc', ''),
                             'job_id': jid,
+                            'total_pages': old_pages,
                         })
             _printer_prev_jobs = current_jobs  # Cập nhật snapshot
         
@@ -2193,63 +2276,75 @@ def add_print_stats_entry(printer_name, document=''):
     save_printer_stats(stats)
     return stats
 
-def auto_increment_page_count(printer_name):
+def auto_increment_page_count(printer_name, known_pages=0):
     """
     Tự động tăng page_count khi phát hiện in xong.
     
-    Cơ chế 2 lớp:
-    1. Đọc JobCountSinceLastReset từ WMI, so sánh với _last_job_count
+    Cơ chế 3 lớp:
+    1. Nếu known_pages > 0 (từ detect_completed_print_jobs JOB_INFO_2):
+       - Dùng số trang thực tế (ưu tiên cao nhất)
+    2. Đọc JobCountSinceLastReset từ WMI, so sánh với _last_job_count
        - Chỉ tính diff khi printer_name ĐÃ CÓ trong _last_job_count
        - Lần đầu: lưu giá trị WMI làm baseline, KHÔNG increment từ WMI
-    2. Fallback: nếu WMI = 0 hoặc lỗi → tăng 1 mỗi lần phát hiện
+    3. Fallback: nếu WMI = 0 hoặc lỗi → dùng known_pages nếu có, nếu không tăng 1
     
     Args:
         printer_name: Tên máy in
+        known_pages: Số trang thực tế từ JOB_INFO_2 (0 = không biết)
     Returns:
         int: page_count mới, hoặc None nếu lỗi
     """
     global _last_job_count
-    increment = 1  # Fallback: tăng 1 mỗi job
     
-    try:
-        # Khởi tạo COM với Multithreaded Apartment cho Flask threaded mode
+    # Ưu tiên 1: known_pages từ JOB_INFO_2 (chính xác nhất)
+    if known_pages > 0:
+        increment = known_pages
+        debug_log(f"Using JOB_INFO_2 pages for {printer_name}: +{increment}")
+    else:
+        increment = 1  # Fallback mặc định
+        # Ưu tiên 2: WMI JobCountSinceLastReset
         try:
-            pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
+            # Khởi tạo COM với Multithreaded Apartment cho Flask threaded mode
+            try:
+                pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
+            except Exception:
+                try:
+                    pythoncom.CoInitialize()
+                except Exception:
+                    pass
+            
+            try:
+                import win32com.client
+                wmi = win32com.client.Dispatch("WbemScripting.SWbemLocator").ConnectServer(".", "root\\CIMV2")
+                query = f'SELECT * FROM Win32_Printer WHERE Name LIKE "%{printer_name}%"'
+                printers = wmi.ExecQuery(query)
+                if printers:
+                    p = printers[0]
+                    current_count = getattr(p, 'JobCountSinceLastReset', None)
+                    if current_count is not None:
+                        try:
+                            cnt = int(current_count)
+                            with _last_job_count_lock:
+                                # Chỉ tính diff khi đã có baseline (tránh spike lần đầu)
+                                if printer_name in _last_job_count:
+                                    last = _last_job_count[printer_name]
+                                    if cnt > last:
+                                        increment = cnt - last
+                                        debug_log(f"WMI JobCount auto-inc for {printer_name}: {last} -> {cnt} (diff={increment})")
+                                # Lưu baseline (lần đầu hoặc cập nhật)
+                                _last_job_count[printer_name] = cnt
+                        except (ValueError, TypeError):
+                            pass
+            finally:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
         except Exception:
-            try:
-                pythoncom.CoInitialize()
-            except Exception:
-                pass
-        
-        try:
-            import win32com.client
-            wmi = win32com.client.Dispatch("WbemScripting.SWbemLocator").ConnectServer(".", "root\\CIMV2")
-            query = f'SELECT * FROM Win32_Printer WHERE Name LIKE "%{printer_name}%"'
-            printers = wmi.ExecQuery(query)
-            if printers:
-                p = printers[0]
-                current_count = getattr(p, 'JobCountSinceLastReset', None)
-                if current_count is not None:
-                    try:
-                        cnt = int(current_count)
-                        with _last_job_count_lock:
-                            # Chỉ tính diff khi đã có baseline (tránh spike lần đầu)
-                            if printer_name in _last_job_count:
-                                last = _last_job_count[printer_name]
-                                if cnt > last:
-                                    increment = cnt - last
-                                    debug_log(f"WMI JobCount auto-inc for {printer_name}: {last} -> {cnt} (diff={increment})")
-                            # Lưu baseline (lần đầu hoặc cập nhật)
-                            _last_job_count[printer_name] = cnt
-                    except (ValueError, TypeError):
-                        pass
-        finally:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
-        
-        # Cập nhật page_count trong settings
+            pass
+    
+    # Cập nhật page_count trong settings
+    try:
         settings = load_printer_settings()
         page_count = settings.get('page_count', {})
         current_pc = page_count.get(printer_name, 0)
@@ -2292,13 +2387,14 @@ def api_printer_auto_detect():
         for job in completed:
             printer_name = job['printer']
             document = job.get('document', '')
+            job_pages = job.get('total_pages', 0) or 0
             entry = add_print_history_entry(
-                f"Tự động: {document}" if document else "Phát hiện in tự động",
+                f"Tự động: {document} ({job_pages} trang)" if document else "Phát hiện in tự động",
                 printer_name
             )
             add_print_stats_entry(printer_name, document)
-            # Tự động tăng page_count khi phát hiện in xong
-            auto_increment_page_count(printer_name)
+            # Tự động tăng page_count với số trang thực tế từ job info
+            auto_increment_page_count(printer_name, job_pages)
             if entry:
                 results.append(entry)
         return jsonify({'detected': results, 'count': len(results)})
@@ -2826,11 +2922,10 @@ def query_printer_page_count_eventlogs(printer_name, port_name):
     """
     Đọc tổng số trang từ Event Logs Windows (PrintService/Operational).
     
-    Chỉ dùng PowerShell EventLogs vì:
-    - WritePrinter là write-only, không đọc được response
-    - CreateFile trên USB port không khả dụng (driver chiếm dụng)
-    - Gửi PJL dạng RAW job sẽ in ra giấy thật (tốn mực)
-    - PJL (@PJL INFO PAGECOUNT) chỉ hoạt động với Brother/HP/network
+    Cơ chế Hybrid 3 lớp:
+    1. PrinterMonitor C# module (nếu đã compile) — nhanh nhất, chính xác nhất
+    2. PowerShell EventLog (Properties[7]) — fallback luôn available
+    3. Cache 30s TTL — tránh query lại quá thường xuyên
     
     Args:
         printer_name: Tên máy in (VD: "EPSON L3210 Series")
@@ -2838,12 +2933,35 @@ def query_printer_page_count_eventlogs(printer_name, port_name):
     Returns:
         int (số trang) hoặc None nếu không đọc được
     """
-    # Event ID 307 = Print job completed (có TotalPages trong Properties[5])
+    # Lớp 1: PrinterMonitor C# module (ưu tiên cao nhất, nhanh nhất)
+    try:
+        cs_result = query_printer_monitor_cs(printer_name, "query", timeout=10)
+        if cs_result and cs_result.get('page_count') is not None:
+            count = int(cs_result['page_count'])
+            if count > 0:
+                with _eventlog_cache_lock:
+                    _eventlog_cache[printer_name] = {'count': count, 'cached_at': time.time()}
+                debug_log(f"EventLog count for {printer_name}: {count} (C#/PS module)")
+                return count
+    except Exception as e:
+        debug_log(f"C#/PS module query error: {e}")
+    
+    # Lớp 2: Kiểm tra cache (30s TTL)
+    with _eventlog_cache_lock:
+        cached = _eventlog_cache.get(printer_name)
+        if cached and (time.time() - cached['cached_at']) < 30:
+            debug_log(f"EventLog count CACHED for {printer_name}: {cached['count']}")
+            return cached['count']
+    
+    # Lớp 3: PowerShell EventLog trực tiếp (Properties[7])
+    
+    # Lớp 2: PowerShell EventLog với Properties[7] (TotalPages, Windows 10/11)
     try:
         ps_cmd = (
-            'Get-WinEvent -FilterHashtable @{LogName="Microsoft-Windows-PrintService/Operational";ID=307} '
-            f'-MaxEvents 200 | Where-Object {{ $_.Properties[3].Value -like "*{printer_name}*" }} | '
-            'Select-Object @{N="Pages";E={$_.Properties[5].Value}} | '
+            'Get-WinEvent -FilterHashtable @{LogName="Microsoft-Windows-PrintService/Operational";'
+            'ID=307;StartTime=(Get-Date).AddDays(-30)} -ErrorAction SilentlyContinue | '
+            f'Where-Object {{ $_.Properties[3].Value -like "*{printer_name}*" }} | '
+            'Select-Object @{N="Pages";E={$_.Properties[7].Value}} | '
             'Measure-Object -Property Pages -Sum | Select-Object -ExpandProperty Sum'
         )
         result = subprocess.run(
@@ -2853,10 +2971,33 @@ def query_printer_page_count_eventlogs(printer_name, port_name):
         if result.returncode == 0 and result.stdout.strip():
             count = int(float(result.stdout.strip()))
             if count > 0:
-                debug_log(f"EventLog page count for {printer_name}: {count}")
+                with _eventlog_cache_lock:
+                    _eventlog_cache[printer_name] = {'count': count, 'cached_at': time.time()}
+                debug_log(f"EventLog count for {printer_name}: {count} (Properties[7], 30 days)")
+                return count
+        
+        # Fallback: Properties[5] cho Windows cũ hơn
+        debug_log(f"Properties[7]=0, trying Properties[5] fallback...")
+        ps_cmd_fb = (
+            'Get-WinEvent -FilterHashtable @{LogName="Microsoft-Windows-PrintService/Operational";'
+            'ID=307;StartTime=(Get-Date).AddDays(-30)} -ErrorAction SilentlyContinue | '
+            f'Where-Object {{ $_.Properties[3].Value -like "*{printer_name}*" }} | '
+            'Select-Object @{N="Pages";E={$_.Properties[5].Value}} | '
+            'Measure-Object -Property Pages -Sum | Select-Object -ExpandProperty Sum'
+        )
+        result2 = subprocess.run(
+            ['powershell', '-NoProfile', '-Command', ps_cmd_fb],
+            capture_output=True, text=True, timeout=10
+        )
+        if result2.returncode == 0 and result2.stdout.strip():
+            count = int(float(result2.stdout.strip()))
+            if count > 0:
+                with _eventlog_cache_lock:
+                    _eventlog_cache[printer_name] = {'count': count, 'cached_at': time.time()}
+                debug_log(f"EventLog count for {printer_name}: {count} (Properties[5] fallback, 30 days)")
                 return count
     except Exception as e:
-        debug_log(f"EventLog query error: {e}")
+        debug_log(f"PowerShell EventLog query error: {e}")
     
     return None
 
@@ -2883,10 +3024,25 @@ def api_printer_page_count():
     if not printer_name:
         return jsonify({'page_count': None, 'source': None, 'error': 'Chưa chọn máy in'})
     
-    # 1. EventLogs (PowerShell)
-    pjl_count = query_printer_page_count_eventlogs(printer_name, port_name)
-    if pjl_count is not None:
-        return jsonify({'page_count': pjl_count, 'source': 'eventlog', 'printer': printer_name})
+    # 1. EventLogs (PowerShell) — 30 ngày gần nhất, đã cache 30s
+    eventlog_count = query_printer_page_count_eventlogs(printer_name, port_name)
+    
+    # 2. Manual count từ settings (lifetime total do user nhập hoặc auto-increment)
+    settings = load_printer_settings()
+    manual_count = settings.get('page_count', {}).get(printer_name, 0) or 0
+    
+    # Kết hợp: EventLog (30 ngày) + manual (lifetime) = ước lượng tốt nhất
+    # Nếu EventLog có data, dùng nó + manual để có lifetime gần đúng
+    if eventlog_count is not None and eventlog_count > 0:
+        # Ưu tiên EventLog vì chính xác hơn cho 30 ngày gần
+        # Nếu manual lớn hơn, có thể user đã nhập lifetime → giữ nguyên
+        if manual_count > eventlog_count:
+            total = manual_count
+            source = 'manual'
+        else:
+            total = eventlog_count
+            source = 'eventlog'
+        return jsonify({'page_count': total, 'source': source, 'printer': printer_name})
     
     # 2. WMI JobCountSinceLastReset (per-session counter)
     wmi_count = 0
@@ -2917,10 +3073,6 @@ def api_printer_page_count():
                 pass
     except Exception:
         pass
-    
-    # 3. Settings (người dùng nhập thủ công - lifetime total)
-    settings = load_printer_settings()
-    manual_count = settings.get('page_count', {}).get(printer_name, 0) or 0
     
     # Kết hợp: manual (lifetime) + WMI (per-session additional)
     if wmi_count > 0 or manual_count > 0:
