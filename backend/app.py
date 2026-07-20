@@ -160,7 +160,7 @@ def _start_project(proj):
         # User sẽ thấy loading trên UI và log npm install trong tab log.
         lf = get_log_file(proj)
         if lf.exists():
-            lf.unlink()
+            _safe_unlink_log(lf)
         debug_log(f"npm install started for {name}...")
         install_proc = subprocess.Popen(
             ["npm", "install"],
@@ -179,7 +179,7 @@ def _start_project(proj):
     
     lf = get_log_file(proj)
     if lf.exists():
-        lf.unlink()
+        _safe_unlink_log(lf)
     log_files[name] = str(lf)
     log_data[name] = []
     log_positions[name] = 0
@@ -458,6 +458,21 @@ def api_delete_project(name):
     save_config()
     return jsonify({"status": "deleted", "name": name})
 
+def _safe_unlink_log(lf):
+    """Xóa file log an toàn. Nếu file đang được dùng bởi process khác (WinError 32),
+    truncate nội dung thay vì xóa file."""
+    try:
+        lf.unlink()
+    except PermissionError:
+        # File đang được process khác mở → truncate nội dung (mode "w" auto-truncates)
+        try:
+            with open(lf, "w", encoding="utf-8") as f:
+                pass
+        except Exception:
+            pass
+    except Exception:
+        pass
+
 def kill_process_on_port(port):
     """
     Dùng psutil tìm và kill process đang chiếm port.
@@ -469,7 +484,7 @@ def kill_process_on_port(port):
     try:
         for proc in psutil.process_iter(['pid', 'name', 'connections']):
             try:
-                for conn in proc.connections(kind='inet'):
+                for conn in proc.net_connections(kind='inet'):
                     if conn.laddr.port == port:
                         proc_name = proc.name().lower()
                         # WHITELIST: Chỉ kill các process liên quan đến Node.js/Next.js
