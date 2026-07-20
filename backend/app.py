@@ -2960,7 +2960,7 @@ def query_printer_page_count_eventlogs(printer_name, port_name):
         ps_cmd = (
             'Get-WinEvent -FilterHashtable @{LogName="Microsoft-Windows-PrintService/Operational";'
             'ID=307;StartTime=(Get-Date).AddDays(-30)} -ErrorAction SilentlyContinue | '
-            f'Where-Object {{ $_.Properties[3].Value -like "*{printer_name}*" }} | '
+            f'Where-Object {{ $_.Properties[4].Value -like "*{printer_name}*" }} | '
             'Select-Object @{N="Pages";E={$_.Properties[7].Value}} | '
             'Measure-Object -Property Pages -Sum | Select-Object -ExpandProperty Sum'
         )
@@ -2976,12 +2976,12 @@ def query_printer_page_count_eventlogs(printer_name, port_name):
                 debug_log(f"EventLog count for {printer_name}: {count} (Properties[7], 30 days)")
                 return count
         
-        # Fallback: Properties[5] cho Windows cũ hơn
+        # Fallback: Properties[5] cho Windows cũ hơn (thường là Size, không phải pages)
         debug_log(f"Properties[7]=0, trying Properties[5] fallback...")
         ps_cmd_fb = (
             'Get-WinEvent -FilterHashtable @{LogName="Microsoft-Windows-PrintService/Operational";'
             'ID=307;StartTime=(Get-Date).AddDays(-30)} -ErrorAction SilentlyContinue | '
-            f'Where-Object {{ $_.Properties[3].Value -like "*{printer_name}*" }} | '
+            f'Where-Object {{ $_.Properties[4].Value -like "*{printer_name}*" }} | '
             'Select-Object @{N="Pages";E={$_.Properties[5].Value}} | '
             'Measure-Object -Property Pages -Sum | Select-Object -ExpandProperty Sum'
         )

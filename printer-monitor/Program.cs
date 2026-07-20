@@ -95,8 +95,8 @@ Usage:
 
                     var props = record.Properties;
 
-                    // Properties[3] = Printer Name (UnicodeString)
-                    string? nameFromProps = props.Count > 3 ? (props[3]?.ToString()?.Trim() ?? "") : "";
+                    // Properties[4] = Printer Name (UnicodeString)
+                    string? nameFromProps = props.Count > 4 ? (props[4]?.ToString()?.Trim() ?? "") : "";
 
                     // Properties[7] = TotalPages (int)
                     int pages = 0;
@@ -188,7 +188,7 @@ Usage:
                         if (record.TimeCreated.HasValue && record.TimeCreated.Value > DateTime.Now) break;
 
                         var props = record.Properties;
-                        string? printer = props.Count > 3 ? props[3]?.ToString()?.Trim() : "";
+                        string? printer = props.Count > 4 ? props[4]?.ToString()?.Trim() : "";
                         int pages = 0;
                         if (props.Count > 7 && props[7] != null)
                             int.TryParse(props[7].ToString(), out pages);
@@ -249,7 +249,7 @@ Usage:
                     if (record.TimeCreated.HasValue && record.TimeCreated.Value < startTime) break;
 
                     var props = record.Properties;
-                    string? printer = props.Count > 3 ? (props[3]?.ToString()?.Trim() ?? "") : "";
+                    string? printer = props.Count > 4 ? (props[4]?.ToString()?.Trim() ?? "") : "";
                     if (string.IsNullOrEmpty(printer)) continue;
 
                     int pages = 0;
