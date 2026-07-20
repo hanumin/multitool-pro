@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+src-tauri/target/
+
+# OS files
+Thumbs.db
+*.DS_Store
+nul
+
+# Env
+.env
+.env.local
+
+# Backend data
+*.pyc
+__pycache__/
+flask_output.txt
+cookies.txt
+
+# AI / IDE
+.claude/
+.gitnexus/
+
+# Logs
+*.log
+

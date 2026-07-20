@@ -1,0 +1,18 @@
+{
+  "portMin": 4000,
+  "portMax": 4999,
+  "projects": [
+    {
+      "name": "HanuLibrary",
+      "path": "C:\\Users\\Nguyen Thanh Dat\\Desktop\\luongphamhanhnguyen-library",
+      "command": "npm run dev -- -p 4000 --turbopack",
+      "port": 4000
+    },
+    {
+      "name": "English Topics",
+      "path": "C:\\Users\\Nguyen Thanh Dat\\Desktop\\1_LAM_WEB_HOC_BE_MINH\\english-topics_v2_nextjs",
+      "command": "npm run dev -- -p 4001 --turbopack",
+      "port": 4001
+    }
+  ]
+}

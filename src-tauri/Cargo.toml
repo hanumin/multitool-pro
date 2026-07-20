@@ -1,0 +1,28 @@
+[package]
+name = "multitool-pro"
+version = "1.8.0"
+description = "MultiTool Pro - All-in-one utility"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "server_dashboard_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+# Plugin cập nhật tự động. Khi build, Tauri sẽ tạo file .sig đi kèm .msi/.exe.
+# Người dùng cần:
+#   1. Tạo keypair: npx tauri signer generate -w ~/.tauri/server-dashboard.key
+#   2. Set biến môi trường TAURI_SIGNING_PRIVATE_KEY + TAURI_SIGNING_PRIVATE_KEY_PASSWORD khi build
+#   3. Upload .msi, .msi.sig, .exe, .exe.sig lên GitHub Release
+#   4. Tạo file latest.json mô tả phiên bản mới nhất (xem docs Tauri Updater)
+tauri-plugin-updater = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
