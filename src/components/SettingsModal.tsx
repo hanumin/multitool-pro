@@ -230,14 +230,14 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
                 <h3 className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-secondary)' }}>Cài đặt chung</h3>
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <label className="text-[11px] mb-1 block" style={{ color: 'var(--fg-muted)' }}>Cổng tối thiểu</label>
-                    <input type="number" value={portMin} onChange={e => setPortMin(parseInt(e.target.value) || 0)}
+                    <label htmlFor="settings-port-min" className="text-[11px] mb-1 block" style={{ color: 'var(--fg-muted)' }}>Cổng tối thiểu</label>
+                    <input id="settings-port-min" name="portMin" type="number" value={portMin} onChange={e => setPortMin(parseInt(e.target.value) || 0)}
                       className="w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition-colors duration-200"
                       style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }} />
                   </div>
                   <div>
-                    <label className="text-[11px] mb-1 block" style={{ color: 'var(--fg-muted)' }}>Cổng tối đa</label>
-                    <input type="number" value={portMax} onChange={e => setPortMax(parseInt(e.target.value) || 0)}
+                    <label htmlFor="settings-port-max" className="text-[11px] mb-1 block" style={{ color: 'var(--fg-muted)' }}>Cổng tối đa</label>
+                    <input id="settings-port-max" name="portMax" type="number" value={portMax} onChange={e => setPortMax(parseInt(e.target.value) || 0)}
                       className="w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition-colors duration-200"
                       style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }} />
                   </div>
@@ -316,24 +316,24 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
 
                   <div className="grid grid-cols-2 gap-4">
                     <div>
-                      <label className="text-[11px] mb-1 block" style={{ color: 'var(--fg-muted)' }}>Tên *</label>
-                      <input value={edit.name || ''} onChange={e => setEdit(p => ({ ...p, name: e.target.value }))}
+                      <label htmlFor="settings-proj-name" className="text-[11px] mb-1 block" style={{ color: 'var(--fg-muted)' }}>Tên *</label>
+                      <input id="settings-proj-name" name="projName" value={edit.name || ''} onChange={e => setEdit(p => ({ ...p, name: e.target.value }))}
                         className="w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition-colors duration-200"
                         style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }}
                         placeholder="MyApp" />
                     </div>
                     <div>
-                      <label className="text-[11px] mb-1 block" style={{ color: 'var(--fg-muted)' }}>Port</label>
-                      <input type="number" value={edit.port ?? 4000} onChange={e => setEdit(p => ({ ...p, port: parseInt(e.target.value) || 0 }))}
+                      <label htmlFor="settings-proj-port" className="text-[11px] mb-1 block" style={{ color: 'var(--fg-muted)' }}>Port</label>
+                      <input id="settings-proj-port" name="projPort" type="number" value={edit.port ?? 4000} onChange={e => setEdit(p => ({ ...p, port: parseInt(e.target.value) || 0 }))}
                         className="w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition-colors duration-200"
                         style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }} />
                     </div>
                   </div>
 
                   <div>
-                    <label className="text-[11px] mb-1 block" style={{ color: 'var(--fg-muted)' }}>Đường dẫn *</label>
+                    <label htmlFor="settings-proj-path" className="text-[11px] mb-1 block" style={{ color: 'var(--fg-muted)' }}>Đường dẫn *</label>
                     <div className="flex gap-2">
-                      <input value={edit.path || ''} onChange={e => setEdit(p => ({ ...p, path: e.target.value }))}
+                      <input id="settings-proj-path" name="projPath" value={edit.path || ''} onChange={e => setEdit(p => ({ ...p, path: e.target.value }))}
                         className="flex-1 border rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition-colors duration-200"
                         style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }}
                         placeholder="C:\Users\...\my-project" />
@@ -346,9 +346,9 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
                   </div>
 
                   <div>
-                    <label className="text-[11px] mb-1 block" style={{ color: 'var(--fg-muted)' }}>Lệnh</label>
+                    <label htmlFor="settings-proj-command" className="text-[11px] mb-1 block" style={{ color: 'var(--fg-muted)' }}>Lệnh</label>
                     <div className="grid grid-cols-3 gap-2">
-                      <select onChange={e => {
+                      <select id="settings-proj-command-template" name="projCommandTemplate" onChange={e => {
                         const val = e.target.value
                         if (val) {
                           setEdit(p => p ? { ...p, command: val } : null)
@@ -363,7 +363,7 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
                         <option value="yarn dev" style={{ background: 'var(--bg)', color: 'var(--fg)' }}>yarn dev</option>
                         <option value="yarn dev -p {port}" style={{ background: 'var(--bg)', color: 'var(--fg)' }}>yarn dev -p {'{port}'}</option>
                       </select>
-                      <input value={edit.command || ''} onChange={e => setEdit(p => ({ ...p, command: e.target.value }))}
+                      <input id="settings-proj-command" name="projCommand" value={edit.command || ''} onChange={e => setEdit(p => ({ ...p, command: e.target.value }))}
                         className="col-span-2 border rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition-colors duration-200"
                         style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }}
                         placeholder="npm run dev" />
@@ -371,8 +371,8 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
                   </div>
 
                   {editingIndex === null && (
-                    <label className="flex items-center gap-2 text-xs select-none cursor-pointer" style={{ color: 'var(--fg-secondary)' }}>
-                      <input type="checkbox" checked={startAfterAdd} onChange={e => setStartAfterAdd(e.target.checked)}
+                    <label htmlFor="settings-start-after-add" className="flex items-center gap-2 text-xs select-none cursor-pointer" style={{ color: 'var(--fg-secondary)' }}>
+                      <input id="settings-start-after-add" name="startAfterAdd" type="checkbox" checked={startAfterAdd} onChange={e => setStartAfterAdd(e.target.checked)}
                         className="w-3.5 h-3.5 rounded border-gray-700 bg-gray-900 accent-emerald-500 cursor-pointer" />
                       Start project immediately after adding
                     </label>

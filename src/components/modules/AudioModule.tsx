@@ -438,7 +438,7 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
                     style={{ backgroundColor: dev.muted ? '#ef444420' : 'var(--input-bg)', borderColor: dev.muted ? '#ef444240' : 'var(--border)', color: dev.muted ? '#ef4444' : 'var(--fg-secondary)' }}>
                     {dev.muted ? '🔇 Bật tiếng' : '🔊 Tắt tiếng'}
                   </button>
-                  <input type="range" min={0} max={100} value={volume}
+                  <input id={`volume-${dev.id}`} name="volume" type="range" min={0} max={100} value={volume}
                     onChange={e => setVolumeLevel(dev.id, parseInt(e.target.value))}
                     className="flex-1 accent-emerald-500" />
                   <span className="text-[10px] font-mono w-8 text-right" style={{ color: 'var(--fg-muted)' }}>{volume}%</span>
@@ -468,14 +468,14 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
                 style={{ color: 'var(--fg-muted)' }}>&times;</button>
             </div>
             <div className="mt-4 space-y-4 text-xs">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input type="checkbox" checked={audioSettings.sound_enabled}
+              <label htmlFor="audio-sound-enabled" className="flex items-center gap-2 cursor-pointer">
+                <input id="audio-sound-enabled" name="soundEnabled" type="checkbox" checked={audioSettings.sound_enabled}
                   onChange={e => setAudioSettings(prev => ({ ...prev, sound_enabled: e.target.checked }))}
                   className="accent-emerald-500" />
                 <span style={{ color: 'var(--fg-secondary)' }}>Âm thanh báo khi mic bật</span>
               </label>
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input type="checkbox" checked={audioSettings.show_widget_on_mic}
+              <label htmlFor="audio-show-widget" className="flex items-center gap-2 cursor-pointer">
+                <input id="audio-show-widget" name="showWidget" type="checkbox" checked={audioSettings.show_widget_on_mic}
                   onChange={e => setAudioSettings(prev => ({ ...prev, show_widget_on_mic: e.target.checked }))}
                   className="accent-emerald-500" />
                 <span style={{ color: 'var(--fg-secondary)' }}>Hiện widget khi mic bật</span>
@@ -489,18 +489,18 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
                   className="w-full accent-emerald-500" />
               </div>
               <div>
-                <label className="text-[11px] font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Màu khi hoạt động</label>
+                <label htmlFor="audio-color-on" className="text-[11px] font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Màu khi hoạt động</label>
                 <div className="flex items-center gap-2">
-                  <input type="color" value={audioSettings.color_mic_on}
+                  <input id="audio-color-on" name="colorMicOn" type="color" value={audioSettings.color_mic_on}
                     onChange={e => setAudioSettings(prev => ({ ...prev, color_mic_on: e.target.value }))}
                     className="w-8 h-8 rounded cursor-pointer border-0" />
                   <span className="font-mono text-[10px]" style={{ color: 'var(--fg-secondary)' }}>{audioSettings.color_mic_on}</span>
                 </div>
               </div>
               <div>
-                <label className="text-[11px] font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Màu khi không hoạt động</label>
+                <label htmlFor="audio-color-off" className="text-[11px] font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Màu khi không hoạt động</label>
                 <div className="flex items-center gap-2">
-                  <input type="color" value={audioSettings.color_mic_off}
+                  <input id="audio-color-off" name="colorMicOff" type="color" value={audioSettings.color_mic_off}
                     onChange={e => setAudioSettings(prev => ({ ...prev, color_mic_off: e.target.value }))}
                     className="w-8 h-8 rounded cursor-pointer border-0" />
                   <span className="font-mono text-[10px]" style={{ color: 'var(--fg-secondary)' }}>{audioSettings.color_mic_off}</span>
@@ -508,8 +508,8 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
               </div>
               {soundFiles.length > 0 && (
                 <div>
-                  <label className="text-[11px] font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Âm thanh báo</label>
-                  <select value={audioSettings.selected_sound || ''}
+                  <label htmlFor="audio-sound-select" className="text-[11px] font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Âm thanh báo</label>
+                  <select id="audio-sound-select" name="selectedSound" value={audioSettings.selected_sound || ''}
                     onChange={e => setAudioSettings(prev => ({ ...prev, selected_sound: e.target.value || null }))}
                     className="w-full px-2 py-1.5 text-xs rounded-lg border"
                     style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg)' }}>

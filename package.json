@@ -1,7 +1,7 @@
 {
   "name": "server-dashboard-tauri",
   "private": true,
-  "version": "1.8.0",
+  "version": "1.9.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -13,6 +13,7 @@
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-updater": "^2.10.1",
+    "@uiw/react-textarea-code-editor": "^3.1.1",
     "ansi-to-html": "^0.7.2",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"

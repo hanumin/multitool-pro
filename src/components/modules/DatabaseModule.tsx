@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
+import CodeEditor from '@uiw/react-textarea-code-editor'
 
 const API = 'http://127.0.0.1:5050'
 
@@ -268,6 +269,61 @@ export default function DatabaseModule({ theme, setStatusText }: DatabaseModuleP
     finally { setLoading(false) }
   }
 
+  // Shared helper: download response as file (blob + click)
+  const downloadBlobFromResponse = async (res: Response, defaultName: string) => {
+    const blob = await res.blob()
+    const contentDisposition = res.headers.get('Content-Disposition')
+    let filename = defaultName
+    if (contentDisposition) {
+      const match = contentDisposition.match(/filename="?([^"]+)"?/)
+      if (match) filename = match[1]
+    }
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url; a.download = filename
+    document.body.appendChild(a); a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+    return filename
+  }
+
+  const exportTableData = async (format: 'csv' | 'json') => {
+    if (!connectedDb || !selectedTable) { setStatusText('No table selected'); return }
+    try {
+      setStatusText(`Exporting ${selectedTable} as ${format.toUpperCase()}...`)
+      const res = await fetch(`${API}/api/database/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          connectionId: connectedDb, database: selectedDb,
+          schema: selectedSchema, table: selectedTable, format
+        })
+      })
+      if (!res.ok) { const err = await res.json(); setStatusText(`❌ ${err.error}`); return }
+      const filename = await downloadBlobFromResponse(res, `${selectedTable}.${format}`)
+      setStatusText(`✅ Exported ${filename}`)
+    } catch (e: any) { setStatusText(`❌ ${e.message}`) }
+  }
+
+  // Cache last query for export consistency
+  const [lastExportQuery, setLastExportQuery] = useState('')
+
+  const exportQueryResult = async (format: 'csv' | 'json') => {
+    if (!connectedDb || !queryResult?.columns?.length) { setStatusText('No query results to export'); return }
+    try {
+      const q = customQuery || lastExportQuery
+      setStatusText(`Exporting query results as ${format.toUpperCase()}...`)
+      const res = await fetch(`${API}/api/database/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ connectionId: connectedDb, database: selectedDb, query: q, format })
+      })
+      if (!res.ok) { const err = await res.json(); setStatusText(`❌ ${err.error}`); return }
+      const filename = await downloadBlobFromResponse(res, `query_result.${format}`)
+      setStatusText(`✅ Exported ${filename}`)
+    } catch (e: any) { setStatusText(`❌ ${e.message}`) }
+  }
+
   const runCustomQuery = async () => {
     if (!customQuery.trim()) return
     setLoading(true)
@@ -282,6 +338,7 @@ export default function DatabaseModule({ theme, setStatusText }: DatabaseModuleP
       const data = await res.json()
       if (data.success !== false) {
         setQueryResult(data)
+        setLastExportQuery(customQuery) // Cache query for export consistency
         if (data.affected_rows !== undefined) {
           setStatusText(`✅ Query executed, affected ${data.affected_rows} rows`)
         } else {
@@ -491,16 +548,16 @@ export default function DatabaseModule({ theme, setStatusText }: DatabaseModuleP
             <h2 className="text-sm font-semibold mb-4" style={{ color: 'var(--fg)' }}>Thêm kết nối database</h2>
             <div className="space-y-4">
               <div>
-                <label className="text-[10px] font-medium block mb-1" style={{ color: 'var(--fg-muted)' }}>Tên kết nối</label>
-                <input type="text" value={editConn.name} onChange={e => setEditConn(p => ({ ...p, name: e.target.value }))}
+                <label htmlFor="db-conn-name" className="text-[10px] font-medium block mb-1" style={{ color: 'var(--fg-muted)' }}>Tên kết nối</label>
+                <input id="db-conn-name" name="name" type="text" value={editConn.name} onChange={e => setEditConn(p => ({ ...p, name: e.target.value }))}
                   className="w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500"
                   style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }}
                   placeholder="My Database" />
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="text-[10px] font-medium block mb-1" style={{ color: 'var(--fg-muted)' }}>Loại</label>
-                  <select value={editConn.type} onChange={e => {
+                  <label htmlFor="db-conn-type" className="text-[10px] font-medium block mb-1" style={{ color: 'var(--fg-muted)' }}>Loại</label>
+                  <select id="db-conn-type" name="type" value={editConn.type} onChange={e => {
                     const isPg = e.target.value === 'postgresql'
                     setEditConn(p => ({ ...p, type: e.target.value as any, port: isPg ? 5432 : 3306 }))
                   }}
@@ -511,36 +568,36 @@ export default function DatabaseModule({ theme, setStatusText }: DatabaseModuleP
                   </select>
                 </div>
                 <div>
-                  <label className="text-[10px] font-medium block mb-1" style={{ color: 'var(--fg-muted)' }}>Host</label>
-                  <input type="text" value={editConn.host} onChange={e => setEditConn(p => ({ ...p, host: e.target.value }))}
+                  <label htmlFor="db-conn-host" className="text-[10px] font-medium block mb-1" style={{ color: 'var(--fg-muted)' }}>Host</label>
+                  <input id="db-conn-host" name="host" type="text" value={editConn.host} onChange={e => setEditConn(p => ({ ...p, host: e.target.value }))}
                     className="w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500"
                     style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }} />
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="text-[10px] font-medium block mb-1" style={{ color: 'var(--fg-muted)' }}>Port</label>
-                  <input type="number" value={editConn.port} onChange={e => setEditConn(p => ({ ...p, port: parseInt(e.target.value) || 5432 }))}
+                  <label htmlFor="db-conn-port" className="text-[10px] font-medium block mb-1" style={{ color: 'var(--fg-muted)' }}>Port</label>
+                  <input id="db-conn-port" name="port" type="number" value={editConn.port} onChange={e => setEditConn(p => ({ ...p, port: parseInt(e.target.value) || 5432 }))}
                     className="w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500"
                     style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }} />
                 </div>
                 <div>
-                  <label className="text-[10px] font-medium block mb-1" style={{ color: 'var(--fg-muted)' }}>Database</label>
-                  <input type="text" value={editConn.database} onChange={e => setEditConn(p => ({ ...p, database: e.target.value }))}
+                  <label htmlFor="db-conn-database" className="text-[10px] font-medium block mb-1" style={{ color: 'var(--fg-muted)' }}>Database</label>
+                  <input id="db-conn-database" name="database" type="text" value={editConn.database} onChange={e => setEditConn(p => ({ ...p, database: e.target.value }))}
                     className="w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500"
                     style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }} />
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="text-[10px] font-medium block mb-1" style={{ color: 'var(--fg-muted)' }}>User</label>
-                  <input type="text" value={editConn.user} onChange={e => setEditConn(p => ({ ...p, user: e.target.value }))}
+                  <label htmlFor="db-conn-user" className="text-[10px] font-medium block mb-1" style={{ color: 'var(--fg-muted)' }}>User</label>
+                  <input id="db-conn-user" name="user" type="text" value={editConn.user} onChange={e => setEditConn(p => ({ ...p, user: e.target.value }))}
                     className="w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500"
                     style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }} />
                 </div>
                 <div>
-                  <label className="text-[10px] font-medium block mb-1" style={{ color: 'var(--fg-muted)' }}>Password</label>
-                  <input type="password" value={editConn.password} onChange={e => setEditConn(p => ({ ...p, password: e.target.value }))}
+                  <label htmlFor="db-conn-password" className="text-[10px] font-medium block mb-1" style={{ color: 'var(--fg-muted)' }}>Password</label>
+                  <input id="db-conn-password" name="password" type="password" value={editConn.password} onChange={e => setEditConn(p => ({ ...p, password: e.target.value }))}
                     className="w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500"
                     style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }} />
                 </div>
@@ -594,7 +651,33 @@ export default function DatabaseModule({ theme, setStatusText }: DatabaseModuleP
               {activeView === 'browse' && (
                 <div className="space-y-4">
                   {selectedTable && tableData ? (
-                    renderTable(tableData.columns, tableData.rows, tableData.total_rows, tableData.total_pages)
+                    <div>
+                      {/* Export toolbar */}
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-[10px] font-medium" style={{ color: 'var(--fg-muted)' }}>
+                          Table: <span className="font-mono text-emerald-500">{selectedDb}.{selectedSchema}.{selectedTable}</span>
+                        </span>
+                        <div className="flex gap-1.5">
+                          <button onClick={() => exportTableData('csv')}
+                            className="px-2 py-1 text-[9px] font-semibold rounded border transition-all active:scale-95 cursor-pointer flex items-center gap-1"
+                            style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+                            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                            </svg>
+                            CSV
+                          </button>
+                          <button onClick={() => exportTableData('json')}
+                            className="px-2 py-1 text-[9px] font-semibold rounded border transition-all active:scale-95 cursor-pointer flex items-center gap-1"
+                            style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+                            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                            </svg>
+                            JSON
+                          </button>
+                        </div>
+                      </div>
+                      {renderTable(tableData.columns, tableData.rows, tableData.total_rows, tableData.total_pages)}
+                    </div>
                   ) : !selectedTable ? (
                     <div className="flex flex-col items-center justify-center py-12">
                       <svg className="w-12 h-12 mb-3 opacity-20" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1}>
@@ -613,11 +696,31 @@ export default function DatabaseModule({ theme, setStatusText }: DatabaseModuleP
 
               {activeView === 'query' && (
                 <div className="space-y-3">
-                  <div className="relative">
-                    <textarea value={customQuery} onChange={e => setCustomQuery(e.target.value)}
-                      rows={4} placeholder="SELECT * FROM users LIMIT 10;"
-                      className="w-full border rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500"
-                      style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }} />
+                  <div className="relative border rounded-lg" style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)' }}>
+                    <CodeEditor
+                      id="db-sql-editor"
+                      value={customQuery}
+                      language="sql"
+                      placeholder="SELECT * FROM users LIMIT 10;"
+                      onChange={(evn) => setCustomQuery(evn.target.value)}
+                      padding={12}
+                      minHeight={96}
+                      className="!text-xs !font-mono focus:outline-none"
+                      style={{
+                        fontSize: 12,
+                        fontFamily: 'ui-monospace,SFMono-Regular,SF Mono,Consolas,Liberation Mono,Menlo,monospace',
+                        backgroundColor: 'var(--input-bg)',
+                        '--color': 'var(--fg)',
+                        '--placeholder': 'var(--fg-dim)',
+                        '--selection': 'rgba(16,185,129,0.3)',
+                        '--punctuation': 'var(--fg-muted)',
+                        '--keyword': '#22c55e',
+                        '--string': '#f59e0b',
+                        '--number': '#a855f7',
+                        '--function': '#3b82f6',
+                        '--comment': '#6b7280',
+                      } as any}
+                    />
                     <button onClick={runCustomQuery} disabled={loading || !customQuery.trim()}
                       className="absolute bottom-2 right-2 px-3 py-1 text-[10px] font-semibold bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg disabled:opacity-50 transition-colors border-0 cursor-pointer flex items-center gap-1">
                       {loading && <div className="animate-spin rounded-full h-2.5 w-2.5 border-b border-white" />}
@@ -633,11 +736,31 @@ export default function DatabaseModule({ theme, setStatusText }: DatabaseModuleP
 
                   {queryResult && queryResult.columns && (
                     <div>
-                      <div className="text-[10px] mb-2" style={{ color: 'var(--fg-dim)' }}>
-                        {queryResult.row_count} rows returned
-                        {queryResult.affected_rows !== undefined && queryResult.affected_rows >= 0 && (
-                          <span> | {queryResult.affected_rows} rows affected</span>
-                        )}
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="text-[10px]" style={{ color: 'var(--fg-dim)' }}>
+                          {queryResult.row_count} rows returned
+                          {queryResult.affected_rows !== undefined && queryResult.affected_rows >= 0 && (
+                            <span> | {queryResult.affected_rows} rows affected</span>
+                          )}
+                        </div>
+                        <div className="flex gap-1.5">
+                          <button onClick={() => exportQueryResult('csv')}
+                            className="px-2 py-1 text-[9px] font-semibold rounded border transition-all active:scale-95 cursor-pointer flex items-center gap-1"
+                            style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+                            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                            </svg>
+                            CSV
+                          </button>
+                          <button onClick={() => exportQueryResult('json')}
+                            className="px-2 py-1 text-[9px] font-semibold rounded border transition-all active:scale-95 cursor-pointer flex items-center gap-1"
+                            style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+                            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                            </svg>
+                            JSON
+                          </button>
+                        </div>
                       </div>
                       {renderTable(queryResult.columns, queryResult.rows, queryResult.row_count, 1)}
                     </div>

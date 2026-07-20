@@ -1018,6 +1018,83 @@ def format_uptime(seconds):
         return f"{minutes}m {secs}s"
     return f"{secs}s"
 
+@app.route("/api/logs/export")
+def api_logs_export():
+    """Export logs dưới dạng file download (cho browser use không Tauri)"""
+    project = request.args.get("project", "All")
+    fmt = request.args.get("format", "txt")  # txt, md, json
+    limit_str = request.args.get("limit", "0")
+    search = request.args.get("search", "")
+    
+    try:
+        limit = int(limit_str)
+    except ValueError:
+        limit = 0
+    
+    if project == "All":
+        all_lines = []
+        for p in config["projects"]:
+            lf = get_log_file(p)
+            if lf.exists():
+                with open(lf, encoding="utf-8", errors="replace") as f:
+                    lines = [l for l in f.read().split("\n") if l]
+                    all_lines.extend(lines)
+        lines = all_lines
+    else:
+        proj = get_project(project)
+        if not proj:
+            return jsonify({"error": "Project not found"}), 404
+        lf = get_log_file(proj)
+        if not lf.exists():
+            lines = []
+        else:
+            with open(lf, encoding="utf-8", errors="replace") as f:
+                lines = [l for l in f.read().split("\n") if l]
+    
+    # Apply search filter
+    if search:
+        search_lower = search.lower()
+        lines = [l for l in lines if search_lower in l.lower()]
+    
+    # Apply limit
+    if limit > 0 and limit < len(lines):
+        lines = lines[-limit:]
+    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    safe_name = project.lower().replace(' ', '_')
+    
+    if fmt == "json":
+        content = json.dumps({
+            "project": project,
+            "exported_at": datetime.now().isoformat(),
+            "line_count": len(lines),
+            "search_filter": search if search else None,
+            "lines": lines
+        }, indent=2, ensure_ascii=False)
+        filename = f"logs_{safe_name}_{timestamp}.json"
+        return Response(
+            content,
+            mimetype="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"', "Content-Type": "application/json; charset=utf-8"}
+        )
+    elif fmt == "md":
+        content = f"# Logs: {project}\nDate: {datetime.now().isoformat()}\nLines: {len(lines)}\n\n```text\n" + "\n".join(lines) + "\n```\n"
+        filename = f"logs_{safe_name}_{timestamp}.md"
+        return Response(
+            content,
+            mimetype="text/markdown",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"', "Content-Type": "text/markdown; charset=utf-8"}
+        )
+    else:
+        # TXT
+        content = "\n".join(lines)
+        filename = f"logs_{safe_name}_{timestamp}.log"
+        return Response(
+            content,
+            mimetype="text/plain",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"', "Content-Type": "text/plain; charset=utf-8"}
+        )
+
 @app.route("/api/logs/save-to-file", methods=["POST"])
 def api_save_logs_to_file():
     data = request.get_json() or {}
@@ -1508,15 +1585,126 @@ def api_db_query():
 
 @app.route("/api/database/export", methods=["POST"])
 def api_db_export():
-    """Export dữ liệu table ra JSON hoặc CSV"""
+    """Export dữ liệu table ra JSON hoặc CSV (file download)"""
     data = request.get_json() or {}
     conn_id = data.get("connectionId")
     database = data.get("database", "")
     schema = data.get("schema", "public")
     table = data.get("table", "")
-    export_format = data.get("format", "json")
+    export_format = data.get("format", "json")  # "json" or "csv"
+    query_text = data.get("query", "")  # Nếu có, export kết quả query thay vì table
     
-    return jsonify({"message": "Use /api/database/query or /api/database/table-data to export data"})
+    if not conn_id:
+        return jsonify({"error": "Missing connectionId"}), 400
+    if not query_text and not table:
+        return jsonify({"error": "Missing table or query"}), 400
+    
+    conns = load_db_connections()
+    found = next((c for c in conns if c.get("id") == conn_id), None)
+    if not found:
+        return jsonify({"error": "Connection not found"}), 404
+    
+    found["database"] = database
+    
+    try:
+        conn = get_db_connection(found)
+        cursor = conn.cursor()
+        db_type = found.get("type", "postgresql").lower()
+        
+        columns = []
+        rows = []
+        
+        if query_text:
+            # Export từ custom query
+            cursor.execute(query_text)
+            if cursor.description:
+                columns = [{"name": d[0]} for d in cursor.description]
+                for row in cursor.fetchall():
+                    row_dict = {}
+                    for i, col in enumerate(columns):
+                        val = row[i]
+                        if hasattr(val, 'isoformat'):
+                            val = val.isoformat()
+                        row_dict[col["name"]] = str(val) if val is not None else None
+                    rows.append(row_dict)
+        else:
+            # Export từ table (lấy tất cả dữ liệu, không phân trang)
+            safe_schema = sanitize_identifier(schema, db_type)
+            safe_table = sanitize_identifier(table, db_type)
+            safe_db = sanitize_identifier(database, db_type)
+            
+            if db_type == "postgresql":
+                cursor.execute("""
+                    SELECT column_name, data_type, is_nullable
+                    FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s
+                    ORDER BY ordinal_position
+                """, (schema, table))
+                columns = [{"name": r[0], "type": r[1]} for r in cursor.fetchall()]
+                col_names = ", ".join([f'"{c["name"]}"' for c in columns])
+                cursor.execute(f'SELECT {col_names} FROM "{safe_schema}"."{safe_table}"')
+            else:
+                cursor.execute(f"""
+                    SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = '{safe_db}' AND TABLE_NAME = '{safe_table}'
+                    ORDER BY ORDINAL_POSITION
+                """)
+                columns = [{"name": r[0], "type": r[1]} for r in cursor.fetchall()]
+                col_names = ", ".join([f"`{c['name']}`" for c in columns])
+                cursor.execute(f"SELECT {col_names} FROM `{safe_db}`.`{safe_table}`")
+            
+            for row in cursor.fetchall():
+                row_dict = {}
+                for i, col in enumerate(columns):
+                    val = row[i]
+                    if hasattr(val, 'isoformat'):
+                        val = val.isoformat()
+                    row_dict[col["name"]] = str(val) if val is not None else None
+                rows.append(row_dict)
+        
+        cursor.close()
+        conn.close()
+        
+        if export_format == "csv":
+            # Tạo CSV
+            import io
+            import csv
+            output = io.StringIO()
+            if columns:
+                writer = csv.DictWriter(output, fieldnames=[c["name"] for c in columns])
+                writer.writeheader()
+                writer.writerows(rows)
+            csv_content = output.getvalue()
+            filename = f"{table or 'query'}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            return Response(
+                csv_content,
+                mimetype="text/csv",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Content-Type": "text/csv; charset=utf-8"
+                }
+            )
+        else:
+            # Mặc định: JSON
+            filename = f"{table or 'query'}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            json_content = json.dumps({
+                "table": table or "query",
+                "columns": columns,
+                "rows": rows,
+                "total_rows": len(rows),
+                "exported_at": datetime.now().isoformat()
+            }, indent=2, ensure_ascii=False)
+            return Response(
+                json_content,
+                mimetype="application/json",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Content-Type": "application/json; charset=utf-8"
+                }
+            )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ═══════════════════════════════════════════════════════════════
 # PRINTER APIs — Quản lý máy in, lịch sử in, thống kê

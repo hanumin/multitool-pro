@@ -290,7 +290,7 @@ function App() {
 
             {/* Mobile URL select */}
             <div className="flex lg:hidden">
-              <select onChange={e => { if (e.target.value) { openBrowser(e.target.value); e.target.value = '' } }}
+              <select id="mobile-url-select" name="urlSelect" onChange={e => { if (e.target.value) { openBrowser(e.target.value); e.target.value = '' } }}
                 className="px-1 py-0.5 text-[9px] rounded border"
                 style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
                 <option value="">URL...</option>
@@ -302,8 +302,8 @@ function App() {
           </div>
 
           <div className="flex items-center gap-3">
-            <label className="flex items-center gap-1.5 cursor-pointer select-none" style={{ color: 'var(--fg-dim)' }}>
-              <input type="checkbox" checked={autostart} onChange={toggleAutostart}
+            <label htmlFor="autostart-checkbox" className="flex items-center gap-1.5 cursor-pointer select-none" style={{ color: 'var(--fg-dim)' }}>
+              <input id="autostart-checkbox" name="autostart" type="checkbox" checked={autostart} onChange={toggleAutostart}
                 className="w-3 h-3 rounded cursor-pointer accent-emerald-500" />
               Tự động khởi động
             </label>

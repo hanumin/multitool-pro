@@ -270,14 +270,14 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
                     className="flex-1 px-1.5 py-1 rounded border font-mono"
                     style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }} />
                 </div>
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input type="checkbox" checked={verifyMd5} onChange={e => setVerifyMd5(e.target.checked)}
+                <label htmlFor="filecopier-verify-md5" className="flex items-center gap-2 cursor-pointer">
+                  <input id="filecopier-verify-md5" name="verifyMd5" type="checkbox" checked={verifyMd5} onChange={e => setVerifyMd5(e.target.checked)}
                     className="accent-emerald-500" />
                   <span style={{ color: 'var(--fg-muted)' }}>Xác minh MD5</span>
                 </label>
                 <div className="flex items-center gap-2">
                   <span style={{ color: 'var(--fg-muted)' }}>Xung đột:</span>
-                  <select value={conflictMode} onChange={e => setConflictMode(e.target.value as any)}
+                  <select id="filecopier-conflict-mode" name="conflictMode" value={conflictMode} onChange={e => setConflictMode(e.target.value as any)}
                     className="px-1.5 py-1 rounded border text-[10px]"
                     style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
                     <option value="overwrite">Ghi đè</option>

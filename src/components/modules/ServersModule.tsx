@@ -298,6 +298,35 @@ export default function ServersModule({ theme, setStatusText }: ServersModulePro
     setStatusText(`Copied ${targetLines.length} lines as ${exportFormat.toUpperCase()}`)
   }
 
+  const handleDownloadLog = async () => {
+    const lines = fullLogs[activeTab] || []
+    if (!lines.length) { setStatusText('No logs to download'); return }
+    try {
+      const params = new URLSearchParams({
+        project: activeTab,
+        format: exportFormat,
+        limit: String(exportLimit),
+        search: logSearch
+      })
+      const res = await fetch(`${API}/api/logs/export?${params}`)
+      if (!res.ok) { setStatusText('Download failed'); return }
+      const blob = await res.blob()
+      const contentDisposition = res.headers.get('Content-Disposition')
+      let filename = `logs_${activeTab.toLowerCase().replace(/\s+/g, '_')}.${exportFormat === 'txt' ? 'log' : exportFormat}`
+      if (contentDisposition) {
+        const match = contentDisposition.match(/filename="?([^"]+)"?/)
+        if (match) filename = match[1]
+      }
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url; a.download = filename
+      document.body.appendChild(a); a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+      setStatusText(`Downloaded ${filename}`)
+    } catch (e: any) { setStatusText(`❌ ${e.message}`) }
+  }
+
   const handleExportLog = async () => {
     const targetLines = getExportLines(exportLimit)
     if (!targetLines.length) { setStatusText('No logs to export'); return }
@@ -547,7 +576,7 @@ export default function ServersModule({ theme, setStatusText }: ServersModulePro
                 })}
               </div>
               <div className="flex items-center gap-1.5 shrink-0 ml-2">
-                <select value={exportLimit} onChange={e => setExportLimit(Number(e.target.value))}
+                <select id="log-export-limit" name="exportLimit" value={exportLimit} onChange={e => setExportLimit(Number(e.target.value))}
                   className="px-1.5 py-0.5 text-[10px] font-medium rounded-md cursor-pointer border"
                   style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
                   <option value={100}>100 dòng</option>
@@ -555,7 +584,7 @@ export default function ServersModule({ theme, setStatusText }: ServersModulePro
                   <option value={1000}>1000 dòng</option>
                   <option value={0}>Tất cả</option>
                 </select>
-                <select value={exportFormat} onChange={e => setExportFormat(e.target.value as any)}
+                <select id="log-export-format" name="exportFormat" value={exportFormat} onChange={e => setExportFormat(e.target.value as any)}
                   className="px-1.5 py-0.5 text-[10px] font-medium rounded-md cursor-pointer border"
                   style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
                   <option value="txt">Văn bản</option>
@@ -564,21 +593,39 @@ export default function ServersModule({ theme, setStatusText }: ServersModulePro
                 </select>
                 <button onClick={handleExportLog}
                   className="px-2.5 py-0.5 text-[10px] font-medium rounded-md border transition-all active:scale-95 cursor-pointer"
-                  style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>Export</button>
+                  style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+                  <svg className="w-2.5 h-2.5 inline mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                  Lưu
+                </button>
                 <button onClick={handleCopyLog}
-                  className="px-2.5 py-0.5 text-[10px] font-medium rounded-md transition-all active:scale-95 cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white border-0">Copy</button>
+                  className="px-2.5 py-0.5 text-[10px] font-medium rounded-md transition-all active:scale-95 cursor-pointer bg-emerald-600 hover:bg-emerald-500 text-white border-0 flex items-center gap-1">
+                  <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" />
+                  </svg>
+                  Copy
+                </button>
+                <button onClick={handleDownloadLog}
+                  className="px-2.5 py-0.5 text-[10px] font-medium rounded-md border transition-all active:scale-95 cursor-pointer flex items-center gap-1"
+                  style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+                  <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                  </svg>
+                  Tải
+                </button>
               </div>
             </div>
             {/* Log Search & Filter Bar */}
             <div className="flex items-center gap-2 px-4 py-1.5 border-b" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--input-bg)' }}>
               <div className="relative flex-1">
                 <span className="absolute left-2 top-1/2 -translate-y-1/2 text-[9px]" style={{ color: 'var(--fg-dim)' }}>🔍</span>
-                <input type="text" value={logSearch} onChange={e => setLogSearch(e.target.value)}
+                <input id="log-search" name="logSearch" type="text" value={logSearch} onChange={e => setLogSearch(e.target.value)}
                   placeholder="Tìm kiếm trong log..."
                   className="w-full pl-6 pr-2 py-1 text-[10px] rounded border focus:outline-none focus:ring-1 focus:ring-emerald-500/30 transition-all"
                   style={{ backgroundColor: 'var(--bg)', borderColor: 'var(--border)', color: 'var(--fg)' }} />
               </div>
-              <select value={logFilter} onChange={e => setLogFilter(e.target.value as any)}
+              <select id="log-filter" name="logFilter" value={logFilter} onChange={e => setLogFilter(e.target.value as any)}
                 className="px-1.5 py-1 text-[10px] rounded border cursor-pointer"
                 style={{ backgroundColor: 'var(--bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
                 <option value="all">Tất cả</option>
@@ -662,14 +709,14 @@ export default function ServersModule({ theme, setStatusText }: ServersModulePro
             style={{ backgroundColor: 'var(--bg)', borderColor: 'var(--border)', color: 'var(--fg)' }}>
             <div className="flex items-center justify-between pb-4 border-b" style={{ borderColor: 'var(--border)' }}>
               <div>
-                <h3 className="text-sm font-semibold">Biến môi trường</h3>
+                <label htmlFor="env-editor" className="text-sm font-semibold cursor-pointer">Biến môi trường</label>
                 <p className="text-[10px] font-mono text-gray-500">{envEditingProject} › {envFileName}</p>
               </div>
               <button onClick={() => setEnvEditingProject(null)}
                 className="p-1 rounded-lg hover:bg-black/10 dark:hover:bg-white/10 transition-colors cursor-pointer border-0"
                 style={{ color: 'var(--fg-muted)' }}>&times;</button>
             </div>
-            <textarea value={envContent} onChange={e => setEnvContent(e.target.value)} rows={12}
+            <textarea id="env-editor" name="envContent" value={envContent} onChange={e => setEnvContent(e.target.value)} rows={12}
               className="w-full border rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500 mt-4"
               style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }}
               placeholder="# PORT=4000\n# DATABASE_URL=..." />

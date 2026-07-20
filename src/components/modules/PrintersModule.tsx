@@ -1093,13 +1093,13 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
               <div className="flex items-center gap-2">
                 <div className="relative flex-1">
                   <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[10px]" style={{ color: 'var(--fg-dim)' }}>🔍</span>
-                  <input type="text" value={historySearch}
+                  <input id="history-search" name="historySearch" type="text" value={historySearch}
                     onChange={e => setHistorySearch(e.target.value)}
                     placeholder="Tìm kiếm lịch sử..."
                     className="w-full pl-7 pr-3 py-1.5 text-[10px] rounded-lg border focus:outline-none focus:ring-2 focus:ring-emerald-500/30 transition-all"
                     style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg)' }} />
                 </div>
-                <select value={historyFilterDays}
+                <select id="history-filter-days" name="historyFilterDays" value={historyFilterDays}
                   onChange={e => setHistoryFilterDays(Number(e.target.value))}
                   className="px-2 py-1.5 text-[10px] rounded-lg border focus:outline-none"
                   style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg)' }}>
