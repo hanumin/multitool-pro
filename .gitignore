@@ -24,6 +24,10 @@ cookies.txt
 .claude/
 .gitnexus/
 
+# .NET Build artifacts
+printer-monitor/bin/
+printer-monitor/obj/
+
 # Logs
 *.log
 

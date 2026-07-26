@@ -1,6 +1,6 @@
 {
   "productName": "MultiTool Pro",
-  "version": "1.9.3",
+  "version": "1.9.10",
   "identifier": "com.multitoolpro.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -12,10 +12,10 @@
     "windows": [
       {
         "title": "MultiTool Pro",
-        "width": 1280,
-        "height": 800,
-        "minWidth": 960,
-        "minHeight": 600,
+        "width": 1680,
+        "height": 1000,
+        "minWidth": 1000,
+        "minHeight": 720,
         "resizable": true,
         "fullscreen": false,
         "center": true

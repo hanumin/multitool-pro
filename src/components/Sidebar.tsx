@@ -8,12 +8,14 @@ interface SidebarProps {
   statusText: string
 }
 
+// WHY: Collapsed = 56px (chỉ icon), expanded = 220px (icon + label + description).
+// Dùng --bg-sidebar CSS variable để theme-aware (dark sidebar riêng biệt với main bg).
 export default function Sidebar({ activeModule, onModuleChange, collapsed, onToggleCollapse, statusText }: SidebarProps) {
   return (
     <aside
       className="flex flex-col border-r shrink-0 transition-all duration-300 select-none"
       style={{
-        width: collapsed ? 56 : 200,
+        width: collapsed ? 56 : 220,
         background: 'var(--bg-sidebar)',
         borderColor: 'var(--border)',
       }}
@@ -33,7 +35,7 @@ export default function Sidebar({ activeModule, onModuleChange, collapsed, onTog
             <h1 className="text-sm font-semibold tracking-tight truncate" style={{ color: 'var(--fg)' }}>
               Bảng điều khiển
             </h1>
-            <p className="text-[9px] truncate" style={{ color: 'var(--fg-muted)' }}>v1.9.3</p>
+            <p className="text-xs truncate" style={{ color: 'var(--fg-muted)' }}>v1.9.10</p>
           </div>
         )}
         {/* Toggle collapse button */}
@@ -78,7 +80,7 @@ export default function Sidebar({ activeModule, onModuleChange, collapsed, onTog
               {!collapsed && (
                 <div className="min-w-0 flex-1">
                   <div className="text-xs font-medium truncate">{mod.label}</div>
-                  <div className="text-[9px] truncate" style={{ color: 'var(--fg-dim)' }}>
+                  <div className="text-xs truncate" style={{ color: 'var(--fg-dim)' }}>
                     {mod.description}
                   </div>
                 </div>
@@ -94,7 +96,7 @@ export default function Sidebar({ activeModule, onModuleChange, collapsed, onTog
       {/* Status footer */}
       {!collapsed && (
         <div
-          className="px-3 py-2 border-t text-[10px] shrink-0"
+          className="px-3 py-2 border-t text-xs shrink-0"
           style={{ borderColor: 'var(--border)', color: 'var(--fg-dim)' }}
         >
           <div className="flex items-center gap-1.5">

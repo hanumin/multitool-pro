@@ -1,0 +1,53 @@
+# All-in-One CI — TypeScript + Python + WHY Comments
+#
+# Chạy mỗi khi push/PR vào main:
+#   1. npx tsc --noEmit       (TypeScript typecheck)
+#   2. python -m py_compile   (Python syntax check)
+#   3. python scripts/check-why-comments.py --exit-error (WHY coverage)
+#
+# Có thể chạy manual từ GitHub UI (workflow_dispatch).
+
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  typecheck:
+    name: TypeScript
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci || npm install
+      - name: TypeScript typecheck
+        run: npx tsc --noEmit
+
+  python-compile:
+    name: Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Check Python syntax
+        run: python -m py_compile backend/app.py
+
+  why-check:
+    name: WHY Comments
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run WHY comment check
+        run: python scripts/check-why-comments.py --exit-error --verbose

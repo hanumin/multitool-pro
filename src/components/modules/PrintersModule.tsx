@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Printer } from '../../types'
 
-const API = 'http://127.0.0.1:5050'
+import { API, fetchWithRetry } from '../../utils/apiFetch'
 
 interface PrintHistoryEntry {
   datetime: string
@@ -109,6 +109,9 @@ interface PrintersModuleProps {
 // getStatusColor, getStatusBg, getStatusRing, getStatusIcon
 // → Chuyển trạng thái máy in thành màu sắc/giao diện
 
+// WHY: Helper — map trạng thái máy in (string) sang màu sắc UI.
+// Dùng includes() để match Vietnamese + English status text.
+// Thứ tự ưu tiên: ready > printing > offline/error > paper jam > no paper.
 const getStatusColor = (status: string) => {
   const s = status?.toLowerCase()
   if (s?.includes('sẵn sàng') || s?.includes('ready') || s?.includes('rảnh')) return '#22c55e'
@@ -119,11 +122,16 @@ const getStatusColor = (status: string) => {
   return '#f59e0b'
 }
 
+// WHY: Helper — tạo background color từ getStatusColor với độ mờ 15%.
+// Dùng inline hex + alpha (VD: #22c55e15) thay vì rgba() để đồng bộ với design system.
 const getStatusBg = (status: string) => {
   const c = getStatusColor(status)
   return `${c}15`
 }
 
+// WHY: Helper — map trạng thái sang CSS ring classes (Tailwind border utilities).
+// Dùng CSS class (không phải inline style) để hover transitions hoạt động.
+// animate-pulse cho trạng thái 'printing' để tạo hiệu ứng sống động.
 const getStatusRing = (status: string) => {
   const s = status?.toLowerCase()
   if (s?.includes('sẵn sàng') || s?.includes('ready') || s?.includes('rảnh')) return 'border-emerald-500/30'
@@ -133,6 +141,8 @@ const getStatusRing = (status: string) => {
   return 'border-amber-500/30'
 }
 
+// WHY: Helper — chọn icon ký tự (unicode) cho từng trạng thái máy in.
+// Dùng ký tự đơn giản (✓ ⟳ ✕ ⚠) thay vì SVG để giảm code + render nhanh hơn.
 const getStatusIcon = (status: string) => {
   const s = status?.toLowerCase()
   if (s?.includes('sẵn sàng') || s?.includes('ready') || s?.includes('rảnh')) return '✓'
@@ -154,6 +164,9 @@ const statusGradients: Record<string, string> = {
 }
 
 // ── Component ──────────────────────────────────────
+// WHY: Module quản lý máy in — dashboard, WMI status, print history, settings, PJL diagnostics.
+// Polling 5s: printers + reminder + settings + history + stats + activity + WMI.
+// Kiến trúc: fetchAll() gọi song song 4 API chính → xử lý settings trước → printers sau.
 export default function PrintersModule({ theme, setStatusText }: PrintersModuleProps) {
   const [printers, setPrinters] = useState<Printer[]>([])
   const [loading, setLoading] = useState(true)
@@ -175,6 +188,10 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
   const [printerStats, setPrinterStats] = useState<PrinterStats | null>(null)
   const [printActivity, setPrintActivity] = useState<PrintActivity[]>([])
   const [statsOpen, setStatsOpen] = useState(false)
+  const [pjlData, setPjlData] = useState<any>(null)
+  const [pjlLoading, setPjlLoading] = useState(false)
+  const [pjlIpInput, setPjlIpInput] = useState('')
+  const [showPjlIpInput, setShowPjlIpInput] = useState(false)
 
   // ── History modal state ──
   const [historySearch, setHistorySearch] = useState('')
@@ -185,13 +202,16 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
   const importFileInputRef = useRef<HTMLInputElement>(null)
   const [importResult, setImportResult] = useState<string | null>(null)
 
+  // WHY: Import từ file JSON — parse text → gửi lên backend → fetchAll refresh.
+  // Dùng hidden <input> ref thay vì Tauri dialog để đơn giản (file text, không cần path).
+  // Reset input.value = '' sau import để cho phép import lại cùng file.
   const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
     try {
       const text = await file.text()
       const data = JSON.parse(text)
-      const res = await fetch(`${API}/api/printer/import`, {
+      const res = await fetchWithRetry(`${API}/api/printer/import`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ data, mode: 'overwrite' })
@@ -214,9 +234,11 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
     if (importFileInputRef.current) importFileInputRef.current.value = ''
   }
 
+  // WHY: Backup gọi riêng (không trong fetchAll) vì chỉ cần khi user click.
+  // Backend trả về size KB để hiển thị — không cần UI progress.
   const triggerBackup = async () => {
     try {
-      const res = await fetch(`${API}/api/printer/backup`, { method: 'POST' })
+      const res = await fetchWithRetry(`${API}/api/printer/backup`, { method: 'POST' })
       if (res.ok) {
         const data = await res.json()
         setStatusText(`✅ Đã sao lưu: ${(data.size / 1024).toFixed(1)} KB`)
@@ -267,6 +289,8 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
     return false
   }).length
 
+  // WHY: Export qua Blob download (fallback khi clipboard API không khả dụng).
+  // JSON chứa history + printers + settings + stats — đủ để import lại sau.
   const exportHistory = async () => {
     try {
       const dataStr = JSON.stringify({
@@ -311,14 +335,16 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
   //   settingsData là biến local (không phải state) để tránh
   //   async timing issues với setPrinterSettings.
   // ──────────────────────────────────────────────────────────────
+  // WHY: autoSelectDefault ref: chạy 1 lần duy nhất khi lần đầu fetchAll có printers,
+  // chọn máy in mặc định và lưu vào settings. Không chạy lại mỗi 5s poll.
   const autoSelectDefault = useRef(false)
   const fetchAll = useCallback(async () => {
     try {
       const [printersRes, reminderRes, settingsRes, historyRes] = await Promise.all([
-        fetch(`${API}/api/printers`),
-        fetch(`${API}/api/printer/reminder-check`),
-        fetch(`${API}/api/printer/settings`),
-        fetch(`${API}/api/printer/history`),
+        fetchWithRetry(`${API}/api/printers`),
+        fetchWithRetry(`${API}/api/printer/reminder-check`),
+        fetchWithRetry(`${API}/api/printer/settings`),
+        fetchWithRetry(`${API}/api/printer/history`),
       ])
 
       let settingsData: any = null
@@ -340,7 +366,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
             if (defaultPrinter) {
               const name = defaultPrinter.name
               setPrinterSettings(prev => ({ ...prev, selected_printer: name }))
-              fetch(`${API}/api/printer/settings`, {
+              fetchWithRetry(`${API}/api/printer/settings`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ selected_printer: name })
               }).then(() => setStatusText(`Đang theo dõi: ${name}`)).catch(() => {})
@@ -356,24 +382,24 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
       }
 
       try {
-        const statsRes = await fetch(`${API}/api/printer/stats`)
+        const statsRes = await fetchWithRetry(`${API}/api/printer/stats`)
         if (statsRes.ok) {
           const data = await statsRes.json()
           setPrinterStats(data.stats)
         }
       } catch {}
       try {
-        const activityRes = await fetch(`${API}/api/printer/activity`)
+        const activityRes = await fetchWithRetry(`${API}/api/printer/activity`)
         if (activityRes.ok) {
           const data = await activityRes.json()
           setPrintActivity(data.active_jobs || [])
         }
       } catch {}
 
-      try { await fetch(`${API}/api/printer/auto-detect`, { method: 'POST' }) } catch {}
+      try { await fetchWithRetry(`${API}/api/printer/auto-detect`, { method: 'POST' }) } catch {}
 
       try {
-        const wmiRes = await fetch(`${API}/api/printer/wmi-status`)
+        const wmiRes = await fetchWithRetry(`${API}/api/printer/wmi-status`)
         if (wmiRes.ok) setWmiStatus(await wmiRes.json())
       } catch {}
 
@@ -382,7 +408,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
       if (selPrinter) {
         const foundPrinter = printers.find(p => p.name === selPrinter)
         try {
-          const pcRes = await fetch(`${API}/api/printer/page-count?printer=${encodeURIComponent(selPrinter)}&port=${encodeURIComponent(foundPrinter?.port || '')}`)
+          const pcRes = await fetchWithRetry(`${API}/api/printer/page-count?printer=${encodeURIComponent(selPrinter)}&port=${encodeURIComponent(foundPrinter?.port || '')}`)
           if (pcRes.ok) {
             const pcData = await pcRes.json()
             if (pcData?.page_count !== null && pcData?.page_count !== undefined) {
@@ -404,6 +430,8 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
     return () => clearInterval(interval)
   }, [fetchAll])
 
+  // WHY: Countdown timer — tính từ reminderInfo.days_left + hours_left + minutes_left.
+  // Laser printer bypass: is_laser = true → không hiển thị countdown.
   useEffect(() => {
     if (!reminderInfo) return
     if (reminderInfo.is_laser) {
@@ -419,10 +447,12 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
     setCountdownText(`${totalHours}h ${mins}m`)
   }, [reminderInfo])
 
+  // WHY: fetchJobs chỉ gọi khi user click expand printer — không poll tự động.
+  // [] deps: reference ổn định, tránh re-create khi component re-render.
   const fetchJobs = useCallback(async (name: string) => {
     setJobsLoading(true)
     try {
-      const res = await fetch(`${API}/api/printers/${encodeURIComponent(name)}/jobs`)
+      const res = await fetchWithRetry(`${API}/api/printers/${encodeURIComponent(name)}/jobs`)
       if (res.ok) {
         const data = await res.json()
         setPrinterJobs(data.jobs || [])
@@ -430,36 +460,44 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
     } catch {} finally { setJobsLoading(false) }
   }, [])
 
+  // WHY: Xóa tất cả lệnh in — cần confirm vì không undo được.
+  // DELETE API endpoint, fetchJobs(name) refresh queue sau khi xóa.
   const clearJobs = async (name: string) => {
     if (!window.confirm(`Xóa tất cả lệnh in của "${name}"?`)) return
     try {
-      const res = await fetch(`${API}/api/printers/${encodeURIComponent(name)}/jobs`, { method: 'DELETE' })
+      const res = await fetchWithRetry(`${API}/api/printers/${encodeURIComponent(name)}/jobs`, { method: 'DELETE' })
       if (res.ok) { setPrinterJobs([]); setStatusText(`Đã xóa lệnh in của ${name}`); fetchJobs(name) }
     } catch { setStatusText('Xóa lệnh in thất bại') }
   }
 
+  // WHY: POST /default API + fetchAll refresh toàn bộ (không chỉ fetchJobs).
+  // Vì thay đổi default ảnh hưởng đến danh sách hiển thị.
   const setDefaultPrinter = async (name: string) => {
     try {
-      const res = await fetch(`${API}/api/printers/${encodeURIComponent(name)}/default`, { method: 'POST' })
+      const res = await fetchWithRetry(`${API}/api/printers/${encodeURIComponent(name)}/default`, { method: 'POST' })
       if (res.ok) { setStatusText(`Đã đặt ${name} làm mặc định`); fetchAll() }
     } catch { setStatusText('Thất bại') }
   }
 
+  // WHY: Gửi trang thử qua backend — backend dùng win32print.StartDocPrinter.
+  // Nếu lỗi, backend trả về error message trong JSON response.
   const testPrint = async (name: string) => {
     try {
-      const res = await fetch(`${API}/api/printers/${encodeURIComponent(name)}/test`, { method: 'POST' })
+      const res = await fetchWithRetry(`${API}/api/printers/${encodeURIComponent(name)}/test`, { method: 'POST' })
       if (res.ok) { setStatusText(`Đã gửi trang thử đến ${name}`); fetchAll() }
       else { const e = await res.json(); setStatusText(e.error || 'Thất bại') }
     } catch { setStatusText('In thử thất bại') }
   }
 
+  // WHY: Ghi nhận in thủ công — user tự bấm khi in xong.
+  // Quan trọng cho GDI printers (không có EventLog → không auto-detect).
   const recordManualPrint = async () => {
     if (!printerSettings.selected_printer) {
       setStatusText('⚠️ Chọn máy in trong Cài đặt trước')
       return
     }
     try {
-      const res = await fetch(`${API}/api/printer/log`, {
+      const res = await fetchWithRetry(`${API}/api/printer/log`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'In thủ công', printer_name: printerSettings.selected_printer })
       })
@@ -467,9 +505,11 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
     } catch { setStatusText('Thất bại') }
   }
 
+  // WHY: Save settings gửi TOÀN BỘ printerSettings object (không chỉ field thay đổi).
+  // Backend merge vào file JSON. Đóng modal + fetchAll refresh sau khi save.
   const saveSettings = async () => {
     try {
-      const res = await fetch(`${API}/api/printer/settings`, {
+      const res = await fetchWithRetry(`${API}/api/printer/settings`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(printerSettings)
       })
@@ -477,9 +517,35 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
     } catch { setStatusText('Thất bại') }
   }
 
+  // WHY: PJL query — dùng network socket (cổng 9100) hoặc RAW spooler.
+  // USB printer gửi được lệnh nhưng KHÔNG đọc được response.
+  // Network printer mới đọc được page_count, toner_level, drum_life.
+  const queryPjlStatus = async (printerName: string, printerIp?: string) => {
+    setPjlLoading(true)
+    setPjlData(null)
+    try {
+      let url = `${API}/api/printer/pjl-status?printer=${encodeURIComponent(printerName)}`
+      if (printerIp) {
+        url += `&ip=${encodeURIComponent(printerIp)}`
+      }
+      const res = await fetch(url)
+      if (res.ok) {
+        setPjlData(await res.json())
+      } else {
+        setPjlData({ error: 'Failed to query PJL' })
+      }
+    } catch {
+      setPjlData({ error: 'Connection failed' })
+    } finally {
+      setPjlLoading(false)
+    }
+  }
+
+  // WHY: Delete history entry theo index — backend shift array.
+  // fetchAll refresh sau khi xóa để đồng bộ UI.
   const deleteHistoryEntry = async (index: number) => {
     try {
-      const res = await fetch(`${API}/api/printer/history?index=${index}`, { method: 'DELETE' })
+      const res = await fetchWithRetry(`${API}/api/printer/history?index=${index}`, { method: 'DELETE' })
       if (res.ok) { fetchAll() }
     } catch {}
   }
@@ -499,7 +565,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
           </div>
           <div className="space-y-1">
             <p className="text-sm font-medium" style={{ color: 'var(--fg)' }}>Đang quét máy in</p>
-            <p className="text-[10px]" style={{ color: 'var(--fg-dim)' }}>Kiểm tra kết nối USB...</p>
+            <p className="text-xs" style={{ color: 'var(--fg-dim)' }}>Kiểm tra kết nối USB...</p>
           </div>
         </div>
       </div>
@@ -519,13 +585,13 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
           <div className="relative p-4">
             {/* Header */}
             <div className="flex items-center justify-between mb-3">
-              <h3 className="text-[10px] font-bold uppercase tracking-[0.15em]" style={{ color: 'var(--fg-muted)' }}>
+              <h3 className="text-xs font-bold uppercase tracking-[0.15em]" style={{ color: 'var(--fg-muted)' }}>
                 <span className="mr-1.5">📊</span>Bảng điều khiển
               </h3>
               <div className="flex items-center gap-1.5">
                 {/* Status ring */}
                 {wmiStatus && (
-                  <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[9px] font-semibold"
+                  <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold"
                     style={{ backgroundColor: getStatusBg(wmiStatus.status || ''), color: getStatusColor(wmiStatus.status || '') }}>
                     <span className={`w-1.5 h-1.5 rounded-full ${wmiStatus.online ? 'bg-emerald-400 animate-pulse' : ''}`}
                       style={{ backgroundColor: !wmiStatus.online ? '#ef4444' : undefined }} />
@@ -541,7 +607,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
               <div>
                 {/* Error banner */}
                 {wmiStatus?.error_state && wmiStatus.error_code && wmiStatus.error_code > 2 && (
-                  <div className="mb-2 px-2.5 py-1.5 rounded-lg text-[10px] font-medium flex items-center gap-2"
+                  <div className="mb-2 px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-2"
                     style={{ backgroundColor: '#ef444415', color: '#f87171', border: '1px solid #ef444430' }}>
                     <span>⚠️</span>
                     <span>{wmiStatus.error_state}</span>
@@ -549,33 +615,33 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                 )}
 
                 {/* Selected printer + connectivity */}
-                <div className="space-y-2 text-[11px]">
+                <div className="space-y-2 text-xs">
                   <div className="flex items-center justify-between group">
-                    <span className="text-[9px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>Máy in</span>
+                    <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>Máy in</span>
                     <span className="font-semibold truncate max-w-[200px] text-right text-[12px]" style={{ color: 'var(--fg)' }}>
                       {printerSettings.selected_printer || (
-                        <span className="italic text-[10px]" style={{ color: 'var(--fg-dim)' }}>Chưa chọn</span>
+                        <span className="italic text-xs" style={{ color: 'var(--fg-dim)' }}>Chưa chọn</span>
                       )}
                     </span>
                   </div>
 
                   <div className="flex items-center justify-between">
-                    <span className="text-[9px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>Cổng</span>
-                    <span className="font-mono text-[10px]" style={{ color: 'var(--fg-secondary)' }}>
+                    <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>Cổng</span>
+                    <span className="font-mono text-xs" style={{ color: 'var(--fg-secondary)' }}>
                       {wmiStatus?.port_name || '...'}
                     </span>
                   </div>
 
                   <div className="flex items-center justify-between">
-                    <span className="text-[9px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>Driver</span>
-                    <span className="font-mono text-[10px] truncate max-w-[180px] text-right" style={{ color: 'var(--fg-secondary)' }}>
+                    <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>Driver</span>
+                    <span className="font-mono text-xs truncate max-w-[180px] text-right" style={{ color: 'var(--fg-secondary)' }}>
                       {wmiStatus?.driver_name || (printers.find(p => p.name === printerSettings.selected_printer)?.driver) || '...'}
                     </span>
                   </div>
 
                   <div className="flex items-center justify-between">
-                    <span className="text-[9px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>Đang in</span>
-                    <span className="font-mono text-[10px]" style={{ color: activePrintCount > 0 ? '#22c55e' : 'var(--fg-dim)' }}>
+                    <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>Đang in</span>
+                    <span className="font-mono text-xs" style={{ color: activePrintCount > 0 ? '#22c55e' : 'var(--fg-dim)' }}>
                       {activePrintCount > 0 ? (
                         <span className="flex items-center gap-1">
                           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
@@ -586,8 +652,8 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                   </div>
 
                   <div className="flex items-center justify-between">
-                    <span className="text-[9px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>Lần in cuối</span>
-                    <span className="font-mono text-[10px]" style={{ color: 'var(--fg-secondary)' }}>
+                    <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>Lần in cuối</span>
+                    <span className="font-mono text-xs" style={{ color: 'var(--fg-secondary)' }}>
                       {printerSettings.last_print_date || (
                         <span className="italic" style={{ color: 'var(--fg-dim)' }}>Chưa từng</span>
                       )}
@@ -595,10 +661,10 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                   </div>
 
                   <div className="flex items-center justify-between">
-                    <span className="text-[9px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>
+                    <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>
                       {isLaser ? '🔲 Laser' : '📅 Hạn in'}
                     </span>
-                    <span className={`font-semibold text-[10px] ${reminderInfo?.should_remind && !isLaser ? 'text-red-400' : ''}`}
+                    <span className={`font-semibold text-xs ${reminderInfo?.should_remind && !isLaser ? 'text-red-400' : ''}`}
                       style={{ color: !reminderInfo?.should_remind || isLaser ? 'var(--fg-secondary)' : undefined }}>
                       {countdownText || 'Đang tính...'}
                     </span>
@@ -620,10 +686,10 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                       className="rounded-lg p-2 transition-all duration-200 hover:scale-[1.02]"
                       style={{ backgroundColor: `${metric.color}08`, border: `1px solid ${metric.color}15` }}>
                       <div className="flex items-center gap-1 mb-1">
-                        <span className="text-[9px]">{metric.icon}</span>
+                        <span className="text-[10px]">{metric.icon}</span>
                         <span className="text-[8px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>{metric.label}</span>
                       </div>
-                      <div className="text-[11px] font-bold font-mono" style={{ color: metric.color }}>
+                      <div className="text-xs font-bold font-mono" style={{ color: metric.color }}>
                         {metric.value !== undefined && metric.value !== null && metric.value !== ''
                           ? `${metric.value}${metric.unit ? ` ${metric.unit}` : ''}`
                           : (<span style={{ color: 'var(--fg-dim)' }}>...</span>)
@@ -676,15 +742,15 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
             {/* Stats footer */}
             <div className="mt-3 pt-3 border-t border-dashed flex items-center justify-between"
               style={{ borderColor: 'var(--border)' }}>
-              <span className="text-[9px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>
+              <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>
                 Tổng số lần in
               </span>
               <button onClick={() => setStatsOpen(true)}
-                className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-[10px] font-bold transition-all duration-200 hover:scale-105 active:scale-95 border-0 cursor-pointer"
+                className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-bold transition-all duration-200 hover:scale-105 active:scale-95 border-0 cursor-pointer"
                 style={{ backgroundColor: '#22c55e15', color: '#22c55e', border: '1px solid #22c55e25' }}>
                 <span className="text-base">{totalPrints}</span>
-                <span className="text-[9px] font-normal opacity-70">lần</span>
-                <span className="text-[10px] ml-0.5">📊</span>
+                <span className="text-[10px] font-normal opacity-70">lần</span>
+                <span className="text-xs ml-0.5">📊</span>
               </button>
             </div>
           </div>
@@ -693,7 +759,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
         {/* ── Card 2: Quick Actions ── */}
         <div className="rounded-xl border backdrop-blur-sm p-4 transition-all duration-300 hover:shadow-lg flex flex-col"
           style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border)' }}>
-          <h3 className="text-[10px] font-bold uppercase tracking-[0.15em] mb-3" style={{ color: 'var(--fg-muted)' }}>
+          <h3 className="text-xs font-bold uppercase tracking-[0.15em] mb-3" style={{ color: 'var(--fg-muted)' }}>
             <span className="mr-1.5">⚡</span>Thao tác nhanh
           </h3>
 
@@ -708,7 +774,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
               { label: 'Cài đặt', icon: '⚙️', color: '#f59e0b', action: () => { setImportResult(null); setSettingsOpen(true) } },
             ].map((btn, i) => (
               <button key={i} onClick={btn.action}
-                className="flex flex-col items-center justify-center gap-1 px-2 py-3 rounded-xl text-[10px] font-semibold transition-all duration-200 hover:scale-[1.03] active:scale-95 border-0 cursor-pointer"
+                className="flex flex-col items-center justify-center gap-1 px-2 py-3 rounded-xl text-xs font-semibold transition-all duration-200 hover:scale-[1.03] active:scale-95 border-0 cursor-pointer"
                 style={{ backgroundColor: `${btn.color}10`, color: btn.color, border: `1px solid ${btn.color}18` }}>
                 <span className="text-lg">{btn.icon}</span>
                 <span>{btn.label}</span>
@@ -718,22 +784,22 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
 
           {/* Alert area */}
           {!isLaser && reminderInfo?.should_remind && printerSettings.reminder_enabled && (
-            <div className="mt-auto p-2.5 rounded-xl border text-[10px] flex items-center gap-2.5 animate-pulse"
+            <div className="mt-auto p-2.5 rounded-xl border text-xs flex items-center gap-2.5 animate-pulse"
               style={{ backgroundColor: '#ef444410', borderColor: '#ef444430', color: '#f87171' }}>
               <span className="text-base">🔴</span>
               <div>
                 <div className="font-semibold">Đã đến lúc in!</div>
-                <div className="text-[9px] mt-0.5 opacity-80">Lần cuối: {printerSettings.last_print_date || 'chưa từng'}</div>
+                <div className="text-[10px] mt-0.5 opacity-80">Lần cuối: {printerSettings.last_print_date || 'chưa từng'}</div>
               </div>
             </div>
           )}
           {isLaser && (
-            <div className="mt-auto p-2.5 rounded-xl border text-[10px] flex items-center gap-2.5"
+            <div className="mt-auto p-2.5 rounded-xl border text-xs flex items-center gap-2.5"
               style={{ backgroundColor: '#eab30810', borderColor: '#eab30830', color: '#eab308' }}>
               <span className="text-base">🔲</span>
               <div>
                 <div className="font-semibold">Máy in laser</div>
-                <div className="text-[9px] mt-0.5 opacity-80">Không cần nhắc chống khô mực</div>
+                <div className="text-[10px] mt-0.5 opacity-80">Không cần nhắc chống khô mực</div>
               </div>
             </div>
           )}
@@ -752,7 +818,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                 <p className="text-xs italic" style={{ color: 'var(--fg-dim)' }}>Không tìm thấy máy in nào.</p>
                 {excluded.length > 0 && printers.length > 0 && (
                   <button onClick={() => { setImportResult(null); setSettingsOpen(true); }}
-                    className="text-[9px] px-3 py-1.5 rounded-lg transition-all border-0 cursor-pointer"
+                    className="text-[10px] px-3 py-1.5 rounded-lg transition-all border-0 cursor-pointer"
                     style={{ backgroundColor: '#3b82f615', color: '#60a5fa' }}>
                     ⚙️ Tất cả {printers.length} máy in đang bị ẩn
                   </button>
@@ -763,7 +829,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
           return (
             <>
               {printers.length > visiblePrinters.length && (
-                <div className="text-[9px] px-1 py-1 flex items-center gap-1.5" style={{ color: 'var(--fg-dim)' }}>
+                <div className="text-[10px] px-1 py-1 flex items-center gap-1.5" style={{ color: 'var(--fg-dim)' }}>
                   <span>🙈 Đã ẩn {printers.length - visiblePrinters.length} máy in ảo</span>                  <button onClick={() => { setImportResult(null); setSettingsOpen(true); }}
                             className="underline hover:no-underline cursor-pointer bg-transparent border-0"
                             style={{ color: '#60a5fa' }}>Cài đặt</button>
@@ -789,16 +855,17 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                     const newSel = isSelected ? null : pr.name
                     setSelectedPrinter(newSel)
                     if (newSel) {
+                      setPjlData(null)
                       fetchJobs(pr.name)
                       setPrinterSettings(prev => ({ ...prev, selected_printer: pr.name }))
-                      fetch(`${API}/api/printer/settings`, {
+                      fetchWithRetry(`${API}/api/printer/settings`, {
                         method: 'POST', headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ selected_printer: pr.name })
                       }).catch(() => {})
-                      fetch(`${API}/api/printer/wmi-status?printer=${encodeURIComponent(pr.name)}`)
+                      fetchWithRetry(`${API}/api/printer/wmi-status?printer=${encodeURIComponent(pr.name)}`)
                         .then(r => r.json()).then(d => setWmiStatus(d)).catch(() => {})
                       // Auto-fetch page count
-                      fetch(`${API}/api/printer/page-count?printer=${encodeURIComponent(pr.name)}&port=${encodeURIComponent(pr.port || '')}`)
+                      fetchWithRetry(`${API}/api/printer/page-count?printer=${encodeURIComponent(pr.name)}&port=${encodeURIComponent(pr.port || '')}`)
                         .then(r => r.json()).then(pc => {
                           if (pc?.page_count !== null) {
                             setPrinterSettings(prev => ({
@@ -851,20 +918,20 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                         )}
                       </div>
                       <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-                        <span className="flex items-center gap-1 text-[10px] font-mono">
+                        <span className="flex items-center gap-1 text-xs font-mono">
                           <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: getStatusColor(pr.status) }} />
                           <span style={{ color: 'var(--fg-muted)' }}>{pr.status || 'Không rõ'}</span>
                         </span>
-                        <span className="text-[9px]" style={{ color: 'var(--fg-dim)' }}>
+                        <span className="text-[10px]" style={{ color: 'var(--fg-dim)' }}>
                           <span className="opacity-60">Việc:</span> {pr.jobs}
                         </span>
                         {pr.driver && (
-                          <span className="text-[9px] hidden sm:inline" style={{ color: 'var(--fg-dim)' }}>
+                          <span className="text-[10px] hidden sm:inline" style={{ color: 'var(--fg-dim)' }}>
                             <span className="opacity-60">Driver:</span> {pr.driver}
                           </span>
                         )}
                         {stats && stats.total > 0 && (
-                          <span className="text-[9px] font-medium" style={{ color: '#4ade80' }}>
+                          <span className="text-[10px] font-medium" style={{ color: '#4ade80' }}>
                             Đã in: {stats.total}
                           </span>
                         )}
@@ -875,7 +942,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                   <div className="flex items-center gap-1.5 shrink-0 ml-2">
                     {!isTracking && !pr.is_laser && (
                       <button onClick={e => { e.stopPropagation(); testPrint(pr.name) }}
-                        className="px-2.5 py-1.5 text-[9px] font-semibold rounded-lg transition-all duration-200 hover:scale-105 active:scale-95 border-0 cursor-pointer"
+                        className="px-2.5 py-1.5 text-[10px] font-semibold rounded-lg transition-all duration-200 hover:scale-105 active:scale-95 border-0 cursor-pointer"
                         style={{ backgroundColor: '#22c55e12', color: '#4ade80', border: '1px solid #22c55e20' }}>
                         In thử
                       </button>
@@ -891,7 +958,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                 {isSelected && (
                   <div className="border-t px-4 py-3 space-y-3 animate-[fadeIn_0.2s_ease]"
                     style={{ borderColor: 'var(--border)' }}>
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[10px]">
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
                       {pr.driver && (
                         <div className="p-2 rounded-lg" style={{ backgroundColor: 'var(--input-bg)' }}>
                           <div className="text-[8px] uppercase tracking-wider mb-0.5" style={{ color: 'var(--fg-dim)' }}>Driver</div>
@@ -959,22 +1026,143 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                     <div className="flex gap-1.5 flex-wrap">
                       {!pr.is_default && (
                         <button onClick={() => setDefaultPrinter(pr.name)}
-                          className="px-2.5 py-1.5 text-[9px] font-semibold rounded-lg transition-all duration-200 hover:scale-105 active:scale-95 border-0 cursor-pointer"
+                          className="px-2.5 py-1.5 text-[10px] font-semibold rounded-lg transition-all duration-200 hover:scale-105 active:scale-95 border-0 cursor-pointer"
                           style={{ backgroundColor: '#3b82f612', color: '#60a5fa', border: '1px solid #3b82f620' }}>
                           📌 Đặt mặc định
                         </button>
                       )}
+                      <button onClick={() => queryPjlStatus(pr.name)}
+                        className="px-2.5 py-1.5 text-[10px] font-semibold rounded-lg transition-all duration-200 hover:scale-105 active:scale-95 border-0 cursor-pointer"
+                        style={{ backgroundColor: '#8b5cf612', color: '#a78bfa', border: '1px solid #8b5cf620' }}>
+                        🔍 Tra cứu PJL
+                      </button>
                     </div>
+
+                    {/* PJL Controls — IP input + Tra cứu button */}
+                    <div className="rounded-lg p-3 text-xs"
+                      style={{ backgroundColor: 'var(--input-bg)', border: '1px solid var(--border)' }}>
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-[8px] uppercase tracking-wider font-semibold" style={{ color: 'var(--fg-dim)' }}>
+                          🔍 PJL Diagnostics
+                        </span>
+                        <span className="text-[8px] px-1.5 py-0.5 rounded-full font-medium"
+                          style={{ backgroundColor: '#8b5cf615', color: '#a78bfa', border: '1px solid #8b5cf625' }}>
+                          Network Only
+                        </span>
+                      </div>
+                      <p className="text-[10px] mb-2" style={{ color: 'var(--fg-muted)' }}>
+                        PJL chỉ hoạt động với máy in có kết nối mạng (cổng 9100).
+                        Máy in USB chỉ gửi lệnh, không đọc được kết quả.
+                      </p>
+                      {/* IP Input */}
+                      {!showPjlIpInput ? (
+                        <div className="flex gap-1.5">
+                          <button onClick={() => queryPjlStatus(pr.name)}
+                            className="flex-1 px-2.5 py-1.5 text-[10px] font-semibold rounded-lg transition-all duration-200 hover:scale-[1.02] active:scale-95 border-0 cursor-pointer"
+                            style={{ backgroundColor: '#8b5cf612', color: '#a78bfa', border: '1px solid #8b5cf620' }}>
+                            📤 Gửi lệnh (USB)
+                          </button>
+                          <button onClick={() => setShowPjlIpInput(true)}
+                            className="flex-1 px-2.5 py-1.5 text-[10px] font-semibold rounded-lg transition-all duration-200 hover:scale-[1.02] active:scale-95 border-0 cursor-pointer"
+                            style={{ backgroundColor: '#22c55e12', color: '#4ade80', border: '1px solid #22c55e20' }}>
+                            🌐 Tra cứu (Network)
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="space-y-1.5">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[10px] shrink-0" style={{ color: 'var(--fg-muted)' }}>IP:</span>
+                            <input id="pjl-ip-input" name="pjlIp" type="text" value={pjlIpInput}
+                              onChange={e => setPjlIpInput(e.target.value)}
+                              placeholder="VD: 192.168.1.100"
+                              className="flex-1 px-2 py-1 text-xs font-mono rounded border focus:outline-none focus:ring-1 focus:ring-emerald-500/30"
+                              style={{ backgroundColor: 'var(--bg)', borderColor: 'var(--border)', color: 'var(--fg)' }} />
+                            <button onClick={() => { setShowPjlIpInput(false); setPjlIpInput('') }}
+                              className="px-2 py-1 text-[10px] rounded border-0 cursor-pointer hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
+                              style={{ color: 'var(--fg-muted)' }}>✕</button>
+                          </div>
+                          <button onClick={() => { queryPjlStatus(pr.name, pjlIpInput || undefined); setShowPjlIpInput(false) }}
+                            disabled={!pjlIpInput.trim() || pjlLoading}
+                            className="w-full px-2.5 py-1.5 text-[10px] font-semibold rounded-lg transition-all duration-200 hover:scale-[1.02] active:scale-95 disabled:opacity-40 border-0 cursor-pointer"
+                            style={{ backgroundColor: '#22c55e12', color: '#4ade80', border: '1px solid #22c55e20' }}>
+                            {pjlLoading ? '⏳ Đang truy vấn...' : '🔍 Tra cứu với IP'}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* PJL Results */}
+                    {pjlData && (
+                      <div className="rounded-lg p-3 text-xs"
+                        style={{ backgroundColor: 'var(--input-bg)', border: '1px solid var(--border)' }}>
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-[8px] uppercase tracking-wider font-semibold" style={{ color: 'var(--fg-dim)' }}>
+                            🔍 PJL Diagnostics
+                          </span>
+                          <button onClick={() => setPjlData(null)}
+                            className="text-[10px] px-1 rounded hover:bg-black/10 dark:hover:bg-white/10 border-0 cursor-pointer"
+                            style={{ color: 'var(--fg-muted)' }}>✕</button>
+                        </div>
+                        {pjlLoading ? (
+                          <div className="flex items-center gap-2 py-2">
+                            <div className="animate-spin rounded-full h-3 w-3 border-b border-emerald-500" />
+                            <span style={{ color: 'var(--fg-dim)' }}>Đang truy vấn PJL...</span>
+                          </div>
+                        ) : pjlData.error ? (
+                          <div className="p-2 rounded text-[10px]"
+                            style={{ backgroundColor: '#ef444410', color: '#f87171' }}>
+                            ❌ {pjlData.error}
+                          </div>
+                        ) : (
+                          <div className="space-y-1">
+                            {pjlData.page_count !== undefined && (
+                              <div className="flex items-center justify-between py-1 px-2 rounded"
+                                style={{ backgroundColor: 'var(--bg-card)' }}>
+                                <span style={{ color: 'var(--fg-muted)' }}>Số trang</span>
+                                <span className="font-bold font-mono" style={{ color: '#22c55e' }}>{pjlData.page_count}</span>
+                              </div>
+                            )}
+                            {pjlData.toner_level !== undefined && (
+                              <div className="flex items-center justify-between py-1 px-2 rounded"
+                                style={{ backgroundColor: 'var(--bg-card)' }}>
+                                <span style={{ color: 'var(--fg-muted)' }}>Mực in</span>
+                                <span className="font-bold font-mono" style={{ color: pjlData.toner_level < 20 ? '#ef4444' : '#fbbf24' }}>{pjlData.toner_level}%</span>
+                              </div>
+                            )}
+                            {pjlData.drum_life !== undefined && (
+                              <div className="flex items-center justify-between py-1 px-2 rounded"
+                                style={{ backgroundColor: 'var(--bg-card)' }}>
+                                <span style={{ color: 'var(--fg-muted)' }}>Drum</span>
+                                <span className="font-bold font-mono" style={{ color: pjlData.drum_life < 20 ? '#ef4444' : '#fbbf24' }}>{pjlData.drum_life}%</span>
+                              </div>
+                            )}
+                            {pjlData.source && (
+                              <div className="flex items-center justify-between py-1 px-2 rounded"
+                                style={{ backgroundColor: 'var(--bg-card)' }}>
+                                <span style={{ color: 'var(--fg-muted)' }}>Nguồn</span>
+                                <span className="font-mono text-[10px]" style={{ color: 'var(--fg-secondary)' }}>{pjlData.source}</span>
+                              </div>
+                            )}
+                            {pjlData.note && (
+                              <div className="mt-1 p-2 rounded text-[10px]"
+                                style={{ backgroundColor: '#8b5cf610', color: '#a78bfa' }}>
+                                {pjlData.note}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )}
 
                     {/* Print Queue */}
                     <div>
                       <div className="flex items-center justify-between mb-2">
-                        <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-secondary)' }}>
+                        <span className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-secondary)' }}>
                           📄 Hàng đợi in
                         </span>
                         {printerJobs.length > 0 && (
                           <button onClick={() => clearJobs(pr.name)}
-                            className="text-[9px] font-medium px-2 py-0.5 rounded transition-colors border-0 cursor-pointer"
+                            className="text-[10px] font-medium px-2 py-0.5 rounded transition-colors border-0 cursor-pointer"
                             style={{ color: '#f87171', backgroundColor: '#ef444410' }}>
                             Xóa tất cả
                           </button>
@@ -983,14 +1171,14 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                       {jobsLoading ? (
                         <div className="flex items-center gap-2 py-3">
                           <div className="animate-spin rounded-full h-3 w-3 border-b border-emerald-500" />
-                          <span className="text-[10px]" style={{ color: 'var(--fg-dim)' }}>Đang tải...</span>
+                          <span className="text-xs" style={{ color: 'var(--fg-dim)' }}>Đang tải...</span>
                         </div>
                       ) : printerJobs.length === 0 ? (
                         <div className="py-3 text-center">
-                          <p className="text-[10px] italic" style={{ color: 'var(--fg-dim)' }}>Hàng đợi trống</p>
+                          <p className="text-xs italic" style={{ color: 'var(--fg-dim)' }}>Hàng đợi trống</p>
                         </div>
                       ) : (
-                        <div className="space-y-1 text-[10px] font-mono max-h-36 overflow-y-auto">
+                        <div className="space-y-1 text-xs font-mono max-h-36 overflow-y-auto">
                           {printerJobs.map((job, i) => (
                             <div key={i} className="flex items-center justify-between px-2.5 py-1.5 rounded-lg transition-colors hover:brightness-110"
                               style={{ backgroundColor: 'var(--input-bg)' }}>
@@ -1028,7 +1216,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
               {/* Total prints hero */}
               <div className="text-center py-2 sm:py-4">
                 <div className="text-3xl sm:text-4xl font-black font-mono" style={{ color: '#22c55e' }}>{totalPrints}</div>
-                <div className="text-[9px] sm:text-[10px] mt-1 uppercase tracking-wider" style={{ color: 'var(--fg-muted)' }}>Tổng số lần in</div>
+                <div className="text-[10px] sm:text-xs mt-1 uppercase tracking-wider" style={{ color: 'var(--fg-muted)' }}>Tổng số lần in</div>
               </div>
 
               {Object.keys(statsPrinters).length === 0 ? (
@@ -1049,10 +1237,10 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                         animation: `fadeIn 0.3s ease-out ${idx * 0.05}s both`,
                       }}>
                       <div className="flex items-center justify-between mb-1.5">
-                        <span className="font-semibold text-[11px] flex items-center gap-1.5 truncate min-w-0" style={{ color: 'var(--fg)' }}>
+                        <span className="font-semibold text-xs flex items-center gap-1.5 truncate min-w-0" style={{ color: 'var(--fg)' }}>
                           {data.is_laser ? '🔲' : '🖨'} {name}
                         </span>
-                        <span className="font-bold text-emerald-400 text-[11px] shrink-0 ml-2">{data.total}</span>
+                        <span className="font-bold text-emerald-400 text-xs shrink-0 ml-2">{data.total}</span>
                       </div>
                       {/* Progress bar */}
                       <div className="w-full h-1.5 sm:h-2 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--bg)' }}>
@@ -1062,7 +1250,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                             background: 'linear-gradient(90deg, #22c55e, #4ade80)',
                           }} />
                       </div>
-                                      <div className="flex items-center gap-3 text-[9px] mt-1.5">
+                                      <div className="flex items-center gap-3 text-[10px] mt-1.5">
                         <span style={{ color: 'var(--fg-dim)' }}>
                           <span className="opacity-60">Lần cuối:</span> {data.last_print || 'Chưa từng'}
                         </span>
@@ -1081,7 +1269,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
             </div>
             <div className="px-4 sm:px-6 py-3 sm:py-4 border-t flex justify-end" style={{ borderColor: 'var(--border)' }}>
               <button onClick={() => setStatsOpen(false)}
-                className="px-5 sm:px-6 py-2 sm:py-2.5 text-[10px] sm:text-[11px] font-bold rounded-xl transition-all duration-200 hover:scale-105 active:scale-95 border-0 cursor-pointer"
+                className="px-5 sm:px-6 py-2 sm:py-2.5 text-xs sm:text-xs font-bold rounded-xl transition-all duration-200 hover:scale-105 active:scale-95 border-0 cursor-pointer"
                 style={{ backgroundColor: '#22c55e', color: 'white' }}>
                 Đóng
               </button>
@@ -1117,16 +1305,16 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
               {/* Filter/search bar */}
               <div className="flex items-center gap-2">
                 <div className="relative flex-1">
-                  <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[10px]" style={{ color: 'var(--fg-dim)' }}>🔍</span>
+                  <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-xs" style={{ color: 'var(--fg-dim)' }}>🔍</span>
                   <input id="history-search" name="historySearch" type="text" value={historySearch}
                     onChange={e => setHistorySearch(e.target.value)}
                     placeholder="Tìm kiếm lịch sử..."
-                    className="w-full pl-7 pr-3 py-1.5 text-[10px] rounded-lg border focus:outline-none focus:ring-2 focus:ring-emerald-500/30 transition-all"
+                    className="w-full pl-7 pr-3 py-1.5 text-xs rounded-lg border focus:outline-none focus:ring-2 focus:ring-emerald-500/30 transition-all"
                     style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg)' }} />
                 </div>
                 <select id="history-filter-days" name="historyFilterDays" value={historyFilterDays}
                   onChange={e => setHistoryFilterDays(Number(e.target.value))}
-                  className="px-2 py-1.5 text-[10px] rounded-lg border focus:outline-none"
+                  className="px-2 py-1.5 text-xs rounded-lg border focus:outline-none"
                   style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg)' }}>
                   <option value={0}>Tất cả</option>
                   <option value={1}>Hôm nay</option>
@@ -1139,7 +1327,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
               {/* Tab buttons */}
               <div className="flex gap-1 flex-wrap">
                 <button onClick={() => setHistoryTab('all')}
-                  className={`px-2.5 py-1 text-[9px] font-semibold rounded-lg transition-all duration-200 border-0 cursor-pointer ${historyTab === 'all' ? 'ring-2 ring-emerald-500/40' : ''}`}
+                  className={`px-2.5 py-1 text-[10px] font-semibold rounded-lg transition-all duration-200 border-0 cursor-pointer ${historyTab === 'all' ? 'ring-2 ring-emerald-500/40' : ''}`}
                   style={{
                     backgroundColor: historyTab === 'all' ? '#22c55e20' : 'var(--input-bg)',
                     color: historyTab === 'all' ? '#22c55e' : 'var(--fg-secondary)',
@@ -1148,7 +1336,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                 </button>
                 {historyPrinters.map(p => (
                   <button key={p} onClick={() => setHistoryTab(p)}
-                    className={`px-2.5 py-1 text-[9px] font-semibold rounded-lg transition-all duration-200 border-0 cursor-pointer ${historyTab === p ? 'ring-2 ring-emerald-500/40' : ''}`}
+                    className={`px-2.5 py-1 text-[10px] font-semibold rounded-lg transition-all duration-200 border-0 cursor-pointer ${historyTab === p ? 'ring-2 ring-emerald-500/40' : ''}`}
                     style={{
                       backgroundColor: historyTab === p ? '#22c55e20' : 'var(--input-bg)',
                       color: historyTab === p ? '#22c55e' : 'var(--fg-secondary)',
@@ -1185,7 +1373,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                   </p>
                   {historySearch && (
                     <button onClick={() => setHistorySearch('')}
-                      className="text-[9px] underline cursor-pointer bg-transparent border-0" style={{ color: '#60a5fa' }}>
+                      className="text-[10px] underline cursor-pointer bg-transparent border-0" style={{ color: '#60a5fa' }}>
                       Xóa bộ lọc
                     </button>
                   )}
@@ -1198,7 +1386,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                   const isRecent = diffDays <= 1
                   return (
                     <div key={idx}
-                      className="flex items-center justify-between p-2 rounded-xl text-[10px] transition-all duration-200 hover:brightness-110"
+                      className="flex items-center justify-between p-2 rounded-xl text-xs transition-all duration-200 hover:brightness-110"
                       style={{
                         backgroundColor: 'var(--input-bg)',
                         borderLeft: isRecent ? '2px solid #22c55e' : '2px solid transparent',
@@ -1210,13 +1398,13 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                           <span className="text-[7px] font-bold uppercase" style={{ color: 'var(--fg-muted)' }}>
                             {entry.datetime?.split(' ')[0]?.split('/')[1] || ''}
                           </span>
-                          <span className="text-[11px] font-black" style={{ color: 'var(--fg)' }}>
+                          <span className="text-xs font-black" style={{ color: 'var(--fg)' }}>
                             {entry.datetime?.split(' ')[0]?.split('/')[0] || ''}
                           </span>
                         </div>
                         {/* Content */}
                         <div className="min-w-0 flex-1">
-                          <div className="truncate font-medium text-[10px]" style={{ color: 'var(--fg)' }}>{entry.action}</div>
+                          <div className="truncate font-medium text-xs" style={{ color: 'var(--fg)' }}>{entry.action}</div>
                           <div className="flex items-center gap-2 mt-0.5">
                             <span className="text-[8px] font-mono" style={{ color: 'var(--fg-dim)' }}>
                               {entry.datetime?.split(' ')?.[1] || entry.datetime}
@@ -1235,7 +1423,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                         </div>
                       </div>
                       <button onClick={() => deleteHistoryEntry(printHistory.indexOf(entry))}
-                        className="text-[10px] opacity-30 hover:opacity-100 transition-all duration-200 hover:scale-110 active:scale-90 bg-transparent border-0 cursor-pointer p-1"
+                        className="text-xs opacity-30 hover:opacity-100 transition-all duration-200 hover:scale-110 active:scale-90 bg-transparent border-0 cursor-pointer p-1"
                         style={{ color: '#ef4444' }}>✕</button>
                     </div>
                   )
@@ -1247,29 +1435,29 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
             <div className="px-4 sm:px-6 py-3 sm:py-4 border-t shrink-0 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2 sm:gap-0" style={{ borderColor: 'var(--border)' }}>
               <div className="flex items-center gap-2">
                 <button onClick={recordManualPrint}
-                  className="px-3 py-2 sm:py-2 text-[10px] font-bold rounded-xl transition-all duration-200 hover:scale-[1.02] sm:hover:scale-105 active:scale-95 border-0 cursor-pointer flex items-center justify-center gap-1.5"
+                  className="px-3 py-2 sm:py-2 text-xs font-bold rounded-xl transition-all duration-200 hover:scale-[1.02] sm:hover:scale-105 active:scale-95 border-0 cursor-pointer flex items-center justify-center gap-1.5"
                   style={{ backgroundColor: '#3b82f6', color: 'white' }}>
                   <span>+</span> Ghi nhận in
                 </button>
                 {/* Export button — tải xuống file JSON */}
                 <button onClick={exportHistory}
-                  className="px-3 py-2 sm:py-2 text-[10px] font-bold rounded-xl transition-all duration-200 hover:scale-[1.02] sm:hover:scale-105 active:scale-95 border-0 cursor-pointer flex items-center justify-center gap-1.5"
+                  className="px-3 py-2 sm:py-2 text-xs font-bold rounded-xl transition-all duration-200 hover:scale-[1.02] sm:hover:scale-105 active:scale-95 border-0 cursor-pointer flex items-center justify-center gap-1.5"
                   style={{ backgroundColor: '#8b5cf615', color: '#a78bfa', border: '1px solid #8b5cf625' }}>
                   <span>📤</span> Xuất
                 </button>
                 {/* Import button — chọn file JSON backup */}
-                <input ref={importFileInputRef}
+                <input id="printer-import-file" name="importFile" ref={importFileInputRef}
                   type="file" accept=".json"
                   onChange={handleImportFile}
                   className="hidden" />
                 <button onClick={() => importFileInputRef.current?.click()}
-                  className="px-3 py-2 sm:py-2 text-[10px] font-bold rounded-xl transition-all duration-200 hover:scale-[1.02] sm:hover:scale-105 active:scale-95 border-0 cursor-pointer flex items-center justify-center gap-1.5"
+                  className="px-3 py-2 sm:py-2 text-xs font-bold rounded-xl transition-all duration-200 hover:scale-[1.02] sm:hover:scale-105 active:scale-95 border-0 cursor-pointer flex items-center justify-center gap-1.5"
                   style={{ backgroundColor: '#f59e0b15', color: '#fbbf24', border: '1px solid #f59e0b25' }}>
                   <span>📥</span> Nhập
                 </button>
               </div>
               <button onClick={() => setHistoryOpen(false)}
-                className="px-4 py-2.5 sm:py-2 text-[10px] font-medium rounded-xl border transition-colors duration-200 hover:bg-black/5 dark:hover:bg-white/5 cursor-pointer"
+                className="px-4 py-2.5 sm:py-2 text-xs font-medium rounded-xl border transition-colors duration-200 hover:bg-black/5 dark:hover:bg-white/5 cursor-pointer"
                 style={{ borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
                 Đóng
               </button>
@@ -1294,28 +1482,28 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
             </div>
             <div className="px-4 sm:px-6 py-3 sm:py-4 space-y-3 sm:space-y-4">
               <div className="animate-[fadeIn_0.3s_ease-out_0.05s_both]">
-                <label className="text-[9px] sm:text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-muted)' }}>
+                <label className="text-[10px] sm:text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-muted)' }}>
                   Số ngày giữa các lần in
                 </label>
-                <input type="number" min={1} max={365} value={printerSettings.days_between_prints}
+                <input id="printer-days-between" name="daysBetweenPrints" type="number" min={1} max={365} value={printerSettings.days_between_prints}
                   onChange={e => setPrinterSettings(prev => ({ ...prev, days_between_prints: parseInt(e.target.value) || 5 }))}
                   className="w-full px-3 py-2 text-xs rounded-xl border mt-1 focus:outline-none focus:ring-2 focus:ring-emerald-500/30 transition-all"
                   style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg)' }} />
               </div>
               <div className="animate-[fadeIn_0.3s_ease-out_0.1s_both]">
-                <label className="text-[9px] sm:text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-muted)' }}>
+                <label className="text-[10px] sm:text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-muted)' }}>
                   Nhắc nhở mỗi (phút)
                 </label>
-                <input type="number" min={1} max={1440} value={printerSettings.remind_minutes}
+                <input id="printer-remind-minutes" name="remindMinutes" type="number" min={1} max={1440} value={printerSettings.remind_minutes}
                   onChange={e => setPrinterSettings(prev => ({ ...prev, remind_minutes: parseInt(e.target.value) || 15 }))}
                   className="w-full px-3 py-2 text-xs rounded-xl border mt-1 focus:outline-none focus:ring-2 focus:ring-emerald-500/30 transition-all"
                   style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg)' }} />
               </div>
               <div className="animate-[fadeIn_0.3s_ease-out_0.15s_both]">
-                <label className="text-[9px] sm:text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-muted)' }}>
+                <label className="text-[10px] sm:text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-muted)' }}>
                   Máy in đã chọn
                 </label>
-                <select value={printerSettings.selected_printer}
+                <select id="printer-select-target" name="selectedPrinter" value={printerSettings.selected_printer}
                   onChange={e => setPrinterSettings(prev => ({ ...prev, selected_printer: e.target.value }))}
                   className="w-full px-3 py-2 text-xs rounded-xl border mt-1 focus:outline-none focus:ring-2 focus:ring-emerald-500/30 transition-all"
                   style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg)' }}>
@@ -1326,14 +1514,14 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                 </select>
               </div>
               <label className="animate-[fadeIn_0.3s_ease-out_0.2s_both] flex items-center gap-2.5 text-xs cursor-pointer pt-1">
-                <input type="checkbox" checked={printerSettings.reminder_enabled}
+                <input id="printer-reminder-enabled" name="reminderEnabled" type="checkbox" checked={printerSettings.reminder_enabled}
                   onChange={e => setPrinterSettings(prev => ({ ...prev, reminder_enabled: e.target.checked }))}
                   className="accent-emerald-500 w-4 h-4 rounded" />
                 <span style={{ color: 'var(--fg-secondary)' }}>Bật nhắc nhở in</span>
               </label>
               {/* ── Excluded Printers ── */}
               <div className="animate-[fadeIn_0.3s_ease-out_0.25s_both]">
-                <label className="text-[9px] sm:text-[10px] font-semibold uppercase tracking-wider flex items-center gap-1.5" style={{ color: 'var(--fg-muted)' }}>
+                <label className="text-[10px] sm:text-xs font-semibold uppercase tracking-wider flex items-center gap-1.5" style={{ color: 'var(--fg-muted)' }}>
                   <span>🙈</span> Ẩn máy in khỏi tổng số
                 </label>
                 <p className="text-[8px] mb-2 mt-0.5" style={{ color: 'var(--fg-dim)' }}>
@@ -1344,9 +1532,9 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                     const isExcluded = (printerSettings.excluded_printers || []).includes(p.name)
                     return (
                       <label key={p.name}
-                        className="flex items-center gap-2 py-1 px-2 rounded-lg text-[10px] cursor-pointer transition-colors hover:brightness-110"
+                        className="flex items-center gap-2 py-1 px-2 rounded-lg text-xs cursor-pointer transition-colors hover:brightness-110"
                         style={{ backgroundColor: isExcluded ? '#ef444408' : 'transparent' }}>
-                        <input type="checkbox" checked={isExcluded}
+                        <input name="excludePrinter" type="checkbox" checked={isExcluded}
                           onChange={e => {
                             const excluded = printerSettings.excluded_printers || []
                             if (e.target.checked) {
@@ -1368,7 +1556,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
 
               {/* ── Page Count ── */}
               <div className="animate-[fadeIn_0.3s_ease-out_0.3s_both]">
-                <label className="text-[9px] sm:text-[10px] font-semibold uppercase tracking-wider flex items-center gap-1.5" style={{ color: 'var(--fg-muted)' }}>
+                <label className="text-[10px] sm:text-xs font-semibold uppercase tracking-wider flex items-center gap-1.5" style={{ color: 'var(--fg-muted)' }}>
                   <span>📄</span> Tổng trang đã in
                 </label>
                 <p className="text-[8px] mb-2 mt-0.5" style={{ color: 'var(--fg-dim)' }}>
@@ -1376,7 +1564,7 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                 </p>
                 {printerSettings.selected_printer && (
                   <div className="flex items-center gap-2">
-                    <input type="number" min={0}
+                    <input id="printer-page-count" name="pageCount" type="number" min={0}
                       value={(printerSettings.page_count?.[printerSettings.selected_printer] ?? 0).toString()}
                       onChange={e => {
                         const pc = { ...(printerSettings.page_count || {}) }
@@ -1389,19 +1577,19 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                   </div>
                 )}
                 {!printerSettings.selected_printer && (
-                  <p className="text-[9px] italic" style={{ color: 'var(--fg-dim)' }}>Chọn máy in trước</p>
+                  <p className="text-[10px] italic" style={{ color: 'var(--fg-dim)' }}>Chọn máy in trước</p>
                 )}
               </div>
 
               {printers.some(p => p.is_laser) && (
-                <p className="animate-[fadeIn_0.3s_ease-out_0.35s_both] text-[9px] italic flex items-center gap-1" style={{ color: 'var(--fg-dim)' }}>
+                <p className="animate-[fadeIn_0.3s_ease-out_0.35s_both] text-[10px] italic flex items-center gap-1" style={{ color: 'var(--fg-dim)' }}>
                   <span>🔲</span> Máy in laser tự động bỏ qua nhắc nhở
                 </p>
               )}
 
               {/* ── Backup & Restore ── */}
               <div className="animate-[fadeIn_0.3s_ease-out_0.4s_both] pt-2 border-t border-dashed" style={{ borderColor: 'var(--border)' }}>
-                <label className="text-[9px] sm:text-[10px] font-semibold uppercase tracking-wider flex items-center gap-1.5" style={{ color: 'var(--fg-muted)' }}>
+                <label className="text-[10px] sm:text-xs font-semibold uppercase tracking-wider flex items-center gap-1.5" style={{ color: 'var(--fg-muted)' }}>
                   <span>💾</span> Sao lưu & Khôi phục
                 </label>
                 <p className="text-[8px] mb-2 mt-0.5" style={{ color: 'var(--fg-dim)' }}>
@@ -1409,18 +1597,18 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
                 </p>
                 <div className="flex items-center gap-2">
                   <button onClick={triggerBackup}
-                    className="flex-1 px-3 py-1.5 text-[9px] font-semibold rounded-lg transition-all duration-200 hover:scale-[1.02] active:scale-95 border-0 cursor-pointer"
+                    className="flex-1 px-3 py-1.5 text-[10px] font-semibold rounded-lg transition-all duration-200 hover:scale-[1.02] active:scale-95 border-0 cursor-pointer"
                     style={{ backgroundColor: '#22c55e15', color: '#4ade80', border: '1px solid #22c55e25' }}>
                     📤 Sao lưu ngay
                   </button>
                   <button onClick={() => importFileInputRef.current?.click()}
-                    className="flex-1 px-3 py-1.5 text-[9px] font-semibold rounded-lg transition-all duration-200 hover:scale-[1.02] active:scale-95 border-0 cursor-pointer"
+                    className="flex-1 px-3 py-1.5 text-[10px] font-semibold rounded-lg transition-all duration-200 hover:scale-[1.02] active:scale-95 border-0 cursor-pointer"
                     style={{ backgroundColor: '#f59e0b15', color: '#fbbf24', border: '1px solid #f59e0b25' }}>
                     📥 Khôi phục
                   </button>
                 </div>
                 {importResult && (
-                  <div className={`mt-2 text-[9px] px-2 py-1 rounded-lg ${importResult.startsWith('✅') ? 'text-emerald-400' : 'text-red-400'}`}
+                  <div className={`mt-2 text-[10px] px-2 py-1 rounded-lg ${importResult.startsWith('✅') ? 'text-emerald-400' : 'text-red-400'}`}
                     style={{ backgroundColor: importResult.startsWith('✅') ? '#22c55e10' : '#ef444410' }}>
                     {importResult}
                   </div>
@@ -1429,12 +1617,12 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
             </div>
             <div className="px-4 sm:px-6 py-3 sm:py-4 border-t flex justify-end gap-2" style={{ borderColor: 'var(--border)' }}>
               <button onClick={() => setSettingsOpen(false)}
-                className="px-4 py-2 text-[10px] font-medium rounded-xl border transition-colors duration-200 hover:bg-black/5 dark:hover:bg-white/5 cursor-pointer"
+                className="px-4 py-2 text-xs font-medium rounded-xl border transition-colors duration-200 hover:bg-black/5 dark:hover:bg-white/5 cursor-pointer"
                 style={{ borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
                 Hủy
               </button>
               <button onClick={saveSettings}
-                className="px-5 sm:px-6 py-2 text-[10px] font-bold rounded-xl transition-all duration-200 hover:scale-105 active:scale-95 border-0 cursor-pointer"
+                className="px-5 sm:px-6 py-2 text-xs font-bold rounded-xl transition-all duration-200 hover:scale-105 active:scale-95 border-0 cursor-pointer"
                 style={{ backgroundColor: '#22c55e', color: 'white' }}>
                 Lưu
               </button>

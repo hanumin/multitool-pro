@@ -1,0 +1,62 @@
+/**
+ * Shared API configuration and fetch with retry.
+ *
+ * WHY: Backend có thể tạm thời không phản hồi (auto-restart wrapper, network blip).
+ * Thay vì mỗi module tự xử lý retry, dùng fetchWithRetry() với exponential backoff.
+ *
+ * Retry pattern:
+ *   - Network errors (fetch throws): retry after 300ms → 1s → 2.5s
+ *   - 5xx server errors: retry with same backoff
+ *   - 4xx client errors: KHÔNG retry (lỗi do request, không phải server)
+ *   - GET requests: retry tối đa 3 lần
+ *   - POST/PUT/DELETE: retry tối đa 1 lần (tránh duplicate side effects)
+ */
+
+export const API = 'http://127.0.0.1:5050'
+
+const RETRY_DELAYS = [300, 1000, 2500]
+
+/**
+ * Fetch với auto-retry trên transient errors.
+ *
+ * @param url - URL cần fetch
+ * @param options - RequestInit (method, headers, body, etc.)
+ * @param retries - Số lần retry (mặc định 2, tổng 3 attempts)
+ * @returns Promise<Response>
+ * @throws Error nếu tất cả retry đều thất bại
+ */
+export async function fetchWithRetry(
+  url: string,
+  options?: RequestInit,
+  retries: number = 2
+): Promise<Response> {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, options)
+
+      // WHY: 4xx là lỗi client (bad request, not found, etc.) — retry cũng vô ích
+      if (res.ok || (res.status >= 400 && res.status < 500)) {
+        return res
+      }
+
+      // WHY: 5xx là lỗi server — có thể hồi phục, retry
+      if (attempt < retries) {
+        await sleep(RETRY_DELAYS[Math.min(attempt, RETRY_DELAYS.length - 1)])
+        continue
+      }
+      return res // Lần cuối, trả về dù 5xx
+    } catch (err) {
+      // WHY: Network error (fetch throw) — retry
+      if (attempt < retries) {
+        await sleep(RETRY_DELAYS[Math.min(attempt, RETRY_DELAYS.length - 1)])
+      } else {
+        throw err
+      }
+    }
+  }
+  throw new Error('fetchWithRetry: unreachable')
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}

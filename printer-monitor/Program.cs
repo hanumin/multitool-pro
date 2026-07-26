@@ -88,7 +88,7 @@ Usage:
 
                 using var reader = new EventLogReader(query);
                 EventLogRecord? record;
-                while ((record = reader.ReadEvent()) != null)
+                while ((record = (EventLogRecord?)reader.ReadEvent()) != null)
                 {
                     if (record.Id != 307) continue;
                     if (record.TimeCreated.HasValue && record.TimeCreated.Value < startTime) break;
@@ -96,13 +96,13 @@ Usage:
                     var props = record.Properties;
 
                     // Properties[4] = Printer Name (UnicodeString)
-                    string? nameFromProps = props.Count > 4 ? (props[4]?.ToString()?.Trim() ?? "") : "";
+                    string? nameFromProps = props.Count > 4 ? (props[4]?.Value?.ToString()?.Trim() ?? "") : "";
 
                     // Properties[7] = TotalPages (int)
                     int pages = 0;
-                    if (props.Count > 7 && props[7] != null)
+                    if (props.Count > 7 && props[7]?.Value != null)
                     {
-                        int.TryParse(props[7].ToString(), out pages);
+                        int.TryParse(props[7].Value.ToString(), out pages);
                     }
 
                     // Filter by printer name
@@ -164,7 +164,7 @@ Usage:
             {
                 var q = new EventLogQuery(logName, PathType.LogName) { ReverseDirection = true };
                 using var r = new EventLogReader(q);
-                var first = r.ReadEvent();
+                var first = (EventLogRecord?)r.ReadEvent();
                 if (first?.TimeCreated.HasValue == true)
                     lastCheck = first.TimeCreated.Value.AddSeconds(-5);
             }
@@ -181,17 +181,17 @@ Usage:
 
                     using var reader = new EventLogReader(query);
                     EventLogRecord? record;
-                    while ((record = reader.ReadEvent()) != null)
+                    while ((record = (EventLogRecord?)reader.ReadEvent()) != null)
                     {
                         if (record.Id != 307) continue;
                         if (record.TimeCreated.HasValue && record.TimeCreated.Value <= lastCheck) continue;
                         if (record.TimeCreated.HasValue && record.TimeCreated.Value > DateTime.Now) break;
 
                         var props = record.Properties;
-                        string? printer = props.Count > 4 ? props[4]?.ToString()?.Trim() : "";
+                        string? printer = props.Count > 4 ? props[4]?.Value?.ToString()?.Trim() : "";
                         int pages = 0;
-                        if (props.Count > 7 && props[7] != null)
-                            int.TryParse(props[7].ToString(), out pages);
+                        if (props.Count > 7 && props[7]?.Value != null)
+                            int.TryParse(props[7].Value.ToString(), out pages);
 
                         if (pages > 0)
                         {
@@ -243,18 +243,18 @@ Usage:
                 var query = new EventLogQuery(logName, PathType.LogName) { ReverseDirection = true };
                 using var reader = new EventLogReader(query);
                 EventLogRecord? record;
-                while ((record = reader.ReadEvent()) != null)
+                while ((record = (EventLogRecord?)reader.ReadEvent()) != null)
                 {
                     if (record.Id != 307) continue;
                     if (record.TimeCreated.HasValue && record.TimeCreated.Value < startTime) break;
 
                     var props = record.Properties;
-                    string? printer = props.Count > 4 ? (props[4]?.ToString()?.Trim() ?? "") : "";
+                    string? printer = props.Count > 4 ? (props[4]?.Value?.ToString()?.Trim() ?? "") : "";
                     if (string.IsNullOrEmpty(printer)) continue;
 
                     int pages = 0;
-                    if (props.Count > 7 && props[7] != null)
-                        int.TryParse(props[7].ToString(), out pages);
+                    if (props.Count > 7 && props[7]?.Value != null)
+                        int.TryParse(props[7].Value.ToString(), out pages);
 
                     if (!printerStats.ContainsKey(printer))
                         printerStats[printer] = 0;
@@ -263,7 +263,8 @@ Usage:
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($$"""{{"error":"{{ex.Message.Replace("\"","'")}}"}}""");
+                var err = new { error = ex.Message.Replace("\"", "'") };
+                Console.Error.WriteLine(JsonSerializer.Serialize(err, JsonOptions));
             }
 
             var stats = printerStats.Select(p => new { printer = p.Key, pages_30days = p.Value }).ToList();
@@ -292,17 +293,18 @@ Usage:
                 using Process? proc = Process.Start(psi);
                 if (proc == null)
                 {
-                    Console.WriteLine($$"""{{"status":"error","error":"Failed to start wevtutil"}}""");
+                    Console.WriteLine(JsonSerializer.Serialize(new { status = "error", error = "Failed to start wevtutil" }, JsonOptions));
                     return 1;
                 }
                 proc.WaitForExit(10000);
 
-                Console.WriteLine($$"""{{"status":"installed","note":"PrintService Operational log enabled."}}""");
+                Console.WriteLine(JsonSerializer.Serialize(new { status = "installed", note = "PrintService Operational log enabled." }, JsonOptions));
                 return 0;
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($$"""{{"error":"{{ex.Message.Replace("\"","'")}}"}}""");
+                var err = new { error = ex.Message.Replace("\"", "'") };
+                Console.Error.WriteLine(JsonSerializer.Serialize(err, JsonOptions));
                 return 1;
             }
         }

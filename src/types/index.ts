@@ -1,4 +1,4 @@
-export type ModuleId = 'servers' | 'printers' | 'audio' | 'file-copier' | 'database'
+export type ModuleId = 'servers' | 'printers' | 'audio' | 'file-copier' | 'database' | 'tunnels' | 'logs'
 
 export interface ModuleDef {
   id: ModuleId
@@ -13,6 +13,8 @@ export const MODULES: ModuleDef[] = [
   { id: 'audio', label: 'Âm thanh', icon: '🎤', description: 'Giám sát mic & thiết bị âm thanh' },
   { id: 'file-copier', label: 'Sao chép', icon: '📂', description: 'Sao chép file audio/video theo từ khóa' },
   { id: 'database', label: 'Cơ sở dữ liệu', icon: '🗄️', description: 'Quản lý PostgreSQL/MySQL' },
+  { id: 'tunnels', label: 'Tunnel', icon: '🌐', description: 'Quản lý Cloudflare Tunnel' },
+  { id: 'logs', label: 'Nhật ký', icon: '📋', description: 'Xem log hệ thống & chẩn đoán' },
 ]
 
 export interface Printer {
@@ -44,5 +46,17 @@ export interface MicStatus {
   active: boolean
   app_using_mic: string
   mic_name: string
+  mic_muted: boolean | null
+  overall_status: 'active' | 'muted' | 'idle' | 'no_mic' | 'error'
+  available_mics: AvailableMic[]
+  mic_count: number
   duration: number
+}
+
+export interface AvailableMic {
+  id: number
+  name: string
+  channels: number
+  default: boolean
+  samplerate: number
 }

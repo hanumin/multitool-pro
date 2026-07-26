@@ -1,0 +1,10 @@
+#!/bin/sh
+# WHY: Pre-commit hook — tự động kiểm tra WHY comment coverage trước khi commit.
+# Nếu còn function thiếu // WHY: hoặc # WHY: comments, commit sẽ bị reject.
+#
+# Dùng npm run check:why (python scripts/check-why-comments.py --exit-error)
+# để đảm bảo mọi function đều có giải thích design decisions.
+#
+# Có thể bỏ qua hook tạm thời với: git commit --no-verify
+
+npm run check:why

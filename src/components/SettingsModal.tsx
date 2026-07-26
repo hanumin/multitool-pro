@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 
-const API = 'http://127.0.0.1:5050'
+import { API, fetchWithRetry } from '../utils/apiFetch'
 
 interface Project {
   name: string
@@ -15,6 +15,9 @@ interface Props {
   onChanged: () => void
 }
 
+// WHY: Modal cài đặt toàn hệ thống — quản lý projects (CRUD), port range, reload config.
+// open/onClose controlled component (parent App quyết định hiển thị).
+// onChanged callback để App refresh status khi settings thay đổi.
 export default function SettingsModal({ open, onClose, onChanged }: Props) {
   const [projects, setProjects] = useState<Project[]>([])
   const [edit, setEdit] = useState<Partial<Project> | null>(null)
@@ -37,49 +40,43 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
     if (open) fetchConfig()
   }, [open])
 
-  // WHY: Retry config fetch 3 times with 1-second delay to withstand backend restarts
+  // WHY: fetchWithRetry đã xử lý retry tự động (exponential backoff 300ms, 1s, 2.5s).
+  // Không cần manual retry loop nữa.
   const fetchConfig = async () => {
     setLoadingConfig(true)
     setError('')
-    const maxRetries = 3
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        const [configRes, projectsRes] = await Promise.all([
-          fetch(`${API}/api/config`),
-          fetch(`${API}/api/projects`)
-        ])
-        
-        if (!configRes.ok || !projectsRes.ok) {
-          throw new Error('Server response not OK')
-        }
-
-        const configData = await configRes.json()
-        const projectsData = await projectsRes.json()
-
-        setProjects(configData.projects || [])
-        setPortMin(configData.portMin ?? 4000)
-        setPortMax(configData.portMax ?? 4999)
-
-        const runningMap: Record<string, boolean> = {}
-        projectsData.forEach((p: any) => {
-          runningMap[p.name] = p.running
-        })
-        setRunningStatus(runningMap)
-        setError('')
-        setLoadingConfig(false)
-        return
-      } catch (err) {
-        if (attempt === maxRetries) {
-          setError('Không thể tải cấu hình sau nhiều lần thử')
-          setLoadingConfig(false)
-        } else {
-          // Wait 1 second before retrying
-          await new Promise(resolve => setTimeout(resolve, 1000))
-        }
+    try {
+      const [configRes, projectsRes] = await Promise.all([
+        fetchWithRetry(`${API}/api/config`),
+        fetchWithRetry(`${API}/api/projects`)
+      ])
+      
+      if (!configRes.ok || !projectsRes.ok) {
+        throw new Error('Server response not OK')
       }
+
+      const configData = await configRes.json()
+      const projectsData = await projectsRes.json()
+
+      setProjects(configData.projects || [])
+      setPortMin(configData.portMin ?? 4000)
+      setPortMax(configData.portMax ?? 4999)
+
+      const runningMap: Record<string, boolean> = {}
+      projectsData.forEach((p: any) => {
+        runningMap[p.name] = p.running
+      })
+      setRunningStatus(runningMap)
+      setError('')
+    } catch (err) {
+      setError('Không thể tải cấu hình sau nhiều lần thử')
+    } finally {
+      setLoadingConfig(false)
     }
   }
 
+  // WHY: POST create vs PUT update — phân biệt bằng editingIndex (null = new, number = edit).
+  // Nếu startAfterAdd và là project mới → start ngay sau khi thêm.
   const saveProject = async () => {
     if (!edit || !edit.name || !edit.path) {
       setError('Cần nhập tên và đường dẫn')
@@ -90,7 +87,7 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
       const isNew = editingIndex === null
       if (!isNew) {
         const oldName = projects[editingIndex].name
-        const res = await fetch(`${API}/api/config/projects/${encodeURIComponent(oldName)}`, {
+        const res = await fetchWithRetry(`${API}/api/config/projects/${encodeURIComponent(oldName)}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(edit),
@@ -101,7 +98,7 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
           return
         }
       } else {
-        const res = await fetch(`${API}/api/config/projects`, {
+        const res = await fetchWithRetry(`${API}/api/config/projects`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(edit),
@@ -114,7 +111,7 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
 
         // Start project immediately after adding if user checked the option
         if (startAfterAdd) {
-          await fetch(`${API}/api/projects/${encodeURIComponent(edit.name)}/start`, {
+          await fetchWithRetry(`${API}/api/projects/${encodeURIComponent(edit.name)}/start`, {
             method: 'POST'
           })
         }
@@ -129,10 +126,12 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
     }
   }
 
+  // WHY: PUT /api/config với portMin/portMax. Gửi toàn bộ config object (backend merge).
+  // FetchConfig + onChanged để đồng bộ App state với modal state.
   const saveGlobalSettings = async () => {
     setError('')
     try {
-      const res = await fetch(`${API}/api/config`, {
+      const res = await fetchWithRetry(`${API}/api/config`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ portMin, portMax }),
@@ -149,6 +148,8 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
     }
   }
 
+  // WHY: Confirm trước khi xóa — nếu project đang chạy, cảnh báo riêng.
+  // DELETE API endpoint + fetchConfig refresh.
   const deleteProject = async (name: string) => {
     const isRunning = runningStatus[name]
     const confirmMsg = isRunning
@@ -157,7 +158,7 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
     
     if (!window.confirm(confirmMsg)) return
     try {
-      await fetch(`${API}/api/config/projects/${encodeURIComponent(name)}`, { method: 'DELETE' })
+      await fetchWithRetry(`${API}/api/config/projects/${encodeURIComponent(name)}`, { method: 'DELETE' })
       await fetchConfig()
       onChanged()
     } catch {
@@ -165,10 +166,12 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
     }
   }
 
+  // WHY: POST /api/config/reload — đọc lại file config từ disk (không restart backend).
+  // Dùng khi user sửa file config thủ công.
   const reloadConfig = async () => {
     setReloading(true)
     try {
-      await fetch(`${API}/api/config/reload`, { method: 'POST' })
+      await fetchWithRetry(`${API}/api/config/reload`, { method: 'POST' })
       await fetchConfig()
       onChanged()
     } catch {}
@@ -230,13 +233,13 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
                 <h3 className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-secondary)' }}>Cài đặt chung</h3>
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <label htmlFor="settings-port-min" className="text-[11px] mb-1 block" style={{ color: 'var(--fg-muted)' }}>Cổng tối thiểu</label>
+                    <label htmlFor="settings-port-min" className="text-xs mb-1 block" style={{ color: 'var(--fg-muted)' }}>Cổng tối thiểu</label>
                     <input id="settings-port-min" name="portMin" type="number" value={portMin} onChange={e => setPortMin(parseInt(e.target.value) || 0)}
                       className="w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition-colors duration-200"
                       style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }} />
                   </div>
                   <div>
-                    <label htmlFor="settings-port-max" className="text-[11px] mb-1 block" style={{ color: 'var(--fg-muted)' }}>Cổng tối đa</label>
+                    <label htmlFor="settings-port-max" className="text-xs mb-1 block" style={{ color: 'var(--fg-muted)' }}>Cổng tối đa</label>
                     <input id="settings-port-max" name="portMax" type="number" value={portMax} onChange={e => setPortMax(parseInt(e.target.value) || 0)}
                       className="w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition-colors duration-200"
                       style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }} />
@@ -244,7 +247,7 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
                 </div>
                 <div className="flex justify-end">
                   <button onClick={saveGlobalSettings}
-                    className="px-3 py-1.5 text-[11px] font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors active:scale-95 cursor-pointer">
+                    className="px-3 py-1.5 text-xs font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors active:scale-95 cursor-pointer">
                     Lưu cài đặt chung
                   </button>
                 </div>
@@ -256,12 +259,12 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
                   <h3 className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-secondary)' }}>Dự án</h3>
                   <div className="flex gap-2">
                     <button onClick={reloadConfig} disabled={reloading}
-                      className="px-2.5 py-1 text-[11px] font-medium border rounded-lg transition-colors disabled:opacity-40 active:scale-95 cursor-pointer"
+                      className="px-2.5 py-1 text-xs font-medium border rounded-lg transition-colors disabled:opacity-40 active:scale-95 cursor-pointer"
                       style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
                       {reloading ? '...' : 'Tải lại từ đĩa'}
                     </button>
                     <button onClick={() => { setEdit({ name: '', path: '', command: 'npm run dev', port: 4000 }); setEditingIndex(null); setStartAfterAdd(false) }}
-                      className="px-2.5 py-1 text-[11px] font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors active:scale-95 cursor-pointer">
+                      className="px-2.5 py-1 text-xs font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors active:scale-95 cursor-pointer">
                       + Thêm dự án
                     </button>
                   </div>
@@ -278,26 +281,26 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2">
                           <span className="text-sm font-medium" style={{ color: 'var(--fg)' }}>{p.name}</span>
-                          <span className="text-[10px] font-mono border px-1.5 py-0.5 rounded transition-colors duration-200"
+                          <span className="text-xs font-mono border px-1.5 py-0.5 rounded transition-colors duration-200"
                             style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-muted)' }}>
                             :{p.port}
                           </span>
                           {runningStatus[p.name] && (
-                            <span className="text-[9px] bg-emerald-500/15 text-emerald-500 border border-emerald-500/20 px-1 py-0.5 rounded font-medium">
+                            <span className="text-[10px] bg-emerald-500/15 text-emerald-500 border border-emerald-500/20 px-1 py-0.5 rounded font-medium">
                               ĐANG CHẠY
                             </span>
                           )}
                         </div>
-                        <p className="text-[11px] truncate mt-0.5 font-mono" style={{ color: 'var(--fg-muted)' }}>{p.path}</p>
-                        <p className="text-[10px] font-mono" style={{ color: 'var(--fg-dim)' }}>{p.command}</p>
+                        <p className="text-xs truncate mt-0.5 font-mono" style={{ color: 'var(--fg-muted)' }}>{p.path}</p>
+                        <p className="text-xs font-mono" style={{ color: 'var(--fg-dim)' }}>{p.command}</p>
                       </div>
                       <div className="flex gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0 ml-3">
                         <button onClick={() => { setEdit({ ...p }); setEditingIndex(i) }}
-                          className="px-2 py-1 text-[10px] font-medium bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 rounded-lg transition-colors active:scale-95 cursor-pointer">
+                          className="px-2 py-1 text-xs font-medium bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 rounded-lg transition-colors active:scale-95 cursor-pointer">
                           Sửa
                         </button>
                         <button onClick={() => deleteProject(p.name)}
-                          className="px-2 py-1 text-[10px] font-medium bg-red-500/10 text-red-400 hover:bg-red-500/20 rounded-lg transition-colors active:scale-95 cursor-pointer">
+                          className="px-2 py-1 text-xs font-medium bg-red-500/10 text-red-400 hover:bg-red-500/20 rounded-lg transition-colors active:scale-95 cursor-pointer">
                           Xóa
                         </button>
                       </div>
@@ -316,14 +319,14 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
 
                   <div className="grid grid-cols-2 gap-4">
                     <div>
-                      <label htmlFor="settings-proj-name" className="text-[11px] mb-1 block" style={{ color: 'var(--fg-muted)' }}>Tên *</label>
+                      <label htmlFor="settings-proj-name" className="text-xs mb-1 block" style={{ color: 'var(--fg-muted)' }}>Tên *</label>
                       <input id="settings-proj-name" name="projName" value={edit.name || ''} onChange={e => setEdit(p => ({ ...p, name: e.target.value }))}
                         className="w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition-colors duration-200"
                         style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }}
                         placeholder="MyApp" />
                     </div>
                     <div>
-                      <label htmlFor="settings-proj-port" className="text-[11px] mb-1 block" style={{ color: 'var(--fg-muted)' }}>Port</label>
+                      <label htmlFor="settings-proj-port" className="text-xs mb-1 block" style={{ color: 'var(--fg-muted)' }}>Port</label>
                       <input id="settings-proj-port" name="projPort" type="number" value={edit.port ?? 4000} onChange={e => setEdit(p => ({ ...p, port: parseInt(e.target.value) || 0 }))}
                         className="w-full border rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition-colors duration-200"
                         style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }} />
@@ -331,7 +334,7 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
                   </div>
 
                   <div>
-                    <label htmlFor="settings-proj-path" className="text-[11px] mb-1 block" style={{ color: 'var(--fg-muted)' }}>Đường dẫn *</label>
+                    <label htmlFor="settings-proj-path" className="text-xs mb-1 block" style={{ color: 'var(--fg-muted)' }}>Đường dẫn *</label>
                     <div className="flex gap-2">
                       <input id="settings-proj-path" name="projPath" value={edit.path || ''} onChange={e => setEdit(p => ({ ...p, path: e.target.value }))}
                         className="flex-1 border rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500 transition-colors duration-200"
@@ -346,7 +349,7 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
                   </div>
 
                   <div>
-                    <label htmlFor="settings-proj-command" className="text-[11px] mb-1 block" style={{ color: 'var(--fg-muted)' }}>Lệnh</label>
+                    <label htmlFor="settings-proj-command" className="text-xs mb-1 block" style={{ color: 'var(--fg-muted)' }}>Lệnh</label>
                     <div className="grid grid-cols-3 gap-2">
                       <select id="settings-proj-command-template" name="projCommandTemplate" onChange={e => {
                         const val = e.target.value
@@ -380,12 +383,12 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
 
                   <div className="flex justify-end gap-2 pt-2">
                     <button onClick={() => { setEdit(null); setEditingIndex(null); setStartAfterAdd(false) }}
-                      className="px-3 py-1.5 text-[11px] font-medium border rounded-lg transition-colors active:scale-95 cursor-pointer"
+                      className="px-3 py-1.5 text-xs font-medium border rounded-lg transition-colors active:scale-95 cursor-pointer"
                       style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
                       Hủy
                     </button>
                     <button onClick={saveProject}
-                      className="px-4 py-1.5 text-[11px] font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors active:scale-95 cursor-pointer">
+                      className="px-4 py-1.5 text-xs font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors active:scale-95 cursor-pointer">
                       {editingIndex !== null ? 'Save Changes' : 'Add Project'}
                     </button>
                   </div>

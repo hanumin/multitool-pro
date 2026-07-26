@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 
-const API = 'http://127.0.0.1:5050'
+import { API, fetchWithRetry } from '../../utils/apiFetch'
 
 interface SourceDir {
   key: string
@@ -14,6 +14,9 @@ interface FileCopierModuleProps {
   setStatusText: (t: string) => void
 }
 
+// WHY: Module sao chép file audio/video theo từ khóa từ nhiều thư mục nguồn.
+// Hỗ trợ dry-run (chạy thử) và copy thật với MD5 verification.
+// Dùng Tauri dialog để chọn thư mục, backend xử lý scan + copy.
 export default function FileCopierModule({ theme, setStatusText }: FileCopierModuleProps) {
   const [sourceDirs, setSourceDirs] = useState<SourceDir[]>([
     { key: 'src1', label: 'Audio Tách Ghép Âm', path: '', count: 0 },
@@ -36,12 +39,17 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
   const [logs, setLogs] = useState<string[]>([])
   const [scanningDir, setScanningDir] = useState<string | null>(null)
 
+  // WHY: Logger dùng icon prefix + timestamp + keep 200 dòng cuối,
+  // tránh memory leak từ log quá dài.
   const addLog = (msg: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') => {
     const icon = type === 'success' ? '✅' : type === 'warning' ? '⚠️' : type === 'error' ? '❌' : 'ℹ️'
     const timestamp = new Date().toLocaleTimeString()
     setLogs(prev => [...prev.slice(-200), `[${timestamp}] ${icon} ${msg}`])
   }
 
+  // WHY: Dùng Tauri dialog (dynamic import) để chọn thư mục nguồn.
+  // Gọi backend đếm file ngay sau khi chọn để hiển thị số lượng.
+  // KHÔNG dùng state tạm — update sourceDirs trực tiếp.
   const selectSourceDir = async (key: string) => {
     try {
       const { open } = await import('@tauri-apps/plugin-dialog')
@@ -51,7 +59,7 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
         setSourceDirs(prev => prev.map(d => d.key === key ? { ...d, path } : d))
         setScanningDir(key)
         try {
-          const res = await fetch(`${API}/api/file-copier/count`, {
+          const res = await fetchWithRetry(`${API}/api/file-copier/count`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ path, extensions: fileExtensions.split(',').map(e => e.trim()) })
           })
@@ -66,6 +74,8 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
     } catch { addLog('Không thể mở hộp thoại chọn thư mục', 'error') }
   }
 
+  // WHY: Tương tự selectSourceDir, dùng Tauri dialog chọn thư mục đích.
+  // Độc lập với source dirs — user có thể chọn sau.
   const selectDestDir = async () => {
     try {
       const { open } = await import('@tauri-apps/plugin-dialog')
@@ -78,6 +88,9 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
     } catch { addLog('Không thể mở hộp thoại chọn thư mục', 'error') }
   }
 
+  // WHY: Chọn file .txt chứa từ khóa, gửi lên backend parse.
+  // Backend trả về keywords array → merge vào state keywords (textarea).
+  // Cho phép keywordMode='file' thay vì gõ tay.
   const selectKeywordFile = async () => {
     try {
       const { open } = await import('@tauri-apps/plugin-dialog')
@@ -86,7 +99,7 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
         const path = typeof selected === 'string' ? selected : selected[0]
         setKeywordFilePath(path)
         try {
-          const res = await fetch(`${API}/api/file-copier/read-keywords`, {
+          const res = await fetchWithRetry(`${API}/api/file-copier/read-keywords`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ path })
           })
@@ -100,6 +113,8 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
     } catch { addLog('Không thể mở hộp thoại chọn file', 'error') }
   }
 
+  // WHY: Reset toàn bộ state về mặc định — không gọi API,
+  // chỉ cleanup local state để user bắt đầu lại.
   const resetAll = () => {
     setSourceDirs(prev => prev.map(d => ({ ...d, path: '', count: 0 })))
     setDestDir('')
@@ -111,6 +126,11 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
     addLog('🔄 Đã đặt lại tất cả', 'info')
   }
 
+  // WHY: Hàm chính — gửi lệnh copy/dry-run lên backend.
+  // dryRun=true: chạy thử (tìm file nhưng không copy).
+  // dryRun=false: thực hiện copy thật.
+  // Validate inputs TRƯỚC khi gửi request để tránh lỗi backend.
+  // Backend trả về found_count + not_found_count + logs chi tiết.
   const runCopy = async (dryRun: boolean) => {
     const validSources = sourceDirs.filter(d => d.path)
     if (validSources.length === 0) { addLog('Vui lòng chọn ít nhất một thư mục nguồn', 'error'); return }
@@ -126,7 +146,7 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
     addLog(`🚀 Bắt đầu ${dryRun ? 'CHẠY THỬ' : 'SAO CHÉP'} với ${keywordList.length} từ khóa`, dryRun ? 'warning' : 'success')
 
     try {
-      const res = await fetch(`${API}/api/file-copier/run`, {
+      const res = await fetchWithRetry(`${API}/api/file-copier/run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -177,11 +197,11 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-sm font-semibold" style={{ color: 'var(--fg)' }}>📂 Sao chép tập tin</h2>
-          <p className="text-[10px]" style={{ color: 'var(--fg-muted)' }}>Tìm và sao chép file âm thanh/video theo từ khóa</p>
+          <p className="text-xs" style={{ color: 'var(--fg-muted)' }}>Tìm và sao chép file âm thanh/video theo từ khóa</p>
         </div>
         <div className="flex gap-2">
           <button onClick={resetAll}
-            className="px-3 py-1.5 text-[11px] font-medium rounded-lg border transition-all active:scale-95 cursor-pointer"
+            className="px-3 py-1.5 text-xs font-medium rounded-lg border transition-all active:scale-95 cursor-pointer"
             style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
             🔄 Đặt lại
           </button>
@@ -197,25 +217,25 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
               <h3 className="text-xs font-semibold" style={{ color: 'var(--fg-secondary)' }}>🔑 Từ khóa</h3>
               <div className="flex gap-1">
                 <button onClick={() => setKeywordMode('manual')}
-                  className={`px-2 py-0.5 text-[10px] rounded-lg transition-all cursor-pointer border-0 ${keywordMode === 'manual' ? 'bg-emerald-500/15 text-emerald-500 ring-1 ring-emerald-500/20' : 'hover:bg-black/5 dark:hover:bg-white/5'}`}
+                  className={`px-2 py-0.5 text-xs rounded-lg transition-all cursor-pointer border-0 ${keywordMode === 'manual' ? 'bg-emerald-500/15 text-emerald-500 ring-1 ring-emerald-500/20' : 'hover:bg-black/5 dark:hover:bg-white/5'}`}
                   style={{ color: keywordMode === 'manual' ? undefined : 'var(--fg-muted)' }}>Thủ công</button>
                 <button onClick={() => setKeywordMode('file')}
-                  className={`px-2 py-0.5 text-[10px] rounded-lg transition-all cursor-pointer border-0 ${keywordMode === 'file' ? 'bg-emerald-500/15 text-emerald-500 ring-1 ring-emerald-500/20' : 'hover:bg-black/5 dark:hover:bg-white/5'}`}
+                  className={`px-2 py-0.5 text-xs rounded-lg transition-all cursor-pointer border-0 ${keywordMode === 'file' ? 'bg-emerald-500/15 text-emerald-500 ring-1 ring-emerald-500/20' : 'hover:bg-black/5 dark:hover:bg-white/5'}`}
                   style={{ color: keywordMode === 'file' ? undefined : 'var(--fg-muted)' }}>Từ tập tin</button>
               </div>
             </div>
             {keywordMode === 'file' ? (
               <div className="flex items-center gap-2">
-                <input type="text" readOnly value={keywordFilePath}
-                  className="flex-1 px-2 py-1.5 text-[10px] rounded-lg border font-mono"
+                <input id="fc-keyword-file" name="keywordFile" type="text" readOnly value={keywordFilePath}
+                  className="flex-1 px-2 py-1.5 text-xs rounded-lg border font-mono"
                   style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}
                   placeholder="Chọn file từ khóa..." />
                 <button onClick={selectKeywordFile}
-                  className="px-3 py-1.5 text-[10px] font-medium rounded-lg bg-emerald-500/15 text-emerald-500 hover:bg-emerald-500/25 transition-all cursor-pointer border-0">Chọn</button>
+                  className="px-3 py-1.5 text-xs font-medium rounded-lg bg-emerald-500/15 text-emerald-500 hover:bg-emerald-500/25 transition-all cursor-pointer border-0">Chọn</button>
               </div>
             ) : (
-              <textarea value={keywords} onChange={e => setKeywords(e.target.value)}
-                className="w-full px-2 py-1.5 text-[10px] font-mono rounded-lg border resize-none focus:outline-none focus:ring-1 focus:ring-emerald-500"
+              <textarea id="fc-keywords" name="keywords" value={keywords} onChange={e => setKeywords(e.target.value)}
+                className="w-full px-2 py-1.5 text-xs font-mono rounded-lg border resize-none focus:outline-none focus:ring-1 focus:ring-emerald-500"
                 style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg)' }}
                 rows={4} placeholder="Nhập từ khóa, mỗi từ một dòng&#10;Ví dụ:&#10;cellist&#10;population explosion" />
             )}
@@ -226,7 +246,7 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
             <h3 className="text-xs font-semibold mb-3" style={{ color: 'var(--fg-secondary)' }}>📁 Thư mục nguồn</h3>
             <div className="space-y-1.5">
               {sourceDirs.map(dir => (
-                <div key={dir.key} className="flex items-center gap-2 text-[10px]">
+                <div key={dir.key} className="flex items-center gap-2 text-xs">
                   <span className="w-36 shrink-0 truncate" style={{ color: 'var(--fg-muted)' }} title={dir.label}>{dir.label}</span>
                   <div className="flex-1 flex items-center gap-1 min-w-0">
                     <span className="flex-1 truncate px-1.5 py-1 rounded font-mono"
@@ -252,8 +272,8 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
           <div className="flex gap-3">
             <div className="flex-1 rounded-xl border backdrop-blur p-4" style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border)' }}>
               <h3 className="text-xs font-semibold mb-3" style={{ color: 'var(--fg-secondary)' }}>🎯 Thư mục đích</h3>
-              <div className="flex items-center gap-2 text-[10px]">
-                <input type="text" readOnly value={destDir}
+              <div className="flex items-center gap-2 text-xs">
+                <input id="fc-dest-dir" name="destDir" type="text" readOnly value={destDir}
                   className="flex-1 px-2 py-1.5 rounded-lg border font-mono"
                   style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}
                   placeholder="Chọn thư mục đích..." />
@@ -263,10 +283,10 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
             </div>
             <div className="rounded-xl border backdrop-blur p-4" style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border)' }}>
               <h3 className="text-xs font-semibold mb-3" style={{ color: 'var(--fg-secondary)' }}>⚙️ Cài đặt</h3>
-              <div className="space-y-2 text-[10px]">
+              <div className="space-y-2 text-xs">
                 <div className="flex items-center gap-2">
                   <span style={{ color: 'var(--fg-muted)' }}>Đuôi file:</span>
-                  <input type="text" value={fileExtensions} onChange={e => setFileExtensions(e.target.value)}
+                  <input id="fc-extensions" name="fileExtensions" type="text" value={fileExtensions} onChange={e => setFileExtensions(e.target.value)}
                     className="flex-1 px-1.5 py-1 rounded border font-mono"
                     style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }} />
                 </div>
@@ -278,7 +298,7 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
                 <div className="flex items-center gap-2">
                   <span style={{ color: 'var(--fg-muted)' }}>Xung đột:</span>
                   <select id="filecopier-conflict-mode" name="conflictMode" value={conflictMode} onChange={e => setConflictMode(e.target.value as any)}
-                    className="px-1.5 py-1 rounded border text-[10px]"
+                    className="px-1.5 py-1 rounded border text-xs"
                     style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
                     <option value="overwrite">Ghi đè</option>
                     <option value="skip">Bỏ qua</option>
@@ -310,20 +330,20 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
                 style={{ width: `${progress}%` }} />
             </div>
           )}
-          <div className="text-[10px] text-center" style={{ color: 'var(--fg-dim)' }}>{statusMessage}</div>
+          <div className="text-xs text-center" style={{ color: 'var(--fg-dim)' }}>{statusMessage}</div>
         </div>
 
         {/* Right: Logs */}
         <div className="w-[40%] rounded-xl border backdrop-blur flex flex-col overflow-hidden"
           style={{ backgroundColor: 'var(--bg-log)', borderColor: 'var(--border)' }}>
-          <div className="shrink-0 flex items-center justify-between px-3 py-2 border-b text-[11px] font-semibold"
+          <div className="shrink-0 flex items-center justify-between px-3 py-2 border-b text-xs font-semibold"
             style={{ borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
             <span>📋 Nhật ký</span>
             <button onClick={() => setLogs([])}
-              className="text-[9px] px-1.5 py-0.5 rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors cursor-pointer border-0"
+              className="text-[10px] px-1.5 py-0.5 rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors cursor-pointer border-0"
               style={{ color: 'var(--fg-muted)' }}>Xóa</button>
           </div>
-          <div className="flex-1 overflow-y-auto p-2 font-mono text-[10px] leading-relaxed" style={{ color: 'var(--fg-secondary)' }}>
+          <div className="flex-1 overflow-y-auto p-2 font-mono text-xs leading-relaxed" style={{ color: 'var(--fg-secondary)' }}>
             {logs.length === 0 ? (
               <div className="flex items-center justify-center h-full italic" style={{ color: 'var(--fg-dim)' }}>
                 Chưa có nhật ký

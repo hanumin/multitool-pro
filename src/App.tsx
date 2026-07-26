@@ -1,14 +1,16 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, lazy, Suspense } from 'react'
 import Sidebar from './components/Sidebar'
-import ServersModule from './components/modules/ServersModule'
-import PrintersModule from './components/modules/PrintersModule'
-import AudioModule from './components/modules/AudioModule'
-import FileCopierModule from './components/modules/FileCopierModule'
-import DatabaseModule from './components/modules/DatabaseModule'
-import SettingsModal from './components/SettingsModal'
 import { ModuleId, MODULES } from './types'
 
-const API = 'http://127.0.0.1:5050'
+const ServersModule = lazy(() => import('./components/modules/ServersModule'))
+const PrintersModule = lazy(() => import('./components/modules/PrintersModule'))
+const AudioModule = lazy(() => import('./components/modules/AudioModule'))
+const FileCopierModule = lazy(() => import('./components/modules/FileCopierModule'))
+const DatabaseModule = lazy(() => import('./components/modules/DatabaseModule'))
+const TunnelsModule = lazy(() => import('./components/modules/TunnelsModule'))
+const LogModule = lazy(() => import('./components/modules/LogModule'))
+import SettingsModal from './components/SettingsModal'
+import { API, fetchWithRetry } from './utils/apiFetch'
 
 type Theme = 'dark' | 'light'
 
@@ -76,6 +78,9 @@ const CHANGELOGS: ChangelogEntry[] = [
   }
 ]
 
+// WHY: Custom hook — persist theme to localStorage + set data-theme attr on <html>.
+// Dark mặc định (không phải system preference) vì app chủ yếu dùng trong terminal tối.
+// Toggle inline function (không cần useCallback vì chỉ dùng trong header button).
 function useTheme() {
   const [theme, setTheme] = useState<Theme>(() => {
     const stored = localStorage.getItem('sd-theme')
@@ -88,22 +93,32 @@ function useTheme() {
     localStorage.setItem('sd-theme', theme)
   }, [theme])
 
+  // WHY: Inline toggle function — không cần useCallback vì chỉ dùng trong header button click.
   const toggle = () => setTheme(t => t === 'dark' ? 'light' : 'dark')
   return { theme, toggle }
 }
 
+// WHY: Responsive sidebar — auto-collapse khi window width < SIDEBAR_BREAKPOINT.
+// Chỉ collapse (không auto-expand) để tôn trọng lựa chọn của user trên màn hình lớn.
+const SIDEBAR_BREAKPOINT = 1100
+
+// WHY: Component chính — quản lý theme, sidebar, module routing, settings modal, bottom bar.
+// Sử dụng React.lazy + Suspense cho code-splitting theo module.
+// State tập trung ở đây, pass props xuống children (sidebar, modules).
 function App() {
   const { theme, toggle: toggleTheme } = useTheme()
   const [activeModule, setActiveModule] = useState<ModuleId>('servers')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [statusText, setStatusText] = useState('Sẵn sàng')
   const [autostart, setAutostart] = useState(false)
-  const [appVersion, setAppVersion] = useState('1.9.3')
+  const [appVersion, setAppVersion] = useState('1.9.10')
   const [changelogOpen, setChangelogOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsRefresh, setSettingsRefresh] = useState(0)
   const [systemIps, setSystemIps] = useState<string[]>(['localhost', '127.0.0.1'])
 
+  // WHY: Dynamic import để không crash trong browser (Tauri API không available ngoài desktop runtime).
+  // .catch(() => {}) — fail silently, fallback về version hardcoded.
   useEffect(() => {
     import('@tauri-apps/api/app')
       .then(m => m.getVersion())
@@ -111,17 +126,35 @@ function App() {
       .catch(() => {})
   }, [])
 
+  // WHY: Fetch autostart + system IPs khi mount — song song (không cần await).
+  // IPs dùng để hiển thị URLs trong bottom bar (localhost + LAN IPs).
   useEffect(() => {
-    fetch(`${API}/api/settings`).then(r => r.json()).then(d => setAutostart(d.autostart)).catch(() => {})
-    fetch(`${API}/api/system/ips`).then(r => r.json()).then(d => {
+    fetchWithRetry(`${API}/api/settings`).then(r => r.json()).then(d => setAutostart(d.autostart)).catch(() => {})
+    fetchWithRetry(`${API}/api/system/ips`).then(r => r.json()).then(d => {
       if (d && Array.isArray(d.ips)) setSystemIps(d.ips)
     }).catch(() => {})
   }, [])
 
+  // WHY: Auto-collapse sidebar khi window < breakpoint (ví dụ: màn hình laptop nhỏ 1366px).
+  // Check ngay khi mount + mỗi lần resize. Cleanup listener khi unmount.
+  useEffect(() => {
+    const handleResize = () => {
+      if (window.innerWidth < SIDEBAR_BREAKPOINT) {
+        setSidebarCollapsed(true)
+      }
+    }
+    handleResize()
+    window.addEventListener('resize', handleResize)
+    return () => window.removeEventListener('resize', handleResize)
+  }, [])
+
+  // WHY: Toggle autostart shortcut trong Windows Startup folder.
+  // Backend tạo/xóa .lnk file — không cần admin.
+  // Response trả về trạng thái thực tế (có thể khác với next).
   const toggleAutostart = async () => {
     const next = !autostart
     try {
-      const res = await fetch(`${API}/api/settings/autostart`, {
+      const res = await fetchWithRetry(`${API}/api/settings/autostart`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled: next }),
@@ -131,18 +164,22 @@ function App() {
     } catch { setStatusText('Lỗi chuyển auto-start') }
   }
 
+  // WHY: 3-layer fallback — Tauri shell.open > backend open browser > window.open.
+  // Dynamic import để không crash khi chạy trong browser (npm run dev outside Tauri).
   const openBrowser = async (url: string) => {
     try {
       const { open } = await import('@tauri-apps/plugin-shell')
       await open(url); return
     } catch {}
     try {
-      await fetch(`${API}/api/system/open-browser`, {
+      await fetchWithRetry(`${API}/api/system/open-browser`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url })
       })
     } catch { window.open(url, '_blank') }
   }
 
+  // WHY: Hide window to system tray (không close).
+  // Dynamic import để không crash trong browser — chỉ hoạt động trong Tauri runtime.
   const minimizeToTray = async () => {
     try {
       const { getCurrentWindow } = await import('@tauri-apps/api/window')
@@ -150,6 +187,9 @@ function App() {
     } catch {}
   }
 
+  // WHY: Dùng Tauri plugin-updater — tự động check + download + install.
+  // Dynamic import để không crash trong browser dev mode.
+  // confirm trước khi download để user kiểm soát bandwidth.
   const checkUpdate = async () => {
     try {
       const { check } = await import('@tauri-apps/plugin-updater')
@@ -166,9 +206,11 @@ function App() {
     } catch (e: any) { setStatusText(e?.message || 'Kiểm tra cập nhật thất bại') }
   }
 
+  // WHY: POST /api/shutdown → backend kill all processes + tự tắt.
+  // innerHTML fallback hiển thị thông báo khi backend đã tắt (không còn React).
   const shutdown = async () => {
     if (!window.confirm('Dừng dashboard và tất cả dự án?')) return
-    try { await fetch(`${API}/api/shutdown`, { method: 'POST' }) } catch {}
+    try { await fetchWithRetry(`${API}/api/shutdown`, { method: 'POST' }) } catch {}
     document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:#030712;color:#9ca3af;font-family:sans-serif;font-size:14px">Dashboard đã dừng.</div>'
   }
 
@@ -181,7 +223,8 @@ function App() {
   const moduleName = MODULES.find(m => m.id === activeModule)?.label || ''
 
   return (
-    <div className="h-screen flex select-none bg-[var(--bg)] text-[var(--fg)]">
+    <>
+    <div className="h-screen flex select-none bg-[var(--bg)] text-[var(--fg)] overflow-hidden">
       {/* Sidebar */}
       <Sidebar
         activeModule={activeModule}
@@ -200,7 +243,7 @@ function App() {
             <h1 className="text-sm font-semibold tracking-tight" style={{ color: 'var(--fg)' }}>
               {moduleName}
             </h1>
-            <span className="text-[10px] px-1.5 py-0.5 rounded font-mono border"
+            <span className="text-xs px-1.5 py-0.5 rounded font-mono border"
               style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-muted)' }}>
               {activeModule}
             </span>
@@ -219,20 +262,19 @@ function App() {
 
             {/* Settings button */}
             <button onClick={() => setSettingsOpen(true)}
-              className="p-1.5 rounded-lg transition-all active:scale-95 cursor-pointer border-0"
-              style={{ color: 'var(--fg-muted)', background: 'transparent' }}
-              title="Cài đặt">
+              className="p-1.5 rounded-lg transition-all active:scale-95 cursor-pointer border-0 group relative"
+              style={{ color: 'var(--fg-muted)', background: 'transparent' }}>
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
                 <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
               </svg>
+              <span className="tooltip-text">Cài đặt</span>
             </button>
 
             {/* Theme toggle */}
             <button onClick={toggleTheme}
-              className="p-1.5 rounded-lg transition-all active:scale-95 cursor-pointer border-0"
-              style={{ color: 'var(--fg-muted)', background: 'transparent' }}
-              title={theme === 'dark' ? 'Giao diện sáng' : 'Giao diện tối'}>
+              className="p-1.5 rounded-lg transition-all active:scale-95 cursor-pointer border-0 group relative"
+              style={{ color: 'var(--fg-muted)', background: 'transparent' }}>
               {theme === 'dark' ? (
                 <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
@@ -242,31 +284,46 @@ function App() {
                   <path strokeLinecap="round" strokeLinejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
                 </svg>
               )}
+              <span className="tooltip-text">{theme === 'dark' ? 'Giao diện sáng' : 'Giao diện tối'}</span>
             </button>
 
             {/* Minimize to tray */}
             <button onClick={minimizeToTray}
-              className="p-1.5 rounded-lg transition-all active:scale-95 cursor-pointer border-0"
-              style={{ color: 'var(--fg-muted)', background: 'transparent' }}
-              title="Thu gọn xuống khay hệ thống">
+              className="p-1.5 rounded-lg transition-all active:scale-95 cursor-pointer border-0 group relative"
+              style={{ color: 'var(--fg-muted)', background: 'transparent' }}>
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M20 12H4" />
               </svg>
+              <span className="tooltip-text">Thu gọn xuống khay</span>
             </button>
           </div>
         </header>
 
-        {/* Module content */}
-        <div className="flex-1 min-h-0 overflow-hidden">
-          {activeModule === 'servers' && <ServersModule theme={theme} setStatusText={setStatusText} />}
-          {activeModule === 'printers' && <PrintersModule theme={theme} setStatusText={setStatusText} />}
-          {activeModule === 'audio' && <AudioModule theme={theme} setStatusText={setStatusText} />}
-          {activeModule === 'file-copier' && <FileCopierModule theme={theme} setStatusText={setStatusText} />}
-          {activeModule === 'database' && <DatabaseModule theme={theme} setStatusText={setStatusText} />}
+        {/* Module content - overflow-y-auto để nội dung scroll riêng, sidebar cố định */}
+        <div className="flex-1 min-h-0 overflow-y-auto">
+          <Suspense fallback={
+            <div className="flex items-center justify-center h-full">
+              <div className="text-center space-y-3">
+                <div className="relative mx-auto w-8 h-8">
+                  <div className="absolute inset-0 rounded-full border-2 border-dashed border-emerald-500/30 animate-spin" />
+                  <div className="absolute inset-2 rounded-full border-2 border-emerald-500/50 animate-spin" style={{ animationDirection: 'reverse', animationDuration: '1.5s' }} />
+                </div>
+                <p className="text-xs font-medium" style={{ color: 'var(--fg-dim)' }}>Đang tải...</p>
+              </div>
+            </div>
+          }>
+            {activeModule === 'servers' && <ServersModule theme={theme} setStatusText={setStatusText} />}
+            {activeModule === 'printers' && <PrintersModule theme={theme} setStatusText={setStatusText} />}
+            {activeModule === 'audio' && <AudioModule theme={theme} setStatusText={setStatusText} />}
+            {activeModule === 'file-copier' && <FileCopierModule theme={theme} setStatusText={setStatusText} />}
+            {activeModule === 'database' && <DatabaseModule theme={theme} setStatusText={setStatusText} />}
+            {activeModule === 'tunnels' && <TunnelsModule theme={theme} setStatusText={setStatusText} />}
+            {activeModule === 'logs' && <LogModule theme={theme} setStatusText={setStatusText} />}
+          </Suspense>
         </div>
 
         {/* Bottom Bar */}
-        <footer className="shrink-0 backdrop-blur-md border-t px-5 py-1.5 flex items-center justify-between text-[10px]"
+        <footer className="shrink-0 backdrop-blur-md border-t px-5 py-1.5 flex items-center justify-between text-xs"
           style={{ background: 'var(--bg-header)', borderColor: 'var(--border)', color: 'var(--fg-dim)' }}>
           <div className="flex items-center gap-3 flex-wrap">
             <button onClick={checkUpdate}
@@ -291,7 +348,7 @@ function App() {
             {/* Mobile URL select */}
             <div className="flex lg:hidden">
               <select id="mobile-url-select" name="urlSelect" onChange={e => { if (e.target.value) { openBrowser(e.target.value); e.target.value = '' } }}
-                className="px-1 py-0.5 text-[9px] rounded border"
+                className="px-1 py-0.5 text-xs rounded border"
                 style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
                 <option value="">URL...</option>
                 {detectedUrls.map(url => (
@@ -309,15 +366,17 @@ function App() {
             </label>
             <span style={{ color: 'var(--fg-dim)' }}>|</span>
             <button onClick={() => setChangelogOpen(true)}
-              className="hover:underline cursor-pointer font-semibold text-emerald-500 hover:text-emerald-400 transition-colors bg-transparent border-0"
-              title="Xem nhật ký thay đổi">
+              className="hover:underline cursor-pointer font-semibold text-emerald-500 hover:text-emerald-400 transition-colors bg-transparent border-0 group relative">
               v{appVersion}
+              <span className="tooltip-text">Xem nhật ký thay đổi</span>
             </button>
           </div>
         </footer>
       </div>
 
-      {/* Settings Modal */}
+    </div>
+
+      {/* WHY: Render modals OUTSIDE root div để position: fixed hoạt động đúng (không bị ảnh hưởng bởi ancestor transform/overflow). */}
       <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)}
         onChanged={() => { setSettingsRefresh(prev => prev + 1) }} />
 
@@ -338,7 +397,7 @@ function App() {
                 <div key={ch.version} className={idx > 0 ? "pt-4 border-t" : ""} style={{ borderColor: 'var(--border)' }}>
                   <span className="text-xs font-bold text-emerald-500">Version {ch.version}</span>
                   <h4 className="text-xs font-semibold mb-2 mt-1" style={{ color: 'var(--fg-secondary)' }}>{ch.title}</h4>
-                  <ul className="list-disc list-inside space-y-1 text-[11px]" style={{ color: 'var(--fg-muted)' }}>
+                  <ul className="list-disc list-inside space-y-1 text-[12px]" style={{ color: 'var(--fg-muted)' }}>
                     {ch.items.map((item, i) => (
                       <li key={i} className="pl-1 -indent-4 ml-4">{item}</li>
                     ))}
@@ -348,12 +407,12 @@ function App() {
             </div>
             <div className="mt-6 flex justify-end">
               <button onClick={() => setChangelogOpen(false)}
-                className="px-4 py-1.5 text-[11px] font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors cursor-pointer border-0">Đóng</button>
+                className="px-4 py-1.5 text-[12px] font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors cursor-pointer border-0">Đóng</button>
             </div>
           </div>
         </div>
       )}
-    </div>
+    </>
   )
 }
 

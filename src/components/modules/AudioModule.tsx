@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { AudioDevice, MicStatus } from '../../types'
 
-const API = 'http://127.0.0.1:5050'
+import { API, fetchWithRetry } from '../../utils/apiFetch'
+
 
 interface AudioSession {
   datetime: string
@@ -26,6 +27,9 @@ interface AudioModuleProps {
   setStatusText: (t: string) => void
 }
 
+// WHY: Module quan ly am thanh — mic status, devices, timer, widget.
+// Polling: fetchAll 5s, fetchMicStatus 1s.
+// Widget mode: overlay nho hien thi mic status + timer.
 export default function AudioModule({ theme, setStatusText }: AudioModuleProps) {
   const [micStatus, setMicStatus] = useState<MicStatus | null>(null)
   const [devices, setDevices] = useState<AudioDevice[]>([])
@@ -63,14 +67,15 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
   const dragging = useRef(false)
   const dragOffset = useRef({ x: 0, y: 0 })
 
-  // Fetch devices and settings
+  // WHY: Fetch song song devices + settings + sound files + history
+  // Dùng Promise.all để giảm thời gian loading (4 API cùng lúc).
   const fetchAll = useCallback(async () => {
     try {
       const [devicesRes, settingsRes, soundRes, historyRes] = await Promise.all([
-        fetch(`${API}/api/audio/devices`),
-        fetch(`${API}/api/audio/settings`),
-        fetch(`${API}/api/audio/sound-files`),
-        fetch(`${API}/api/audio/session-history`),
+        fetchWithRetry(`${API}/api/audio/devices`),
+        fetchWithRetry(`${API}/api/audio/settings`),
+        fetchWithRetry(`${API}/api/audio/sound-files`),
+        fetchWithRetry(`${API}/api/audio/session-history`),
       ])
       if (devicesRes.ok) {
         const data = await devicesRes.json()
@@ -92,7 +97,8 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
     } catch { setStatusText('Đang kết nối lại...') }
   }, [setStatusText])
 
-  // Stable refs to avoid recreating fetchMicStatus every second
+  // WHY: Dùng refs để fetchMicStatus (chạy mỗi 1s) không cần re-create.
+  // Nếu dùng state trực tiếp, useCallback phải rebuild mỗi khi state thay đổi → interval bị clear/reset.
   useEffect(() => {
     audioSettingsRef.current = audioSettings
   }, [audioSettings])
@@ -100,9 +106,12 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
     widgetModeRef.current = widgetMode
   }, [widgetMode])
 
+  // WHY: Polling mic status mỗi 1s — cần phản hồi real-time khi mic bật/tắt.
+  // Dùng refs (không phải state) để callback ổn định, tránh re-create interval.
+  // previousWasActiveRef: phát hiện transition active→inactive để log session.
   const fetchMicStatus = useCallback(async () => {
     try {
-      const res = await fetch(`${API}/api/audio/mic-status`)
+      const res = await fetchWithRetry(`${API}/api/audio/mic-status`)
       if (res.ok) {
         const data: MicStatus = await res.json()
         setMicStatus(data)
@@ -141,7 +150,7 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
             setWidgetMode(false)
           }
           if (sessionTimerRef.current > 2) {
-            fetch(`${API}/api/audio/session-log`, {
+            fetchWithRetry(`${API}/api/audio/session-log`, {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 duration: sessionTimerRef.current,
@@ -155,7 +164,11 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
     } catch {}
   }, []) // Empty deps - stable callback using refs
 
-  // Timer interval
+  // WHY: Timer chỉ chạy khi mic đang active (microphone đang được dùng).
+  // Tự động clear khi mic tắt — không tốn tài nguyên nền.
+  // Dùng sessionTimerRef (ref) kết hợp setSessionTimer (state) để:
+  //   - Ref: đọc giá trị ngay lập tức trong fetchMicStatus (không stale)
+  //   - State: trigger re-render UI hiển thị đồng hồ
   useEffect(() => {
     if (micStatus?.active) {
       timerRef.current = setInterval(() => {
@@ -192,16 +205,20 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
     }
   }, [selectedDevice, devices])
 
+  // WHY: Toggle mute device — POST mute API + fetchAll refresh.
+  // Local state muted cap nhat ngay (optimistic UI).
   const toggleMute = async (id: number) => {
     try {
-      const res = await fetch(`${API}/api/audio/devices/${id}/mute`, { method: 'POST' })
+      const res = await fetchWithRetry(`${API}/api/audio/devices/${id}/mute`, { method: 'POST' })
       if (res.ok) { setMuted(!muted); fetchAll() }
     } catch {}
   }
 
+  // WHY: Set volume — PUT volume API + local state.
+  // Clamp 0-100 (backend cung lam).
   const setVolumeLevel = async (id: number, vol: number) => {
     try {
-      await fetch(`${API}/api/audio/devices/${id}/volume`, {
+      await fetchWithRetry(`${API}/api/audio/devices/${id}/volume`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ volume: vol })
       })
@@ -209,16 +226,20 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
     } catch {}
   }
 
+  // WHY: Set default audio device — POST default API + UI feedback.
+  // Refresh devices list de thay doi default badge.
   const setDefaultDevice = async (id: number) => {
     try {
-      const res = await fetch(`${API}/api/audio/devices/${id}/default`, { method: 'POST' })
+      const res = await fetchWithRetry(`${API}/api/audio/devices/${id}/default`, { method: 'POST' })
       if (res.ok) { setStatusText('Đã đặt mặc định'); fetchAll() }
     } catch { setStatusText('Thất bại') }
   }
 
+  // WHY: Save audio settings (sound, widget opacity, colors).
+  // POST whole settings object — backend merge.
   const saveSettings = async () => {
     try {
-      const res = await fetch(`${API}/api/audio/settings`, {
+      const res = await fetchWithRetry(`${API}/api/audio/settings`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(audioSettings)
       })
@@ -226,12 +247,14 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
     } catch { setStatusText('Thất bại') }
   }
 
-  // Widget drag handlers - use window for reliable drag
+  // WHY: Dùng window-level event listeners để drag không bị giới hạn bởi kích thước component.
+  // Ref pattern (dragging, dragOffset) thay vì state để tránh re-render khi drag.
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
       if (!dragging.current) return
       setWidgetPos({ x: e.clientX - dragOffset.current.x, y: e.clientY - dragOffset.current.y })
     }
+    // WHY: Cleanup khi thả chuột — dùng window-level listener để bắt ngay cả khi chuột ra ngoài component.
     const handleMouseUp = () => { dragging.current = false }
     window.addEventListener('mousemove', handleMouseMove)
     window.addEventListener('mouseup', handleMouseUp)
@@ -240,11 +263,15 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
       window.removeEventListener('mouseup', handleMouseUp)
     }
   }, [])
+  // WHY: Start widget drag — luu offset de tranh jump khi bat dau drag.
+  // Window-level move/up listeners duoc attach trong useEffect (handleMouseMove/handleMouseUp).
   const handleMouseDown = (e: React.MouseEvent) => {
     dragging.current = true
     dragOffset.current = { x: e.clientX - widgetPos.x, y: e.clientY - widgetPos.y }
   }
 
+  // WHY: Format seconds -> mm:ss (khong co hours vi timer mic thuong < 1h).
+  // Dung padStart de dam bao 2 chu so (VD: 5 -> 05).
   const formatDuration = (seconds: number) => {
     const m = Math.floor(seconds / 60)
     const s = seconds % 60
@@ -279,19 +306,19 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
               {micStatus?.active ? formatDuration(sessionTimer) : '--:--'}
             </div>
             {/* App name */}
-            <div className="text-white/80 text-[10px] mt-1 truncate max-w-full text-center">
+            <div className="text-white/80 text-xs mt-1 truncate max-w-full text-center">
               {micStatus?.app_using_mic || 'Không có ứng dụng'}
             </div>
             {/* Status dot */}
             <div className="flex items-center gap-1 mt-1">
               <span className={`w-1.5 h-1.5 rounded-full ${micStatus?.active ? 'bg-green-300 animate-pulse' : 'bg-gray-400'}`} />
-              <span className="text-white/70 text-[9px]">{micStatus?.active ? 'Hoạt động' : 'Không hoạt động'}</span>
+              <span className="text-white/70 text-[10px]">{micStatus?.active ? 'Hoạt động' : 'Không hoạt động'}</span>
             </div>
           </div>
         </div>
         {/* Minimize button */}
         <button onClick={() => setWidgetMode(false)}
-          className="absolute -top-2 -right-2 w-5 h-5 rounded-full bg-gray-800 border border-gray-600 text-white text-[9px] flex items-center justify-center cursor-pointer hover:bg-gray-700"
+          className="absolute -top-2 -right-2 w-5 h-5 rounded-full bg-gray-800 border border-gray-600 text-white text-[10px] flex items-center justify-center cursor-pointer hover:bg-gray-700"
           title="Thoát chế độ thu gọn">
           ✕
         </button>
@@ -305,11 +332,11 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-sm font-semibold" style={{ color: 'var(--fg)' }}>🎤 Quản lý Âm thanh & Mic</h2>
-          <p className="text-[10px]" style={{ color: 'var(--fg-muted)' }}>{devices.length} thiết bị · {sessionHistory.length} phiên</p>
+          <p className="text-xs" style={{ color: 'var(--fg-muted)' }}>{devices.length} thiết bị · {sessionHistory.length} phiên</p>
         </div>
         <div className="flex gap-2">
           <button onClick={() => setWidgetMode(true)}
-            className="px-2.5 py-1.5 text-[10px] font-medium rounded-lg border transition-all active:scale-95 cursor-pointer"
+            className="px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-all active:scale-95 cursor-pointer"
             style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
             🔲 Thu nhỏ
           </button>
@@ -322,11 +349,11 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
         <div className="rounded-xl border backdrop-blur p-4 transition-all"
           style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border)' }}>
           <div className="flex items-center justify-between mb-3">
-            <h3 className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-muted)' }}>
+            <h3 className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-muted)' }}>
               🎙 Micro
             </h3>
             {micStatus && (
-              <span className={`flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold ${
+              <span className={`flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold ${
                 micStatus.active ? 'bg-emerald-500/15 text-emerald-500 ring-1 ring-emerald-500/20' : 'bg-gray-500/10 text-gray-400 ring-1 ring-gray-500/15'
               }`}>
                 <span className={`w-1.5 h-1.5 rounded-full ${micStatus.active ? 'bg-emerald-400 animate-pulse' : 'bg-gray-400'}`} />
@@ -335,31 +362,97 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
             )}
           </div>
           {micStatus ? (
-            <div className="space-y-2 text-[11px]">
-              <div>
-                <span style={{ color: 'var(--fg-muted)' }}>Ứng dụng:</span>
-                <p className="font-medium truncate mt-0.5" style={{ color: 'var(--fg)' }}>{micStatus.app_using_mic || 'Không có'}</p>
+            <div className="space-y-2 text-xs">
+              <div className="flex items-center gap-2 mb-2">
+                {/* Overall Status Badge */}
+                {micStatus.overall_status === 'active' && (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" /> ĐANG DÙNG
+                  </span>
+                )}
+                {micStatus.overall_status === 'muted' && (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-red-500/15 text-red-400 border border-red-500/30 flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-red-400" /> 🔇 ĐÃ TẮT
+                  </span>
+                )}
+                {micStatus.overall_status === 'idle' && (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-500/10 text-blue-400 border border-blue-500/20 flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-blue-400" /> SẴN SÀNG
+                  </span>
+                )}
+                {micStatus.overall_status === 'no_mic' && (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-gray-500/10 text-gray-400 border border-gray-500/20 flex items-center gap-1">
+                    ❌ KHÔNG CÓ MIC
+                  </span>
+                )}
+                {/* Mic count */}
+                {micStatus.mic_count > 0 && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded" style={{ backgroundColor: 'var(--input-bg)', color: 'var(--fg-dim)' }}>
+                    {micStatus.mic_count} mic
+                  </span>
+                )}
               </div>
               <div>
-                <span style={{ color: 'var(--fg-muted)' }}>Mic:</span>
+                <span style={{ color: 'var(--fg-muted)' }}>🎤 Mic đang dùng:</span>
                 <p className="font-medium truncate mt-0.5" style={{ color: 'var(--fg)' }}>{micStatus.mic_name || 'Không rõ'}</p>
               </div>
+              <div>
+                <span style={{ color: 'var(--fg-muted)' }}>📱 Ứng dụng:</span>
+                <p className="font-medium truncate mt-0.5" style={{ color: 'var(--fg)' }}>{micStatus.app_using_mic || 'Không có'}</p>
+              </div>
+              {micStatus.mic_muted !== null && micStatus.mic_muted !== undefined && (
+                <div>
+                  <span style={{ color: 'var(--fg-muted)' }}>🔇 Tắt tiếng:</span>
+                  <p className="font-medium mt-0.5" style={{ color: micStatus.mic_muted ? '#ef4444' : '#22c55e' }}>
+                    {micStatus.mic_muted ? 'Micro đang tắt tiếng' : 'Micro đang bật'}
+                  </p>
+                </div>
+              )}
               <div>
                 <span style={{ color: 'var(--fg-muted)' }}>Trạng thái:</span>
                 <p className="font-medium mt-0.5" style={{ color: micStatus.active ? '#22c55e' : '#94a3b8' }}>
                   {micStatus.active ? 'Micro đang dùng' : 'Không hoạt động'}
                 </p>
               </div>
+              {/* Available mics list */}
+              {micStatus.available_mics && micStatus.available_mics.length > 0 && (
+                <div className="pt-2 border-t mt-2" style={{ borderColor: 'var(--border)' }}>
+                  <span className="text-xs font-semibold" style={{ color: 'var(--fg-muted)' }}>
+                    📋 Micro khả dụng ({micStatus.available_mics.length}):
+                  </span>
+                  <div className="mt-1 space-y-0.5 max-h-24 overflow-y-auto">
+                    {micStatus.available_mics.slice(0, 6).map(mic => (
+                      <div key={mic.id} className="flex items-center gap-1.5 text-[10px]">
+                        <span style={{ color: mic.default ? '#22c55e' : 'var(--fg-dim)' }}>
+                          {mic.default ? '🔵' : '○'}
+                        </span>
+                        <span className="truncate flex-1" style={{ color: mic.default ? 'var(--fg)' : 'var(--fg-dim)' }}>
+                          {mic.name}
+                        </span>
+                        <span style={{ color: 'var(--fg-dim)' }}>{mic.channels}ch</span>
+                        {mic.default && (
+                          <span className="text-[8px] bg-emerald-500/10 text-emerald-400 px-1 rounded">MĐ</span>
+                        )}
+                      </div>
+                    ))}
+                    {micStatus.available_mics.length > 6 && (
+                      <p className="text-[10px] italic" style={{ color: 'var(--fg-dim)' }}>
+                        +{micStatus.available_mics.length - 6} micro khác...
+                      </p>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
           ) : (
-            <p className="text-[11px] italic" style={{ color: 'var(--fg-dim)' }}>Đang kết nối...</p>
+            <p className="text-xs italic" style={{ color: 'var(--fg-dim)' }}>Đang kết nối...</p>
           )}
         </div>
 
         {/* Timer Dashboard */}
         <div className="rounded-xl border backdrop-blur p-4 transition-all"
           style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border)' }}>
-          <h3 className="text-[10px] font-semibold uppercase tracking-wider mb-3" style={{ color: 'var(--fg-muted)' }}>
+          <h3 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{ color: 'var(--fg-muted)' }}>
             ⏱ Bộ đếm
           </h3>
           <div className="flex flex-col items-center">
@@ -367,7 +460,7 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
               style={{ color: micStatus?.active ? '#22c55e' : 'var(--fg-secondary)' }}>
               {micStatus?.active ? formatDuration(sessionTimer) : '00:00'}
             </div>
-            <div className="text-[10px] mt-2 flex items-center gap-3 flex-wrap justify-center">
+            <div className="text-xs mt-2 flex items-center gap-3 flex-wrap justify-center">
               <span style={{ color: 'var(--fg-muted)' }}>
                 Gần nhất: <strong style={{ color: 'var(--fg-secondary)' }}>{formatDuration(lastSessionDuration)}</strong>
               </span>
@@ -377,12 +470,12 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
             </div>
             <div className="mt-2 flex gap-1.5">
               <button onClick={() => setHistoryOpen(true)}
-                className="px-2 py-0.5 text-[9px] rounded-lg border transition-colors cursor-pointer"
+                className="px-2 py-0.5 text-[10px] rounded-lg border transition-colors cursor-pointer"
                 style={{ borderColor: 'var(--border)', color: 'var(--fg-muted)' }}>
                 📋 Lịch sử
               </button>
               <button onClick={() => setSettingsOpen(true)}
-                className="px-2 py-0.5 text-[9px] rounded-lg border transition-colors cursor-pointer"
+                className="px-2 py-0.5 text-[10px] rounded-lg border transition-colors cursor-pointer"
                 style={{ borderColor: 'var(--border)', color: 'var(--fg-muted)' }}>
                 ⚙️ Settings
               </button>
@@ -410,10 +503,10 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
                   <div className="flex items-center gap-2">
                     <span className="text-sm font-medium truncate" style={{ color: 'var(--fg)' }}>{dev.name}</span>
                     {dev.is_default && (
-                      <span className="text-[9px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded font-medium">MẶC ĐỊNH</span>
+                      <span className="text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded font-medium">MẶC ĐỊNH</span>
                     )}
                   </div>
-                  <span className="text-[10px]" style={{ color: 'var(--fg-dim)' }}>
+                  <span className="text-xs" style={{ color: 'var(--fg-dim)' }}>
                     {dev.is_input ? 'Đầu vào' : 'Đầu ra'}
                     {dev.muted && <span className="ml-2 text-red-400">🔇 TẮT TIẾNG</span>}
                   </span>
@@ -426,7 +519,7 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
                     backgroundColor: dev.volume > 70 ? '#22c55e' : dev.volume > 30 ? '#eab308' : '#ef4444'
                   }} />
                 </div>
-                <span className="text-[10px] font-mono w-8 text-right" style={{ color: 'var(--fg-muted)' }}>{dev.volume}%</span>
+                <span className="text-xs font-mono w-8 text-right" style={{ color: 'var(--fg-muted)' }}>{dev.volume}%</span>
               </div>
             </div>
 
@@ -434,18 +527,18 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
               <div className="border-t px-4 py-3 space-y-3" style={{ borderColor: 'var(--border)' }}>
                 <div className="flex items-center gap-3">
                   <button onClick={() => toggleMute(dev.id)}
-                    className="px-3 py-1 text-[11px] font-medium rounded-lg border transition-colors cursor-pointer"
+                    className="px-3 py-1 text-xs font-medium rounded-lg border transition-colors cursor-pointer"
                     style={{ backgroundColor: dev.muted ? '#ef444420' : 'var(--input-bg)', borderColor: dev.muted ? '#ef444240' : 'var(--border)', color: dev.muted ? '#ef4444' : 'var(--fg-secondary)' }}>
                     {dev.muted ? '🔇 Bật tiếng' : '🔊 Tắt tiếng'}
                   </button>
                   <input id={`volume-${dev.id}`} name="volume" type="range" min={0} max={100} value={volume}
                     onChange={e => setVolumeLevel(dev.id, parseInt(e.target.value))}
                     className="flex-1 accent-emerald-500" />
-                  <span className="text-[10px] font-mono w-8 text-right" style={{ color: 'var(--fg-muted)' }}>{volume}%</span>
+                  <span className="text-xs font-mono w-8 text-right" style={{ color: 'var(--fg-muted)' }}>{volume}%</span>
                 </div>
                 {!dev.is_default && (
                   <button onClick={() => setDefaultDevice(dev.id)}
-                    className="w-full px-3 py-1.5 text-[11px] font-medium bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 rounded-lg transition-colors cursor-pointer border-0">
+                    className="w-full px-3 py-1.5 text-xs font-medium bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 rounded-lg transition-colors cursor-pointer border-0">
                     🎯 Đặt mặc định {dev.is_input ? 'Mic' : 'Loa'}
                   </button>
                 )}
@@ -481,34 +574,34 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
                 <span style={{ color: 'var(--fg-secondary)' }}>Hiện widget khi mic bật</span>
               </label>
               <div>
-                <label className="text-[11px] font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>
+                <label className="text-xs font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>
                   Độ mờ widget: {Math.round((audioSettings.widget_opacity ?? 1.0) * 100)}%
                 </label>
-                <input type="range" min={10} max={100} value={Math.round((audioSettings.widget_opacity ?? 1.0) * 100)}
+                <input id="audio-opacity" name="widgetOpacity" type="range" min={10} max={100} value={Math.round((audioSettings.widget_opacity ?? 1.0) * 100)}
                   onChange={e => setAudioSettings(prev => ({ ...prev, widget_opacity: parseInt(e.target.value) / 100 }))}
                   className="w-full accent-emerald-500" />
               </div>
               <div>
-                <label htmlFor="audio-color-on" className="text-[11px] font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Màu khi hoạt động</label>
+                <label htmlFor="audio-color-on" className="text-xs font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Màu khi hoạt động</label>
                 <div className="flex items-center gap-2">
                   <input id="audio-color-on" name="colorMicOn" type="color" value={audioSettings.color_mic_on}
                     onChange={e => setAudioSettings(prev => ({ ...prev, color_mic_on: e.target.value }))}
                     className="w-8 h-8 rounded cursor-pointer border-0" />
-                  <span className="font-mono text-[10px]" style={{ color: 'var(--fg-secondary)' }}>{audioSettings.color_mic_on}</span>
+                  <span className="font-mono text-xs" style={{ color: 'var(--fg-secondary)' }}>{audioSettings.color_mic_on}</span>
                 </div>
               </div>
               <div>
-                <label htmlFor="audio-color-off" className="text-[11px] font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Màu khi không hoạt động</label>
+                <label htmlFor="audio-color-off" className="text-xs font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Màu khi không hoạt động</label>
                 <div className="flex items-center gap-2">
                   <input id="audio-color-off" name="colorMicOff" type="color" value={audioSettings.color_mic_off}
                     onChange={e => setAudioSettings(prev => ({ ...prev, color_mic_off: e.target.value }))}
                     className="w-8 h-8 rounded cursor-pointer border-0" />
-                  <span className="font-mono text-[10px]" style={{ color: 'var(--fg-secondary)' }}>{audioSettings.color_mic_off}</span>
+                  <span className="font-mono text-xs" style={{ color: 'var(--fg-secondary)' }}>{audioSettings.color_mic_off}</span>
                 </div>
               </div>
               {soundFiles.length > 0 && (
                 <div>
-                  <label htmlFor="audio-sound-select" className="text-[11px] font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Âm thanh báo</label>
+                  <label htmlFor="audio-sound-select" className="text-xs font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Âm thanh báo</label>
                   <select id="audio-sound-select" name="selectedSound" value={audioSettings.selected_sound || ''}
                     onChange={e => setAudioSettings(prev => ({ ...prev, selected_sound: e.target.value || null }))}
                     className="w-full px-2 py-1.5 text-xs rounded-lg border"
@@ -523,10 +616,10 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
             </div>
             <div className="mt-6 flex justify-end gap-2">
               <button onClick={() => setSettingsOpen(false)}
-                className="px-3 py-1.5 text-[11px] font-medium border rounded-lg transition-colors cursor-pointer"
+                className="px-3 py-1.5 text-xs font-medium border rounded-lg transition-colors cursor-pointer"
                 style={{ borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>Hủy</button>
               <button onClick={saveSettings}
-                className="px-4 py-1.5 text-[11px] font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors cursor-pointer border-0">Lưu</button>
+                className="px-4 py-1.5 text-xs font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors cursor-pointer border-0">Lưu</button>
             </div>
           </div>
         </div>
@@ -549,7 +642,7 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
                 <p className="text-xs italic text-center py-8" style={{ color: 'var(--fg-dim)' }}>Chưa có phiên nào</p>
               ) : (
                 sessionHistory.slice(0, 50).map((session, idx) => (
-                  <div key={idx} className="p-2 rounded-lg text-[10px]"
+                  <div key={idx} className="p-2 rounded-lg text-xs"
                     style={{ backgroundColor: 'var(--input-bg)' }}>
                     <div className="flex items-center justify-between">
                       <span className="font-mono" style={{ color: 'var(--fg-muted)' }}>{session.datetime}</span>
@@ -571,7 +664,7 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
             </div>
             <div className="mt-4 pt-4 border-t flex justify-end" style={{ borderColor: 'var(--border)' }}>
               <button onClick={() => setHistoryOpen(false)}
-                className="px-3 py-1.5 text-[11px] font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors cursor-pointer border-0">Đóng</button>
+                className="px-3 py-1.5 text-xs font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors cursor-pointer border-0">Đóng</button>
             </div>
           </div>
         </div>
