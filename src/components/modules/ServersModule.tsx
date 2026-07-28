@@ -96,6 +96,12 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
   const [watchdogToggling, setWatchdogToggling] = useState<Record<string, boolean>>({})
   const [batchTunnelLoading, setBatchTunnelLoading] = useState(false)
   const [showServerSettings, setShowServerSettings] = useState(false)
+  const [logTheme, setLogTheme] = useState<'light' | 'dark'>(() => {
+    try {
+      const stored = localStorage.getItem('sd-log-theme')
+      return stored === 'dark' ? 'dark' : 'light'
+    } catch { return 'light' }
+  })
   const logEndRef = useRef<HTMLDivElement>(null)
   const prevTabRef = useRef(activeTab)
   // WHY: Track segment vừa được click để chạy glow animation pulse ngắn.
@@ -125,6 +131,10 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
   useEffect(() => {
     localStorage.setItem('sd-active-tab', activeTab)
   }, [activeTab])
+  // WHY: Persist logTheme để giữ chế độ sáng/tối giữa các lần mở app.
+  useEffect(() => {
+    localStorage.setItem('sd-log-theme', logTheme)
+  }, [logTheme])
 
   const [showFilterDropdown, setShowFilterDropdown] = useState(false)
   const filterDropdownRef = useRef<HTMLDivElement>(null)
@@ -273,12 +283,12 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
         setStatusText(`🌐 Tunnel started for ${name}`)
         addToast({ type: 'success', title: `🌐 ${name}`, message: 'Tunnel đã được mở thành công' })
       } else {
-        setStatusText(`❌ Tunnel error: ${data.error || 'Unknown'}`)
+        setStatusText(`❌ Lỗi tunnel: ${data.error || 'Không xác định'}`)
         addToast({ type: 'error', title: `🌐 ${name}`, message: data.error || 'Mở tunnel thất bại' })
         if (data.instructions) setStatusText(data.instructions)
       }
     } catch {
-      setStatusText('Failed to start tunnel')
+      setStatusText('Mở tunnel thất bại')
       addToast({ type: 'error', title: '🔌 Mất kết nối', message: 'Không thể kết nối tới backend' })
     }
     finally { setTunnelLoading(l => ({ ...l, [name]: false })) }
@@ -301,7 +311,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
         addToast({ type: 'info', title: `🌐 ${name}`, message: 'Tunnel đã đóng' })
       }
     } catch {
-      setStatusText('Failed to stop tunnel')
+      setStatusText('Dừng tunnel thất bại')
       addToast({ type: 'error', title: `🌐 ${name}`, message: 'Dừng tunnel thất bại' })
     }
     finally { setTunnelLoading(l => ({ ...l, [name]: false })) }
@@ -346,7 +356,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
         setStatusText('🌐 Tunnel started!')
         addToast({ type: 'success', title: `🌐 ${name}`, message: 'Tunnel đã được cài và mở thành công' })
       } else {
-        setStatusText(`❌ ${data.error || 'Failed'}`)
+        setStatusText(`❌ ${data.error || 'Thất bại'}`)
         addToast({ type: 'error', title: `🌐 ${name}`, message: data.error || 'Cài & mở tunnel thất bại' })
       }
     } catch {
@@ -425,8 +435,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
       try {
         const { invoke } = await import('@tauri-apps/api/core')
         await invoke('update_tray_status', { running, total: data.length })
-      } catch {}
-    } catch { setStatusText('Reconnecting...') }
+      } catch {}      } catch { setStatusText('Đang kết nối lại...') }
   }, [setStatusText])
 
   // WHY: Expose global functions for tray menu (Start All / Stop All)
@@ -580,7 +589,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
     try {
       const res = await fetchWithRetry(`${API}/api/projects/${encodeURIComponent(name)}/${action}`, { method: 'POST' })
       if (res.ok) {
-        setStatusText(`${action === 'start' ? 'Started' : 'Stopped'} ${name}`)
+        setStatusText(`${action === 'start' ? 'Đã chạy' : 'Đã dừng'} ${name}`)
         if (action === 'start') {
           addToast({ type: 'success', title: `🚀 ${name}`, message: 'Máy chủ đã khởi động' })
         } else {
@@ -588,12 +597,12 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
         }
       } else {
         const e = await res.json();
-        setStatusText(e.error || 'Failed')
+        setStatusText(e.error || 'Thất bại')
         addToast({ type: 'error', title: `❌ ${name}`, message: e.error || 'Thao tác thất bại' })
       }
       await fetchProjects()
     } catch {
-      setStatusText('Connection failed')
+      setStatusText('Mất kết nối')
       addToast({ type: 'error', title: '🔌 Mất kết nối', message: `Không thể ${action === 'start' ? 'khởi động' : 'dừng'} ${name}` })
     }
     finally { setLoading(p => ({ ...p, [name]: false })) }
@@ -603,8 +612,8 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
   // Confirm truoc khi clean vi khong undo duoc.
   const cleanProject = async (name: string, type: 'basic' | 'deep' | 'nuke') => {
     let msg = `Run clean (${type}) for ${name}?`
-    if (type === 'deep') msg = 'Deep clean will stop the server and delete build folders. Continue?'
-    else if (type === 'nuke') msg = `⚠️ NUKE CLEAN will delete node_modules and reinstall. Continue?`
+    if (type === 'deep') msg = 'Dọn sâu sẽ dừng máy chủ và xóa thư mục build. Tiếp tục?'
+    else if (type === 'nuke') msg = `⚠️ XÓA SẠCH sẽ xóa node_modules và cài lại. Tiếp tục?`
     if (!window.confirm(msg)) return
     setClearing(c => ({ ...c, [name]: true }))
     try {
@@ -614,7 +623,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
       const data = await res.json()
       if (res.ok) {
         if (data.status === 'nuked_reinstalling') {
-          setStatusText(`Nuked ${name}! Running npm install...`)
+          setStatusText(`Đã xóa sạch ${name}! Đang cài lại...`)
           addToast({ type: 'info', title: `🧹 ${name}`, message: 'Đã nuke và đang chạy npm install' })
           setActiveTab(name)
         } else {
@@ -627,7 +636,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
       }
       await fetchProjects()
     } catch {
-      setStatusText('Connection failed')
+      setStatusText('Mất kết nối')
       addToast({ type: 'error', title: '🔌 Mất kết nối', message: 'Không thể kết nối tới backend' })
     }
     finally { setClearing(c => ({ ...c, [name]: false })) }
@@ -655,7 +664,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
     try {
       const res = await fetchWithRetry(`${API}/api/projects/${encodeURIComponent(name)}/env`)
       if (res.ok) { const d = await res.json(); setEnvFileName(d.fileName); setEnvContent(d.content) }
-    } catch { setStatusText('Failed to load env file') }
+    } catch { setStatusText('Lỗi tải file .env') }
   }
 
   // WHY: PUT /api/projects/<name>/env de save noi dung .env.
@@ -669,8 +678,8 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
         body: JSON.stringify({ fileName: envFileName, content: envContent })
       })
       if (res.ok) { setStatusText(`Saved ${envFileName}`); setEnvEditingProject(null); addToast({ type: 'success', title: '💾 Lưu .env', message: `Đã lưu ${envFileName}` }) }
-      else { const e = await res.json(); setStatusText(e.error || 'Failed'); addToast({ type: 'error', title: '💾 Lưu .env thất bại', message: e.error || 'Lỗi không xác định' }) }
-    } catch { setStatusText('Connection failed'); addToast({ type: 'error', title: '🔌 Mất kết nối', message: 'Không thể kết nối tới backend' }) }
+      else { const e = await res.json(); setStatusText(e.error || 'Thất bại'); addToast({ type: 'error', title: '💾 Lưu .env thất bại', message: e.error || 'Lỗi không xác định' }) }
+    } catch { setStatusText('Mất kết nối'); addToast({ type: 'error', title: '🔌 Mất kết nối', message: 'Không thể kết nối tới backend' }) }
     finally { setEnvSaving(false) }
   }
 
@@ -695,7 +704,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
   // Fallback: neu clipboard API fail, log van hien thi tren UI.
   const handleCopyLog = () => {
     const targetLines = getExportLines(exportLimit)
-    if (!targetLines.length) { setStatusText('No logs to copy'); return }
+    if (!targetLines.length) { setStatusText('Không có log để sao chép'); return }
     const content = formatLogs(targetLines, exportFormat)
     navigator.clipboard.writeText(content)
     setStatusText(`Copied ${targetLines.length} lines as ${exportFormat.toUpperCase()}`)
@@ -705,7 +714,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
   // Blob download fallback cho browser mode (khong co Tauri save dialog).
   const handleDownloadLog = async () => {
     const lines = fullLogs[activeTab] || []
-    if (!lines.length) { setStatusText('No logs to download'); return }
+    if (!lines.length) { setStatusText('Không có log để tải'); return }
     try {
       const params = new URLSearchParams({
         project: activeTab,
@@ -714,7 +723,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
         search: logSearch
       })
       const res = await fetchWithRetry(`${API}/api/logs/export?${params}`)
-      if (!res.ok) { setStatusText('Download failed'); return }
+      if (!res.ok) { setStatusText('Tải thất bại'); return }
       const blob = await res.blob()
       const contentDisposition = res.headers.get('Content-Disposition')
       let filename = `logs_${activeTab.toLowerCase().replace(/\s+/g, '_')}.${exportFormat === 'txt' ? 'log' : exportFormat}`
@@ -736,17 +745,17 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
   // Fallback ve handleDownloadLog neu khong co Tauri runtime.
   const handleExportLog = async () => {
     const targetLines = getExportLines(exportLimit)
-    if (!targetLines.length) { setStatusText('No logs to export'); return }
+    if (!targetLines.length) { setStatusText('Không có log để xuất'); return }
     const content = formatLogs(targetLines, exportFormat)
     const fileExt = exportFormat === 'txt' ? 'log' : exportFormat
     const defaultName = `logs_${activeTab.toLowerCase().replace(/\s+/g, '_')}_${exportLimit === 0 ? 'all' : exportLimit}.${fileExt}`
     try {
       const { save } = await import('@tauri-apps/plugin-dialog')
       const selectedPath = await save({ title: 'Export Server Logs', defaultPath: defaultName, filters: [{ name: exportFormat.toUpperCase(), extensions: [fileExt] }] })
-      if (!selectedPath) { setStatusText('Export cancelled'); return }
-      setStatusText('Saving...')
+      if (!selectedPath) { setStatusText('Đã hủy xuất'); return }
+      setStatusText('Đang lưu...')
       const res = await fetchWithRetry(`${API}/api/logs/save-to-file`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: selectedPath, content }) })
-      setStatusText(res.ok ? `Exported to ${selectedPath.split(/[\\/]/).pop()}` : (await res.json()).error || 'Failed')
+      setStatusText(res.ok ? `Đã xuất ra ${selectedPath.split(/[\\/]/).pop()}` : (await res.json()).error || 'Thất bại')
     } catch (err: any) { setStatusText(err?.message || 'Export error') }
   }
 
@@ -775,7 +784,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
             setBatchLoading(true)
             try {
               await fetchWithRetry(`${API}/api/projects/start-all`, { method: 'POST' })
-              setStatusText('Started all projects')
+              setStatusText('Đã khởi động tất cả')
               addToast({ type: 'success', title: '🚀 Khởi động hàng loạt', message: 'Tất cả dự án đã được khởi động' })
               await fetchProjects()
             } catch {
@@ -794,11 +803,11 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
             setBatchLoading(true)
             try {
               await fetchWithRetry(`${API}/api/projects/stop-all`, { method: 'POST' })
-              setStatusText('Stopped all projects')
+              setStatusText('Đã dừng tất cả')
               addToast({ type: 'info', title: '⏹ Dừng hàng loạt', message: 'Tất cả dự án đã được dừng' })
               await fetchProjects()
             } catch {
-              setStatusText('Failed to stop all')
+              setStatusText('Dừng tất cả thất bại')
               addToast({ type: 'error', title: '⏹ Dừng hàng loạt thất bại', message: 'Không thể kết nối tới backend' })
             }
             finally { setBatchLoading(false) }
@@ -850,18 +859,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
             }
             return null
           })()}
-          {/* Background Polling Toggle */}
-          {onBackgroundPollingChange && (
-            <button onClick={() => onBackgroundPollingChange(!backgroundPolling)}
-              className="flex items-center gap-1 px-2 py-1 text-[10px] rounded-lg transition-all active:scale-95 cursor-pointer border-0"
-              style={{ color: backgroundPolling ? '#34d399' : 'var(--fg-muted)', backgroundColor: backgroundPolling ? 'rgba(52,211,153,0.1)' : 'transparent' }}>
-              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
-              </svg>
-              Nền: {backgroundPolling ? 'BẬT' : 'TẮT'}
-            </button>
-          )}
-          {/* Settings button — merged, placed next to tunnel info */}
+          {/* Settings button — duy nhất, gom cả polling + màu sắc */}
           {(onBackgroundPollingChange || onLogColorsChange) && (
             <button onClick={() => setShowServerSettings(!showServerSettings)}
               className="flex items-center gap-1 px-2 py-1 text-xs rounded-lg transition-all active:scale-95 cursor-pointer border-0 group relative shrink-0"
@@ -968,18 +966,18 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
       {/* Server Cards */}
       <div className="shrink-0 grid grid-cols-2 gap-3 px-4 pb-2">
         {projects.map((p, idx) => (
-          <div key={p.name} className={`relative group rounded-xl border backdrop-blur p-4 ${'card-hover animate-card-enter'} flex flex-col justify-between`}
-            style={{ background: 'var(--bg-card)', borderColor: 'var(--border)', animationDelay: `${idx * 0.05}s` }}>
+          <div key={p.name} className={`relative group rounded-xl border overflow-hidden ${'animate-card-enter'} flex flex-col justify-between card-container ${p.running ? 'card-running' : ''}`}
+            style={{ background: 'var(--card-bg)', borderColor: 'var(--card-border)', animationDelay: `${idx * 0.05}s` }}>
+            {p.running && <div className="card-accent-bar" />}
             <div className={`absolute left-0 top-2 bottom-2 w-0.5 rounded-full transition-all duration-300 ${p.running ? 'bg-emerald-400 animate-running-bar' : ''}`}
-              style={{ background: p.running ? undefined : 'var(--fg-dim)' }} />
+              style={{ background: p.running ? undefined : 'var(--accent-bar-stopped)' }} />
             <div>
               <div className="flex items-start justify-between pl-3">
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <h2 className="text-sm font-medium truncate" style={{ color: 'var(--fg)' }}>{p.name}</h2>
-                    <span className={`relative inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold ${p.running ? 'bg-emerald-500/15 text-emerald-500 ring-1 ring-emerald-500/20 animate-badge-pop' : 'bg-red-500/10 text-red-400 ring-1 ring-red-500/15'}`}>
-                      <span className={`w-1 h-1 rounded-full ${p.running ? 'bg-emerald-400 animate-pulse' : 'bg-red-400'}`} />
-                      {p.running && <span className="absolute inset-0 rounded-full animate-status-ring" />}
+                    <h2 className="text-sm font-semibold truncate" style={{ color: 'var(--fg)' }}>{p.name}</h2>
+                    <span className={`status-badge ${p.running ? 'status-badge-running animate-badge-pop' : 'status-badge-stopped'}`}>
+                      <span className={`status-dot ${p.running ? 'status-dot-running' : 'status-dot-stopped'}`} />
                       {p.running ? 'ĐANG CHẠY' : 'ĐÃ DỪNG'}
                     </span>
                   </div>
@@ -994,18 +992,17 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                 </button>
               </div>
               {expandedProject === p.name && (
-                <div className="mt-3 pt-3 border-t border-dashed space-y-2 text-xs pl-3 expand-enter" style={{ borderColor: 'var(--border)' }}>
-                  <div className="grid grid-cols-2 gap-2">
-                    <div><span style={{ color: 'var(--fg-muted)' }}>Bộ nhớ:</span> <span className="font-mono" style={{ color: 'var(--fg-secondary)' }}>{diagnostics[p.name]?.memory ? `${(diagnostics[p.name].memory / 1024 / 1024).toFixed(1)} MB` : p.running ? '...' : 'Không hoạt động'}</span></div>
-                    <div><span style={{ color: 'var(--fg-muted)' }}>CPU:</span> <span className="font-mono" style={{ color: 'var(--fg-secondary)' }}>{diagnostics[p.name]?.cpu !== undefined ? `${diagnostics[p.name].cpu}%` : p.running ? '...' : 'Inactive'}</span></div>
-                    {/* Uptime */}
-                    <div><span style={{ color: 'var(--fg-muted)' }}>Uptime:</span> <span className="font-mono" style={{ color: diagnostics[p.name]?.uptime_seconds > 3600 ? '#22c55e' : 'var(--fg-secondary)' }}>{diagnostics[p.name]?.uptime || (p.running ? '...' : '-')}</span></div>
-                    <div><span style={{ color: 'var(--fg-muted)' }}>Node:</span> <span className="font-mono" style={{ color: 'var(--fg-secondary)' }}>{diagnostics[p.name]?.env?.node || '...'} {diagnostics[p.name]?.env?.npm ? `(npm ${diagnostics[p.name].env.npm})` : ''}</span></div>
+                <div className="mt-3 pt-3 border-t border-dashed pl-3 expand-enter" style={{ borderColor: 'var(--border)' }}>
+                  <div className="diag-grid">
+                    <div className="diag-item"><span className="diag-label">Bộ nhớ:</span> <span className="diag-value">{diagnostics[p.name]?.memory ? `${(diagnostics[p.name].memory / 1024 / 1024).toFixed(1)} MB` : p.running ? '...' : 'Không hoạt động'}</span></div>
+                    <div className="diag-item"><span className="diag-label">CPU:</span> <span className="diag-value">{diagnostics[p.name]?.cpu !== undefined ? `${diagnostics[p.name].cpu}%` : p.running ? '...' : '-'}</span></div>
+                    <div className="diag-item"><span className="diag-label">Uptime:</span> <span className="diag-value" style={{ color: diagnostics[p.name]?.uptime_seconds > 3600 ? '#22c55e' : undefined }}>{diagnostics[p.name]?.uptime || (p.running ? '...' : '-')}</span></div>
+                    <div className="diag-item"><span className="diag-label">Node:</span> <span className="diag-value">{diagnostics[p.name]?.env?.node || '...'} {diagnostics[p.name]?.env?.npm ? `(npm ${diagnostics[p.name].env.npm})` : ''}</span></div>
                   </div>
                   {diagnostics[p.name]?.git && (
-                    <div className="flex items-center gap-2 flex-wrap">
+                    <div className="flex items-center gap-2 flex-wrap mt-2">
                       <span style={{ color: 'var(--fg-muted)' }}>Git:</span>
-                      <span className="font-mono text-emerald-500">{diagnostics[p.name].git.branch}</span>
+                      <span className="font-mono text-emerald-500 text-xs">{diagnostics[p.name].git.branch}</span>
                       <span className={`px-1 rounded text-[8px] font-mono ${diagnostics[p.name].git.is_dirty ? 'bg-amber-500/10 text-amber-500 border border-amber-500/15' : 'bg-emerald-500/10 text-emerald-500 border border-emerald-500/15'}`}>
                         {diagnostics[p.name].git.is_dirty ? `${diagnostics[p.name].git.dirty_count} đã sửa` : 'sạch'}
                       </span>
@@ -1023,7 +1020,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                         if (res.ok) setStatusText(`✅ SSL cert created: ${data.cert}`)
                         else if (data.instructions) setStatusText(`❌ ${data.error}. ${data.instructions}`)
                         else setStatusText(`❌ ${data.error}`)
-                      } catch { setStatusText('Failed to create SSL cert') }
+                      } catch { setStatusText('Lỗi tạo chứng chỉ SSL') }
                     }}
                       className="px-2 py-1 text-[10px] font-semibold rounded border transition-colors active:scale-95 cursor-pointer"
                       style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>🔒 SSL</button>
@@ -1053,27 +1050,24 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                       if (ts?.status === 'active' && ts?.url) {
                         return (
                           <div className="flex items-center gap-1.5 flex-wrap">
-                            <a href={ts.url} target="_blank" rel="noopener noreferrer"
-                              className="text-xs font-mono truncate max-w-[180px] underline underline-offset-2 hover:text-blue-400 bg-transparent border-0 cursor-pointer"
-                              style={{ color: '#3b82f6', textDecorationColor: '#3b82f680' }}>
-                              {ts.url}
+                            <a href={ts.url} target="_blank" rel="noopener noreferrer" className="tunnel-url-link truncate max-w-[180px]">
+                              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
+                              {ts.url.replace('https://', '')}
                             </a>
                             <button onClick={() => {
                               navigator.clipboard.writeText(ts.url!)
-                              setStatusText('Đã copy URL tunnel')
+                              setStatusText('📋 Đã copy URL')
                             }}
-                              className="px-1.5 py-0.5 text-[8px] font-semibold rounded border transition-colors active:scale-95 cursor-pointer"
-                              style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-dim)' }}>
+                              className="tunnel-pill tunnel-pill-active">
                               📋 Copy
                             </button>
                             <button onClick={() => openBrowser(ts.url!)}
-                              className="px-1.5 py-0.5 text-[8px] font-semibold rounded bg-blue-500/15 text-blue-400 hover:bg-blue-500/25 border-0 cursor-pointer active:scale-95 transition-all">
-                              🔗 Mở trình duyệt
+                              className="tunnel-pill" style={{ background: 'var(--button-tunnel-bg)', color: 'var(--button-tunnel-text)', border: '1px solid var(--button-tunnel-border)' }}>
+                              🔗 Mở
                             </button>
                             <button onClick={() => stopTunnel(p.name)} disabled={tunnelLoading[p.name]}
-                              className="px-1.5 py-0.5 text-[8px] font-semibold rounded border transition-colors active:scale-95 cursor-pointer disabled:opacity-30"
-                              style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: '#ef4444' }}>
-                              {tunnelLoading[p.name] ? '...' : '⏹ Dừng'}
+                              className="tunnel-pill" style={{ color: '#ef4444', border: '1px solid rgba(239,68,68,0.3)' }}>
+                              {tunnelLoading[p.name] ? '⏳' : '⏹ Dừng'}
                             </button>
                           </div>
                         )
@@ -1187,30 +1181,21 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                         <span className="flex items-center gap-1 text-[10px] font-semibold" style={{ color: '#34d399' }}>
                           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" /> Tunnel
                         </span>
-                        <a href={ts.url} target="_blank" rel="noopener noreferrer"
-                          className="text-xs font-mono truncate max-w-[170px] underline underline-offset-2 hover:text-blue-400 bg-transparent border-0 cursor-pointer"
-                          style={{ color: '#3b82f6', textDecorationColor: '#3b82f680' }}>
+                        <a href={ts.url} target="_blank" rel="noopener noreferrer" className="tunnel-url-link truncate max-w-[170px]">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
                           {ts.url.replace('https://', '')}
                         </a>
                         <button onClick={() => { navigator.clipboard.writeText(ts.url!); setStatusText('📋 Đã copy URL') }}
-                          className="px-1 py-0.5 text-[8px] font-semibold rounded border transition-colors active:scale-95 cursor-pointer hover:bg-white/5 flex items-center gap-0.5"
-                          style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-dim)' }}>
-                          <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                          </svg>
-                          Copy
+                          className="tunnel-pill tunnel-pill-active">
+                          📋 Copy
                         </button>
                         <button onClick={() => openBrowser(ts.url!)}
-                          className="px-1 py-0.5 text-[8px] font-semibold rounded bg-blue-500/15 text-blue-400 hover:bg-blue-500/25 border-0 cursor-pointer active:scale-95 transition-all flex items-center gap-0.5">
-                          <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-                          </svg>
-                          Mở
+                          className="tunnel-pill" style={{ background: 'var(--button-tunnel-bg)', color: 'var(--button-tunnel-text)', border: '1px solid var(--button-tunnel-border)' }}>
+                          🔗 Mở
                         </button>
                         <button onClick={() => stopTunnel(p.name)} disabled={tunnelLoading[p.name]}
-                          className="px-1 py-0.5 text-[8px] font-semibold rounded border transition-colors active:scale-95 cursor-pointer disabled:opacity-30 hover:bg-red-500/10"
-                          style={{ borderColor: 'rgba(239,68,68,0.3)', color: '#ef4444' }}>
-                          Dừng
+                          className="tunnel-pill" style={{ color: '#ef4444', border: '1px solid rgba(239,68,68,0.3)' }}>
+                          {tunnelLoading[p.name] ? '⏳' : '⏹ Dừng'}
                         </button>
                         {ts.watchdog_restart_count !== undefined && ts.watchdog_restart_count > 0 && (
                           <span className="flex items-center gap-0.5 text-[8px] font-mono" style={{ color: '#fbbf24' }}>
@@ -1361,12 +1346,26 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
               </div>
               <div className="flex gap-1.5 items-center">
                 <button onClick={() => act(p.name, 'start')} disabled={p.running || loading[p.name]}
-                  className="px-3 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer disabled:opacity-30 active:scale-95 bg-emerald-500/15 text-emerald-500 hover:bg-emerald-500/25 ring-1 ring-emerald-500/20 border-0">
-                  {loading[p.name] ? '...' : 'Bắt đầu'}
+                  className="card-btn card-btn-start">
+                  {loading[p.name] ? (
+                    <div className="animate-spin rounded-full h-3 w-3 border-b border-current" />
+                  ) : (
+                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M5.25 5.653c0-.856.917-1.398 1.667-.986l11.54 6.347a1.125 1.125 0 010 1.972l-11.54 6.347a1.125 1.125 0 01-1.667-.986V5.653z" />
+                    </svg>
+                  )}
+                  Bắt đầu
                 </button>
                 <button onClick={() => act(p.name, 'stop')} disabled={!p.running || loading[p.name]}
-                  className="px-3 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer disabled:opacity-30 active:scale-95 bg-red-500/10 text-red-400 hover:bg-red-500/20 ring-1 ring-red-500/15 border-0">
-                  {loading[p.name] ? '...' : 'Dừng'}
+                  className="card-btn card-btn-stop">
+                  {loading[p.name] ? (
+                    <div className="animate-spin rounded-full h-3 w-3 border-b border-current" />
+                  ) : (
+                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  )}
+                  Dừng
                 </button>
                 <select id={`clean-select-${p.name}`} name="cleanType" onChange={e => { const v = e.target.value as 'basic' | 'deep' | 'nuke'; if (v) { cleanProject(p.name, v); e.target.value = '' } }}
                   disabled={clearing[p.name]} className="px-2 py-1.5 text-xs font-semibold rounded-lg cursor-pointer border transition-colors"
@@ -1384,7 +1383,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
 
       {/* ─── Log Viewer — Terminal Style ─── */}
       <div className="flex-1 min-h-0 px-4 pb-4">
-        <div className="h-full rounded-xl border flex flex-col overflow-hidden" style={{ borderColor: 'rgba(255,255,255,0.06)' }}>
+        <div className={`h-full rounded-xl border flex flex-col overflow-hidden ${logTheme === 'dark' ? 'terminal-dark' : ''}`} style={{ borderColor: 'var(--terminal-border)' }}>
           {/* Terminal Title Bar — macOS style traffic-light dots */}
           <div className="terminal-header shrink-0">
             <div className="flex items-center gap-1.5">
@@ -1393,14 +1392,27 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
               <div className="terminal-dot green" title="Phóng to" />
             </div>
             <div className="flex-1 text-center">
-              <span className="text-[10px] font-medium tracking-wide" style={{ color: 'rgba(255,255,255,0.4)' }}>
+              <span className="text-[10px] font-medium tracking-wide" style={{ color: 'var(--terminal-text-muted)' }}>
                 {activeTab === 'All' ? '📋 Terminal — Tất cả log' : `📋 Terminal — ${activeTab}`}
               </span>
             </div>
             <div className="flex items-center gap-1">
+              {/* WHY: Log theme toggle — sun/moon icon */}
+              <button onClick={() => setLogTheme(prev => prev === 'light' ? 'dark' : 'light')}
+                className="px-1.5 py-0.5 text-[8px] font-medium rounded transition-all cursor-pointer hover:scale-110 active:scale-95"
+                style={{ color: 'var(--terminal-text-muted)', background: 'var(--terminal-border)' }}
+                title={logTheme === 'light' ? 'Chuyển sang nền tối' : 'Chuyển sang nền sáng'}>
+                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  {logTheme === 'light' ? (
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M21.752 15.002A9.718 9.718 0 0118 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 003 11.25C3 16.635 7.365 21 12.75 21a9.753 9.753 0 009.002-5.998z" />
+                  ) : (
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v2.25m6.364.386l-1.591 1.591M21 12h-2.25m-.386 6.364l-1.591-1.591M12 18.75V21m-4.773-4.227l-1.591 1.591M5.25 12H3m4.227-4.773L5.636 5.636M15.75 12a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0z" />
+                  )}
+                </svg>
+              </button>
               <button onClick={handleCopyLog}
                 className="px-1.5 py-0.5 text-[8px] font-medium rounded transition-colors cursor-pointer"
-                style={{ color: 'rgba(255,255,255,0.4)', background: 'rgba(255,255,255,0.06)' }}
+                style={{ color: 'var(--terminal-text-muted)', background: 'var(--terminal-border)' }}
                 title="Copy log">
                 <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" />
@@ -1408,7 +1420,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
               </button>
               <button onClick={handleDownloadLog}
                 className="px-1.5 py-0.5 text-[8px] font-medium rounded transition-colors cursor-pointer"
-                style={{ color: 'rgba(255,255,255,0.4)', background: 'rgba(255,255,255,0.06)' }}
+                style={{ color: 'var(--terminal-text-muted)', background: 'var(--terminal-border)' }}
                 title="Tải log">
                 <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
@@ -1416,8 +1428,8 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
               </button>
             </div>
           </div>
-          <div className="shrink-0" style={{ backgroundColor: '#161822' }}>
-            <div className="flex items-center justify-between px-3 py-1" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+          <div className="shrink-0" style={{ backgroundColor: 'var(--terminal-bg-tabs)' }}>
+            <div className="flex items-center justify-between px-3 py-1" style={{ borderBottom: '1px solid var(--terminal-border)' }}>
               <div className="flex gap-0.5 overflow-x-auto">
                 {tabs.map(tab => {
                   const isActive = activeTab === tab
@@ -1427,8 +1439,8 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                         isActive ? 'active' : ''
                       }`}
                       style={isActive
-                        ? { color: '#34d399', background: '#0d1117', borderBottom: '2px solid #34d399' }
-                        : { color: 'rgba(255,255,255,0.3)', background: 'transparent' }}>
+                        ? { color: '#34d399', background: 'var(--terminal-bg-body)', borderBottom: '2px solid #34d399' }
+                        : { color: 'var(--terminal-text-muted)', background: 'transparent' }}>
                       <span className="flex items-center gap-1.5">
                         <span className={`w-1.5 h-1.5 rounded-full ${tab === 'All' || projects.find(p => p.name === tab)?.running ? 'bg-emerald-400' : 'bg-gray-500'}`} />
                         {tab}
@@ -1440,7 +1452,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
               <div className="flex items-center gap-1.5 shrink-0 ml-2">
                 <select id="log-export-limit" name="exportLimit" value={exportLimit} onChange={e => setExportLimit(Number(e.target.value))}
                   className="px-1.5 py-0.5 text-[9px] font-medium rounded cursor-pointer border-0 transition-all"
-                  style={{ backgroundColor: 'rgba(255,255,255,0.06)', color: 'rgba(255,255,255,0.5)' }}>
+                  style={{ backgroundColor: 'var(--terminal-border)', color: 'var(--terminal-text-muted)' }}>
                   <option value={100}>100 dòng</option>
                   <option value={500}>500</option>
                   <option value={1000}>1000</option>
@@ -1448,22 +1460,22 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                 </select>
                 <select id="log-export-format" name="exportFormat" value={exportFormat} onChange={e => setExportFormat(e.target.value as any)}
                   className="px-1.5 py-0.5 text-[9px] font-medium rounded cursor-pointer border-0 transition-all"
-                  style={{ backgroundColor: 'rgba(255,255,255,0.06)', color: 'rgba(255,255,255,0.5)' }}>
+                  style={{ backgroundColor: 'var(--terminal-border)', color: 'var(--terminal-text-muted)' }}>
                   <option value="txt">TXT</option>
                   <option value="md">MD</option>
                   <option value="json">JSON</option>
                 </select>
                 <button onClick={handleExportLog}
                   className="px-1.5 py-0.5 text-[8px] font-medium rounded transition-all cursor-pointer flex items-center gap-1"
-                  style={{ color: 'rgba(255,255,255,0.5)', background: 'rgba(255,255,255,0.06)' }}>
+                  style={{ color: 'var(--terminal-text-muted)', background: 'var(--terminal-border)' }}>
                   💾 Lưu
                 </button>
               </div>
             </div>
             {/* Log Search & Filter Bar */}
-            <div className="flex items-center gap-2 px-3 py-1" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+            <div className="flex items-center gap-2 px-3 py-1" style={{ borderBottom: '1px solid var(--terminal-border)' }}>
               <div className="relative flex-1 max-w-[200px]">
-                <svg className="absolute left-2 top-1/2 -translate-y-1/2 w-2.5 h-2.5" style={{ color: 'rgba(255,255,255,0.2)' }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <svg className="absolute left-2 top-1/2 -translate-y-1/2 w-2.5 h-2.5" style={{ color: 'var(--terminal-text-dim)' }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
                 </svg>
                 <input ref={searchInputRef} id="log-search" name="logSearch" type="text" value={logSearch}
@@ -1480,22 +1492,22 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                   }}
                   placeholder="Tìm kiếm..."
                   className="w-full pl-5 pr-2 py-0.5 text-[10px] rounded border-0 transition-all focus:outline-none"
-                  style={{ backgroundColor: 'rgba(255,255,255,0.04)', color: '#e6edf3', fontFamily: 'inherit' }} />
+                  style={{ backgroundColor: 'var(--terminal-border)', color: 'var(--terminal-text)', fontFamily: 'inherit' }} />
                 {/* Search History Dropdown */}
                 {showSearchHistory && searchHistory.length > 0 && (
                   <div className="absolute top-full left-0 right-0 mt-0.5 rounded-lg border shadow-lg z-50 overflow-hidden"
-                    style={{ backgroundColor: '#1a1b26', borderColor: 'rgba(255,255,255,0.08)' }}>
-                    <div className="flex items-center justify-between px-2 py-1 text-[8px]" style={{ color: 'rgba(255,255,255,0.3)', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+                    style={{ backgroundColor: 'var(--terminal-bg-header)', borderColor: 'var(--terminal-border)' }}>
+                    <div className="flex items-center justify-between px-2 py-1 text-[8px]" style={{ color: 'var(--terminal-text-muted)', borderBottom: '1px solid var(--terminal-border)' }}>
                       <span>Tìm gần đây</span>
                       <button onClick={() => { setSearchHistory([]); setShowSearchHistory(false) }}
-                        className="hover:underline bg-transparent border-0 cursor-pointer" style={{ color: 'rgba(255,255,255,0.3)' }}>🗑️ Xoá hết</button>
+                        className="hover:underline bg-transparent border-0 cursor-pointer" style={{ color: 'var(--terminal-text-muted)' }}>🗑️ Xoá hết</button>
                     </div>
                     {searchHistory.map((q, i) => (
-                      <div key={i} className="flex items-center px-2 py-1 hover:bg-white/[0.04] transition-colors cursor-default">
+                      <div key={i} className="flex items-center px-2 py-1 hover:bg-black/[0.03] dark:hover:bg-white/[0.04] transition-colors cursor-default">
                         <button onMouseDown={() => { setLogSearch(q); setShowSearchHistory(false) }}
                           className="flex-1 text-left text-[9px] flex items-center gap-2 bg-transparent border-0 cursor-pointer"
-                          style={{ color: 'rgba(255,255,255,0.6)' }}>
-                          <span style={{ color: 'rgba(255,255,255,0.2)' }}>🕐</span>
+                          style={{ color: 'var(--terminal-text-muted)' }}>
+                          <span style={{ color: 'var(--terminal-text-dim)' }}>🕐</span>
                           <span className="truncate">{q}</span>
                         </button>
                         <button onMouseDown={(e) => { e.stopPropagation(); setSearchHistory(prev => prev.filter((_, idx) => idx !== i)) }}
@@ -1526,8 +1538,8 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                     <button onClick={() => setShowFilterDropdown(prev => !prev)}
                       className="flex items-center gap-1 px-1.5 py-0.5 text-[9px] rounded transition-all cursor-pointer border-0 relative"
                       style={{
-                        color: selectedCount === 0 ? 'rgba(255,255,255,0.3)' : '#34d399',
-                        backgroundColor: selectedCount === 0 ? 'rgba(255,255,255,0.04)' : 'rgba(52,211,153,0.1)',
+                        color: selectedCount === 0 ? 'var(--terminal-text-dim)' : '#34d399',
+                        backgroundColor: selectedCount === 0 ? 'var(--terminal-border)' : 'rgba(52,211,153,0.1)',
                       }}>
                       <span>📋</span>
                       <span>{selectedCount === 0 ? 'Lọc' : `${selectedCount}`}</span>
@@ -1540,20 +1552,20 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                     {selectedCount > 0 && (
                       <button onClick={() => { setLogFilter([]); setShowFilterDropdown(false) }}
                         className="px-1 py-0.5 text-[8px] rounded transition-all cursor-pointer border-0"
-                        style={{ color: 'rgba(239,68,68,0.6)', backgroundColor: 'rgba(239,68,68,0.08)' }}>✕</button>
+                        style={{ color: 'var(--terminal-text-dim)', backgroundColor: 'rgba(239,68,68,0.08)' }}>✕</button>
                     )}
                     {showFilterDropdown && (
                       <div className="absolute top-full left-0 mt-0.5 rounded-lg border shadow-lg z-50 overflow-hidden min-w-[150px]"
-                        style={{ backgroundColor: '#1a1b26', borderColor: 'rgba(255,255,255,0.08)' }}>
-                        <div className="flex items-center gap-1 px-2 py-1 border-b" style={{ borderColor: 'rgba(255,255,255,0.06)' }}>
+                        style={{ backgroundColor: 'var(--terminal-bg-header)', borderColor: 'var(--terminal-border)' }}>
+                        <div className="flex items-center gap-1 px-2 py-1 border-b" style={{ borderColor: 'var(--terminal-border)' }}>
                           <button onClick={() => { setLogFilter(filterOpts.map(o => o.value)); setShowFilterDropdown(false) }}
-                            className="flex-1 px-1 py-0.5 text-[8px] font-semibold rounded cursor-pointer hover:bg-white/[0.04] transition-colors border-0"
-                            style={{ color: 'rgba(255,255,255,0.5)' }}>
+                            className="flex-1 px-1 py-0.5 text-[8px] font-semibold rounded cursor-pointer hover:bg-black/[0.03] dark:hover:bg-white/[0.04] transition-colors border-0"
+                            style={{ color: 'var(--terminal-text-muted)' }}>
                             ✓ Tất cả
                           </button>
                           <button onClick={() => { setLogFilter([]); setShowFilterDropdown(false) }}
-                            className="flex-1 px-1 py-0.5 text-[8px] font-semibold rounded cursor-pointer hover:bg-white/[0.04] transition-colors border-0"
-                            style={{ color: 'rgba(255,255,255,0.3)' }}>
+                            className="flex-1 px-1 py-0.5 text-[8px] font-semibold rounded cursor-pointer hover:bg-black/[0.03] dark:hover:bg-white/[0.04] transition-colors border-0"
+                            style={{ color: 'var(--terminal-text-dim)' }}>
                             ✕ Bỏ
                           </button>
                         </div>
@@ -1562,15 +1574,15 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                             const checked = logFilter.includes(o.value)
                             return (
                               <label key={o.value}
-                                className="flex items-center gap-2 px-2 py-1 text-[9px] hover:bg-white/[0.04] transition-colors cursor-pointer"
-                                style={{ color: 'rgba(255,255,255,0.6)' }}>
+                                className="flex items-center gap-2 px-2 py-1 text-[9px] hover:bg-black/[0.03] dark:hover:bg-white/[0.04] transition-colors cursor-pointer"
+                                style={{ color: 'var(--terminal-text-muted)' }}>
                                 <input type="checkbox" checked={checked}
                                   onChange={() => {
                                     setLogFilter(prev => checked ? prev.filter(v => v !== o.value) : [...prev, o.value])
                                   }}
                                   className="w-2.5 h-2.5 rounded cursor-pointer accent-emerald-500" />
                                 <span>{o.icon} {o.label}</span>
-                                <span className="ml-auto text-[8px] font-mono" style={{ color: 'rgba(255,255,255,0.2)' }}>
+                                <span className="ml-auto text-[8px] font-mono" style={{ color: 'var(--terminal-text-dim)' }}>
                                   {logLevelCounts.counts[o.value] ?? 0}
                                 </span>
                               </label>
@@ -1584,10 +1596,10 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
               })()}
               {logSearch && (
                 <button onClick={() => setLogSearch('')}
-                  className="px-1 py-0.5 text-[8px] rounded hover:bg-white/[0.04] transition-colors border-0 cursor-pointer"
-                  style={{ color: 'rgba(255,255,255,0.3)' }}>✕</button>
+                  className="px-1 py-0.5 text-[8px] rounded hover:bg-black/[0.03] dark:hover:bg-white/[0.04] transition-colors border-0 cursor-pointer"
+                  style={{ color: 'var(--terminal-text-dim)' }}>✕</button>
               )}
-              <span className="flex items-center gap-1 text-[9px] font-mono ml-auto" style={{ color: 'rgba(255,255,255,0.3)' }}>
+              <span className="flex items-center gap-1 text-[9px] font-mono ml-auto" style={{ color: 'var(--terminal-text-dim)' }}>
                 {(() => {
                   const total = logLevelCounts.total
                   const filtered = logSearch
@@ -1597,8 +1609,8 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                       : total
                   return (
                     <>
-                      <span style={{ color: filtered < total ? '#fbbf24' : 'rgba(255,255,255,0.4)' }}>{filtered}</span>
-                      <span style={{ color: 'rgba(255,255,255,0.15)' }}>/</span>
+                      <span style={{ color: filtered < total ? '#fbbf24' : 'var(--terminal-text-muted)' }}>{filtered}</span>
+                      <span style={{ color: 'var(--terminal-text-dim)' }}>/</span>
                       <span>{total}</span>
                     </>
                   )
@@ -1610,7 +1622,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
               const order = ['error', 'warn', 'success', 'build', 'tunnel', 'metrics', 'cleanup', 'debug', 'info']
               const colors: Record<string, string> = {
                 error: '#f87171', warn: '#fbbf24', success: '#4ade80', build: '#60a5fa',
-                tunnel: '#60a5fa', metrics: '#a78bfa', cleanup: '#f472b6', debug: '#94a3b8', info: 'rgba(255,255,255,0.08)'
+                tunnel: '#60a5fa', metrics: '#a78bfa', cleanup: '#f472b6', debug: '#94a3b8', info: 'var(--terminal-text-dim)'
               }
               return (
                 <div className="flex h-0.5">
@@ -1644,12 +1656,12 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
             {displayLines.length === 0 ? (
               <div className="flex items-center justify-center h-full">
                 <div className="text-center">
-                  <div className="text-lg" style={{ color: 'rgba(255,255,255,0.08)' }}>
+                  <div className="text-lg" style={{ color: 'var(--terminal-text-dim)' }}>
                     <svg className="w-10 h-10 mx-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1}>
                       <path strokeLinecap="round" strokeLinejoin="round" d="M14.25 9.75L16.5 12l-2.25 2.25m-4.5 0L7.5 12l2.25-2.25M6 20.25h12A2.25 2.25 0 0020.25 18V6A2.25 2.25 0 0018 3.75H6A2.25 2.25 0 003.75 6v12A2.25 2.25 0 006 20.25z" />
                     </svg>
                   </div>
-                  <p className="mt-2 text-xs" style={{ color: 'rgba(255,255,255,0.2)' }}>
+                  <p className="mt-2 text-xs" style={{ color: 'var(--terminal-text-muted)' }}>
                     <span className="animate-terminal-blink">_</span> Chưa có log. Hãy khởi động máy chủ.
                   </p>
                 </div>
@@ -1676,7 +1688,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                 return (
                   <>
                     <div className="sticky top-0 z-10 flex items-center gap-3 px-2 py-1 text-[8px] font-medium border-b"
-                      style={{ backgroundColor: '#0d1117', borderColor: 'rgba(255,255,255,0.04)', color: 'rgba(255,255,255,0.2)' }}>
+                      style={{ backgroundColor: 'var(--terminal-bg-body)', borderColor: 'var(--terminal-border)', color: 'var(--terminal-text-dim)' }}>
                       <span className="w-8 text-right shrink-0">#</span>
                       <span className="w-10 shrink-0">Thời gian</span>
                       <span className="w-14 shrink-0">Cấp độ</span>
@@ -1696,7 +1708,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                           )
                         } catch {}
                       }
-                      const style = getLineStyle(line, i, logColors)
+                      const style = getLineStyle(line, i, logColors, logTheme)
                       const mergedColors = { ...DEFAULT_LOG_COLORS, ...logColors }
                       const level = detectLevel(line)
                       const levelLabel = level && level !== 'defaultText' ? (() => {
@@ -1709,12 +1721,12 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                           className="flex items-start gap-1 px-2 py-0.5 hover:bg-white/[0.03] transition-colors group"
                           style={{ backgroundColor: style.backgroundColor }}>
                           <span className="select-none shrink-0 text-right font-mono"
-                            style={{ color: 'rgba(255,255,255,0.15)', width: '2rem', fontSize: '10px', lineHeight: '1.6rem' }}>
+                            style={{ color: 'var(--terminal-text-dim)', width: '2rem', fontSize: '10px', lineHeight: '1.6rem' }}>
                             {i + 1}
                           </span>
                           {timestamp && (
                             <span className="select-none shrink-0 font-mono text-[10px]"
-                              style={{ color: 'rgba(255,255,255,0.15)', lineHeight: '1.6rem' }}>
+                              style={{ color: 'var(--terminal-text-dim)', lineHeight: '1.6rem' }}>
                               {timestamp.slice(11)}
                             </span>
                           )}

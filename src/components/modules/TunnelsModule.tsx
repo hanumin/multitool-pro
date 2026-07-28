@@ -442,14 +442,14 @@ export default function TunnelsModule({ theme, setStatusText, inactive, backgrou
       const data = await res.json()
       if (res.ok) {
         setTunnelStates(prev => ({ ...prev, [name]: data }))
-        setStatusText(`🌐 Tunnel started for ${name}`)
+        setStatusText(`🌐 Đã mở tunnel cho ${name}`)
         addToast({ type: 'success', title: `🌐 ${name}`, message: 'Tunnel đã được mở thành công' })
       } else {
-        setStatusText(`❌ ${data.error || 'Failed'}`)
+        setStatusText(`❌ ${data.error || 'Thất bại'}`)
         addToast({ type: 'error', title: `🌐 ${name}`, message: data.error || 'Mở tunnel thất bại' })
       }
     } catch {
-      setStatusText('Failed to start tunnel')
+      setStatusText('Mở tunnel thất bại')
       addToast({ type: 'error', title: '🔌 Mất kết nối', message: 'Không thể kết nối tới backend' })
     }
     finally { setTunnelLoading(l => ({ ...l, [name]: false })) }
@@ -467,11 +467,11 @@ export default function TunnelsModule({ theme, setStatusText, inactive, backgrou
           const data = await statusRes.json()
           setTunnelStates(prev => ({ ...prev, [name]: data }))
         }
-        setStatusText(`Tunnel stopped for ${name}`)
+        setStatusText(`Đã dừng tunnel cho ${name}`)
         addToast({ type: 'info', title: `🌐 ${name}`, message: 'Tunnel đã đóng' })
       }
     } catch {
-      setStatusText('Failed to stop tunnel')
+      setStatusText('Dừng tunnel thất bại')
       addToast({ type: 'error', title: `🌐 ${name}`, message: 'Dừng tunnel thất bại' })
     }
     finally { setTunnelLoading(l => ({ ...l, [name]: false })) }
@@ -529,10 +529,10 @@ export default function TunnelsModule({ theme, setStatusText, inactive, backgrou
       const data = await res.json()
       if (res.ok) {
         setTunnelStates(prev => ({ ...prev, [name]: data }))
-        setStatusText('🌐 Tunnel started!')
+        setStatusText('🌐 Đã mở tunnel!')
         addToast({ type: 'success', title: `🌐 ${name}`, message: 'Tunnel đã được cài và mở thành công' })
       } else {
-        setStatusText(`❌ ${data.error || 'Failed'}`)
+        setStatusText(`❌ ${data.error || 'Thất bại'}`)
         addToast({ type: 'error', title: `🌐 ${name}`, message: data.error || 'Cài & mở tunnel thất bại' })
       }
     } catch { setStatusText('❌ Connection failed'); addToast({ type: 'error', title: `🌐 ${name}`, message: 'Mất kết nối khi cài tunnel' }) }
@@ -923,9 +923,9 @@ export default function TunnelsModule({ theme, setStatusText, inactive, backgrou
                   fetchAll()
                 } else {
                   const err = await res.json()
-                  setStatusText(`❌ Import failed: ${err.error || 'Unknown'}`)
+                  setStatusText(`❌ Nhập thất bại: ${err.error || 'Không xác định'}`)
                 }
-              } catch { setStatusText('❌ Import failed: invalid file') }
+              } catch { setStatusText('❌ Nhập thất bại: file không hợp lệ') }
               finally {
                 setImporting(false)
                 // WHY: Reset file input để cho phép import cùng file lại (nếu user muốn)

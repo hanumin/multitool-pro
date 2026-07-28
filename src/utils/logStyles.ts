@@ -86,12 +86,27 @@ export function detectLevel(line: string): keyof LogColors | null {
   return null // default / info
 }
 
+// WHY: Phát hiện terminal theme từ DOM — fallback về 'dark' nếu không tìm thấy.
+// Dùng cho getLineStyle để chọn background phù hợp (sáng cho dark, tối cho light).
+function getTerminalTheme(): 'light' | 'dark' {
+  if (typeof document !== 'undefined') {
+    const terminal = document.querySelector('.terminal-body')
+    if (terminal) {
+      const bg = getComputedStyle(terminal).backgroundColor
+      // Nếu nền sáng (rgb gần 255), dùng dark overlay cho lines
+      return bg && parseInt(bg.split(',')[0].replace(/\D/g, '')) > 200 ? 'light' : 'dark'
+    }
+  }
+  return 'dark'
+}
+
 // WHY: Tạo style cho 1 dòng log. customColors cho phép ghi đè màu từ Settings.
-// colors: nếu không truyền, dùng DEFAULT_LOG_COLORS.
-export function getLineStyle(line: string, index: number, customColors?: LogColors): LogLineStyle {
+// Theme-aware: tự động dùng dark/light background overlay phù hợp.
+export function getLineStyle(line: string, index: number, customColors?: LogColors, theme?: 'light' | 'dark'): LogLineStyle {
   const level = detectLevel(line)
   const isOdd = index % 2 === 0
   const colors = { ...DEFAULT_LOG_COLORS, ...customColors }
+  const isLight = theme === 'light' || (!theme && getTerminalTheme() === 'light')
 
   if (level && level !== 'defaultText') {
     const def = LEVELS.find(l => l.key === level)
@@ -106,9 +121,11 @@ export function getLineStyle(line: string, index: number, customColors?: LogColo
     }
   }
 
-  // Default / Info
+  // Default / Info — theme-aware background
   return {
     color: colors.defaultText!,
-    backgroundColor: isOdd ? 'rgba(255,255,255,0.02)' : 'transparent',
+    backgroundColor: isOdd
+      ? (isLight ? 'rgba(0,0,0,0.02)' : 'rgba(255,255,255,0.02)')
+      : 'transparent',
   }
 }
