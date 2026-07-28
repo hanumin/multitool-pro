@@ -1170,116 +1170,22 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                   </div>
                 </div>
               )}
-              {/* ─── Tunnel URL — hiển thị trên card, không cần expand ─── */}
-              <div className="mt-2 pt-2 pl-3 border-t border-dashed" style={{ borderColor: 'var(--border)' }}>
-                {(() => {
-                  const ts = tunnelStates[p.name]
-                  if (!ts) return null
-                  if (ts.status === 'active' && ts.url) {
-                    return (
-                      <div className="flex items-center gap-1.5 flex-wrap">
-                        <span className="flex items-center gap-1 text-[10px] font-semibold" style={{ color: '#34d399' }}>
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" /> Tunnel
-                        </span>
-                        <a href={ts.url} target="_blank" rel="noopener noreferrer" className="tunnel-url-link truncate max-w-[170px]">
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
-                          {ts.url.replace('https://', '')}
-                        </a>
-                        <button onClick={() => { navigator.clipboard.writeText(ts.url!); setStatusText('📋 Đã copy URL') }}
-                          className="tunnel-pill tunnel-pill-active">
-                          📋 Copy
-                        </button>
-                        <button onClick={() => openBrowser(ts.url!)}
-                          className="tunnel-pill" style={{ background: 'var(--button-tunnel-bg)', color: 'var(--button-tunnel-text)', border: '1px solid var(--button-tunnel-border)' }}>
-                          🔗 Mở
-                        </button>
-                        <button onClick={() => stopTunnel(p.name)} disabled={tunnelLoading[p.name]}
-                          className="tunnel-pill" style={{ color: '#ef4444', border: '1px solid rgba(239,68,68,0.3)' }}>
-                          {tunnelLoading[p.name] ? '⏳' : '⏹ Dừng'}
-                        </button>
-                        {ts.watchdog_restart_count !== undefined && ts.watchdog_restart_count > 0 && (
-                          <span className="flex items-center gap-0.5 text-[8px] font-mono" style={{ color: '#fbbf24' }}>
-                            <svg className="w-2 h-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                              <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                            </svg>
-                            {ts.watchdog_restart_count}
-                          </span>
-                        )}
-                      </div>
-                    )
-                  }
-                  if (ts.status === 'connecting') {
-                    return (
-                      <div className="flex items-center gap-1.5">
-                        <span className="flex items-center gap-1 text-[10px] font-semibold" style={{ color: '#fbbf24' }}>
-                          <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" /> Tunnel
-                        </span>
-                        <div className="flex items-center gap-1">
-                          <div className="animate-spin rounded-full h-2 w-2 border-b border-amber-400" />
-                          <span className="text-[10px]" style={{ color: 'var(--fg-dim)' }}>Đang kết nối...</span>
-                        </div>
-                        <button onClick={() => stopTunnel(p.name)} disabled={tunnelLoading[p.name]}
-                          className="px-1.5 py-0.5 text-[8px] font-semibold rounded border transition-colors active:scale-95 cursor-pointer disabled:opacity-30"
-                          style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: '#ef4444' }}>
-                          Hủy
-                        </button>
-                      </div>
-                    )
-                  }
-                  if (ts.status === 'error') {
-                    return (
-                      <div className="flex items-center gap-1.5 flex-wrap">
-                        <span className="flex items-center gap-1 text-[10px] font-semibold" style={{ color: '#ef4444' }}>
-                          <span className="w-1.5 h-1.5 rounded-full bg-red-400" /> Tunnel
-                        </span>
-                        <span className="text-[10px] truncate max-w-[150px]" style={{ color: '#ef4444' }}>{ts.error || 'Lỗi'}</span>
-                        <button onClick={() => startTunnel(p.name)} disabled={!p.running || tunnelLoading[p.name]}
-                          className="flex items-center gap-0.5 px-1.5 py-0.5 text-[8px] font-semibold rounded border transition-colors active:scale-95 cursor-pointer disabled:opacity-30"
-                          style={{ backgroundColor: 'rgba(59,130,246,0.1)', borderColor: 'rgba(59,130,246,0.25)', color: '#60a5fa' }}>
-                          <svg className="w-2 h-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                          </svg>
-                          Thử lại
-                        </button>
-                      </div>
-                    )
-                  }
-                  if (p.running && ts.cloudflared_installed !== undefined) {
-                    return (
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-[10px]" style={{ color: 'var(--fg-dim)' }}>🌐 Tunnel</span>
-                        {ts.cloudflared_installed === false ? (
-                          <button onClick={() => installAndStartTunnel(p.name)}
-                            disabled={tunnelLoading[p.name]}
-                            className="flex items-center gap-1 px-2 py-0.5 text-[9px] font-semibold rounded-lg transition-all active:scale-95 cursor-pointer disabled:opacity-30"
-                            style={{ backgroundColor: 'rgba(16,185,129,0.15)', color: '#34d399', border: '1px solid rgba(16,185,129,0.3)' }}>
-                            {tunnelLoading[p.name] ? (
-                              <><div className="animate-spin rounded-full h-2 w-2 border-b border-current" /> Đang cài...</>
-                            ) : '📥 Cài & Mở'}
-                          </button>
-                        ) : (
-                          <button onClick={() => startTunnel(p.name)}
-                            disabled={tunnelLoading[p.name]}
-                            className="flex items-center gap-1 px-2 py-0.5 text-[9px] font-semibold rounded-lg transition-all active:scale-95 cursor-pointer disabled:opacity-30"
-                            style={{ backgroundColor: 'rgba(59,130,246,0.1)', color: '#60a5fa', border: '1px solid rgba(59,130,246,0.25)' }}>
-                            {tunnelLoading[p.name] ? (
-                              <><div className="animate-spin rounded-full h-2 w-2 border-b border-current" /> Đang kết nối...</>
-                            ) : '🔗 Mở tunnel'}
-                          </button>
-                        )}
-                      </div>
-                    )
-                  }
-                  return null
-                })()}
-              </div>
             </div>
-            <div className="flex items-center justify-between mt-2 pl-3">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-xs font-mono" style={{ color: 'var(--fg-muted)' }}><span style={{ color: 'var(--fg-dim)' }}>Cổng</span> {p.port}</span>
+            <div className="flex items-center justify-between gap-2 px-3 py-1.5">
+              <div className="flex items-center gap-2 flex-wrap min-w-0">
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-medium"
+                  style={{ backgroundColor: 'var(--input-bg)', border: '1px solid var(--border)', color: 'var(--fg-muted)' }}>
+                  <span style={{ color: 'var(--fg-dim)' }}>Cổng</span> {p.port}
+                </span>
                 {p.running && (
                   <button onClick={() => openBrowser(`http://localhost:${p.port}`)}
-                    className="text-xs underline underline-offset-2 hover:text-blue-400 bg-transparent border-0 cursor-pointer p-0" style={{ color: '#3b82f6', textDecorationColor: '#3b82f680' }}>Mở</button>
+                    className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[9px] font-medium rounded transition-all hover:bg-blue-500/10 active:scale-95 bg-transparent border-0 cursor-pointer"
+                    style={{ color: '#3b82f6' }}>
+                    <svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                    </svg>
+                    Mở
+                  </button>
                 )}
                 {/* Port Conflict Badge */}
                 {portConflicts[p.port] && portConflicts[p.port].length > 0 && (
@@ -1298,6 +1204,54 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                     📦 {diskSizes[p.name].node_modules}MB
                   </span>
                 )}
+                {/* Compact Tunnel URL Badge — hiển thị ngay trên card, không cần expand */}
+                {(() => {
+                  const ts = tunnelStates[p.name]
+                  if (!ts) return null
+                  if (ts.status === 'active' && ts.url) {
+                    return (
+                      <span className="tunnel-url-link inline-flex items-center gap-1 px-1.5 py-0.5 text-[9px] max-w-[180px]">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
+                        {ts.url.replace('https://', '').replace('/','')}
+                      </span>
+                    )
+                  }
+                  if (ts.status === 'connecting') {
+                    return (
+                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-medium" style={{ color: '#fbbf24', background: 'rgba(251,191,36,0.08)', border: '1px solid rgba(251,191,36,0.2)' }}>
+                        <div className="animate-spin rounded-full h-2 w-2 border-b border-amber-400" />
+                        Đang kết nối
+                      </span>
+                    )
+                  }
+                  if (ts.status === 'error') {
+                    return (
+                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-medium" style={{ color: '#ef4444', background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.2)' }}>
+                        <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
+                        Lỗi tunnel
+                      </span>
+                    )
+                  }
+                  if (p.running && ts.cloudflared_installed !== undefined && !ts.cloudflared_installed) {
+                    return (
+                      <button onClick={() => installAndStartTunnel(p.name)} disabled={tunnelLoading[p.name]}
+                        className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[9px] font-semibold rounded transition-all active:scale-95 cursor-pointer disabled:opacity-30"
+                        style={{ color: '#34d399', background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.25)' }}>
+                        📥 Cài tunnel
+                      </button>
+                    )
+                  }
+                  if (p.running && ts.cloudflared_installed === true && ts.status !== 'active') {
+                    return (
+                      <button onClick={() => startTunnel(p.name)} disabled={tunnelLoading[p.name]}
+                        className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[9px] font-semibold rounded transition-all active:scale-95 cursor-pointer disabled:opacity-30"
+                        style={{ color: '#60a5fa', background: 'rgba(59,130,246,0.08)', border: '1px solid rgba(59,130,246,0.2)' }}>
+                        🔗 Mở tunnel
+                      </button>
+                    )
+                  }
+                  return null
+                })()}
                 {/* Quick File Explorer */}
                 <button onClick={async () => {
                   try {
@@ -1314,7 +1268,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                     } catch { setStatusText('Failed to open explorer') }
                   }
                 }}
-                  className="text-xs px-1.5 py-0.5 rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors border-0 cursor-pointer"
+                  className="inline-flex items-center px-1.5 py-0.5 text-[10px] rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors border-0 cursor-pointer"
                   style={{ color: 'var(--fg-muted)' }} title="Mở trong File Explorer">
                   📁
                 </button>
@@ -1344,9 +1298,10 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                   </select>
                 )}
               </div>
-              <div className="flex gap-1.5 items-center">
+              <div className="flex gap-1 items-center shrink-0">
                 <button onClick={() => act(p.name, 'start')} disabled={p.running || loading[p.name]}
-                  className="card-btn card-btn-start">
+                  className="relative group inline-flex items-center justify-center w-7 h-7 rounded-lg transition-all disabled:opacity-20 disabled:cursor-not-allowed active:scale-90"
+                  style={{ backgroundColor: 'var(--button-start-bg)', color: 'var(--button-start-text)', border: '1px solid var(--button-start-border)' }}>
                   {loading[p.name] ? (
                     <div className="animate-spin rounded-full h-3 w-3 border-b border-current" />
                   ) : (
@@ -1354,10 +1309,11 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                       <path strokeLinecap="round" strokeLinejoin="round" d="M5.25 5.653c0-.856.917-1.398 1.667-.986l11.54 6.347a1.125 1.125 0 010 1.972l-11.54 6.347a1.125 1.125 0 01-1.667-.986V5.653z" />
                     </svg>
                   )}
-                  Bắt đầu
+                  <span className="tooltip-text whitespace-nowrap">Bắt đầu</span>
                 </button>
                 <button onClick={() => act(p.name, 'stop')} disabled={!p.running || loading[p.name]}
-                  className="card-btn card-btn-stop">
+                  className="relative group inline-flex items-center justify-center w-7 h-7 rounded-lg transition-all disabled:opacity-20 disabled:cursor-not-allowed active:scale-90"
+                  style={{ backgroundColor: 'var(--button-stop-bg)', color: 'var(--button-stop-text)', border: '1px solid var(--button-stop-border)' }}>
                   {loading[p.name] ? (
                     <div className="animate-spin rounded-full h-3 w-3 border-b border-current" />
                   ) : (
@@ -1365,16 +1321,20 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                       <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
                     </svg>
                   )}
-                  Dừng
+                  <span className="tooltip-text whitespace-nowrap">Dừng</span>
                 </button>
-                <select id={`clean-select-${p.name}`} name="cleanType" onChange={e => { const v = e.target.value as 'basic' | 'deep' | 'nuke'; if (v) { cleanProject(p.name, v); e.target.value = '' } }}
-                  disabled={clearing[p.name]} className="px-2 py-1.5 text-xs font-semibold rounded-lg cursor-pointer border transition-colors"
-                  style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
-                  <option value="">Dọn...</option>
-                  <option value="basic">Cache nhanh</option>
-                  <option value="deep">Build sâu</option>
-                  <option value="nuke">Xóa sạch & Cài lại</option>
-                </select>
+                <div className="relative group">
+                  <select id={`clean-select-${p.name}`} name="cleanType" onChange={e => { const v = e.target.value as 'basic' | 'deep' | 'nuke'; if (v) { cleanProject(p.name, v); e.target.value = '' } }}
+                    disabled={clearing[p.name]}
+                    className="w-8 h-8 rounded-lg cursor-pointer border transition-all disabled:opacity-30 text-center text-[11px] appearance-none"
+                    style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+                    <option value="">🧹</option>
+                    <option value="basic">Cache</option>
+                    <option value="deep">Build sâu</option>
+                    <option value="nuke">Xóa sạch</option>
+                  </select>
+                  <span className="tooltip-text whitespace-nowrap">Dọn dẹp</span>
+                </div>
               </div>
             </div>
           </div>
