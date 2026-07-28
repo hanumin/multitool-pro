@@ -1,5 +1,5 @@
 @echo off
-cd /d "C:\Users\Nguyen Thanh Dat\Desktop\Server-Dashboard"
+cd /d "C:\Users\Nguyen Thanh Dat\Desktop\Multi-App\Server-Dashboard"
 echo ==========================================
 echo    MultiTool Pro - Restart Backend
 echo ==========================================
@@ -16,12 +16,11 @@ start "MultiTool Pro Backend" python backend/app.py
 timeout /t 3 /nobreak >nul
 
 echo [*] Backend started! Testing API...
-curl -s http://127.0.0.1:5050/api/printer/wmi-status?printer=EPSON%%20L3210%%20Series
+curl -s http://127.0.0.1:5050/api/projects 2>&1
 echo.
 echo.
 echo ==========================================
 echo    Backend dang chay!
-echo    Mo http://127.0.0.1:5050/api/printer/wmi-status?printer=EPSON%%20L3210%%20Series
-echo    de kiem tra trong trinh duyet
+echo    Mo http://localhost:1420 de dung app
 echo ==========================================
 pause

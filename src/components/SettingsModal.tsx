@@ -1,6 +1,20 @@
 import { useEffect, useState } from 'react'
-
+import { ModuleId, MODULES } from '../types'
+import { type LogColors, DEFAULT_LOG_COLORS } from '../utils/logStyles'
 import { API, fetchWithRetry } from '../utils/apiFetch'
+
+// WHY: Danh sách cấp độ log cho Settings — tương ứng với LogColors keys + DEFAULT_LOG_COLORS.
+const LOG_COLOR_LEVELS: { key: keyof LogColors; label: string; icon: string }[] = [
+  { key: 'error',     label: 'Lỗi',         icon: '🔴' },
+  { key: 'warn',      label: 'Cảnh báo',    icon: '🟡' },
+  { key: 'success',   label: 'Thành công',  icon: '🟢' },
+  { key: 'build',     label: 'Xây dựng',    icon: '🔵' },
+  { key: 'tunnel',    label: 'Tunnel',      icon: '🌐' },
+  { key: 'metrics',   label: 'Chỉ số',      icon: '🟣' },
+  { key: 'cleanup',   label: 'Dọn dẹp',     icon: '🩷' },
+  { key: 'debug',     label: 'Gỡ lỗi',      icon: '⚪' },
+  { key: 'defaultText', label: 'Mặc định',  icon: '📄' },
+]
 
 interface Project {
   name: string
@@ -13,12 +27,18 @@ interface Props {
   open: boolean
   onClose: () => void
   onChanged: () => void
+  backgroundPolling?: Record<ModuleId, boolean>
+  onBackgroundPollingChange?: (polling: Record<ModuleId, boolean>) => void
+  logColors?: LogColors
+  onLogColorsChange?: (colors: LogColors) => void
+  theme?: 'dark' | 'light'
+  onToggleTheme?: () => void
 }
 
 // WHY: Modal cài đặt toàn hệ thống — quản lý projects (CRUD), port range, reload config.
 // open/onClose controlled component (parent App quyết định hiển thị).
 // onChanged callback để App refresh status khi settings thay đổi.
-export default function SettingsModal({ open, onClose, onChanged }: Props) {
+export default function SettingsModal({ open, onClose, onChanged, backgroundPolling, onBackgroundPollingChange, logColors, onLogColorsChange, theme, onToggleTheme }: Props) {
   const [projects, setProjects] = useState<Project[]>([])
   const [edit, setEdit] = useState<Partial<Project> | null>(null)
   const [editingIndex, setEditingIndex] = useState<number | null>(null)
@@ -245,13 +265,134 @@ export default function SettingsModal({ open, onClose, onChanged }: Props) {
                       style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }} />
                   </div>
                 </div>
-                <div className="flex justify-end">
-                  <button onClick={saveGlobalSettings}
-                    className="px-3 py-1.5 text-xs font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors active:scale-95 cursor-pointer">
-                    Lưu cài đặt chung
-                  </button>
-                </div>
               </div>
+
+              {/* Theme Toggle */}
+              {theme && onToggleTheme && (
+                <div className="rounded-xl p-5 border space-y-3 transition-colors duration-200"
+                  style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border)' }}>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-secondary)' }}>
+                        Giao diện
+                      </h3>
+                      <p className="text-[10px] mt-0.5" style={{ color: 'var(--fg-muted)' }}>
+                        {theme === 'dark' ? '🌙 Giao diện tối' : '☀️ Giao diện sáng'}
+                      </p>
+                    </div>
+                    <button onClick={onToggleTheme}
+                      className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded-lg border transition-all active:scale-95 cursor-pointer hover:bg-black/5 dark:hover:bg-white/5"
+                      style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+                      {theme === 'dark' ? (
+                        <><svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+                        </svg>
+                        Chuyển sáng</>
+                      ) : (
+                        <><svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+                        </svg>
+                        Chuyển tối</>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Background Polling Toggles */}
+              {backgroundPolling && onBackgroundPollingChange && (
+                <div className="rounded-xl p-5 border space-y-3 transition-colors duration-200"
+                  style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border)' }}>
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-secondary)' }}>
+                      Polling nền
+                    </h3>
+                    <span className="text-[10px]" style={{ color: 'var(--fg-muted)' }}>
+                      Cho phép module chạy ngầm khi không được chọn
+                    </span>
+                  </div>
+                  <div className="space-y-1.5">
+                    {MODULES.filter(mod => mod.polls).map(mod => {
+                      const isOn = backgroundPolling[mod.id]
+                      return (
+                        <div key={mod.id}
+                          className="flex items-center justify-between px-3 py-2 rounded-lg transition-colors"
+                          style={{ backgroundColor: isOn ? 'rgba(34,197,94,0.05)' : 'transparent' }}>
+                          <div className="flex items-center gap-2.5">
+                            <span className="text-sm">{mod.icon}</span>
+                            <div>
+                              <span className="text-xs font-medium" style={{ color: 'var(--fg)' }}>{mod.label}</span>
+                              <span className="text-[10px] ml-2" style={{ color: 'var(--fg-muted)' }}>{mod.description}</span>
+                            </div>
+                          </div>
+                          <label className="relative inline-flex items-center cursor-pointer">
+                            <input type="checkbox" id={`bg-polling-${mod.id}`} name={`bg-polling-${mod.id}`} checked={isOn}
+                              onChange={e => onBackgroundPollingChange({ ...backgroundPolling, [mod.id]: e.target.checked })}
+                              className="sr-only peer" />
+                            <div className="w-8 h-4 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-emerald-500 bg-gray-600/40" />
+                          </label>
+                        </div>
+                      )
+                    })}
+                  </div>
+                  <div className="pt-1 text-[10px]" style={{ color: 'var(--fg-muted)' }}>
+                    {Object.values(backgroundPolling).some(Boolean)
+                      ? `✅ Đang bật polling nền cho ${Object.entries(backgroundPolling).filter(([,v]) => v).length} module`
+                      : '💤 Tất cả module chỉ poll khi được chọn (tiết kiệm tài nguyên nhất)'}
+                  </div>
+                </div>
+              )}
+
+              {/* Log Color Customization */}
+              {logColors !== undefined && onLogColorsChange && (
+                <div className="rounded-xl p-5 border space-y-3 transition-colors duration-200"
+                  style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border)' }}>
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-secondary)' }}>
+                      Màu sắc log
+                    </h3>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px]" style={{ color: 'var(--fg-muted)' }}>Tùy chỉnh màu chữ cho từng cấp độ log</span>
+                      <button onClick={() => {
+                        const hasCustom = Object.keys(logColors).length > 0
+                        if (hasCustom && !window.confirm('Đặt lại tất cả màu về mặc định?')) return
+                        onLogColorsChange({})
+                      }}
+                        className="px-2 py-0.5 text-[8px] font-semibold rounded border transition-colors active:scale-95 cursor-pointer"
+                        style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-muted)' }}>
+                        Đặt lại
+                      </button>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {LOG_COLOR_LEVELS.map(({ key, label, icon }) => {
+                      const currentColor = logColors[key] || DEFAULT_LOG_COLORS[key]
+                      return (
+                        <div key={key}
+                          className="flex items-center gap-2 px-3 py-2 rounded-lg transition-colors hover:bg-white/[0.02]">
+                          <span className="text-sm">{icon}</span>
+                          <div className="flex-1 min-w-0">
+                            <span className="text-xs font-medium" style={{ color: 'var(--fg)' }}>{label}</span>
+                          </div>
+                          <div className="relative">
+                            <input type="color" id={`log-color-${key}`} name={`log-color-${key}`} value={currentColor}
+                              onChange={e => onLogColorsChange({ ...logColors, [key]: e.target.value })}
+                              className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                              title={`Thay đổi màu ${label}`} />
+                            <div className="w-6 h-6 rounded-md border shadow-sm transition-transform active:scale-95"
+                              style={{ backgroundColor: currentColor, borderColor: 'var(--border)' }} />
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                  <div className="pt-1 text-[10px]" style={{ color: 'var(--fg-muted)' }}>
+                    {Object.keys(logColors).length > 0
+                      ? `🎨 Đã tùy chỉnh ${Object.keys(logColors).length}/${LOG_COLOR_LEVELS.length} màu`
+                      : 'Màu mặc định — nhấn vào ô màu để thay đổi'}
+                  </div>
+                </div>
+              )}
 
               {/* Projects list */}
               <div>

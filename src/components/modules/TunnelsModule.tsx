@@ -1,6 +1,8 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo, memo } from 'react'
 
 import { API, fetchWithRetry } from '../../utils/apiFetch'
+import { useToast } from '../../components/ToastManager'
+import type { PreloadedData } from '../../types'
 
 interface Project {
   name: string; port: number; path: string; command?: string; running: boolean
@@ -18,6 +20,7 @@ interface TunnelState {
   request_count?: number
   request_rate?: number | null
   request_history?: { t: number; c: number }[]
+  endpoint_counts?: Record<string, number>
   alert_threshold?: number
 }
 
@@ -30,7 +33,7 @@ interface HistoryEntry {
 
 // WHY: History chart component — vẽ biểu đồ request rate từ lịch sử (giờ/ngày/tuần).
 // Format timestamp thành giờ:phút hoặc ngày/tháng tùy theo range.
-function HistoryChart({ history, range }: { history: HistoryEntry[]; range: string }) {
+const HistoryChart = memo(function HistoryChart({ history, range }: { history: HistoryEntry[]; range: string }) {
   if (history.length < 2) return (
     <div className="flex items-center justify-center h-32 text-xs" style={{ color: 'var(--fg-dim)' }}>
       Chưa có đủ dữ liệu lịch sử.
@@ -84,9 +87,39 @@ function HistoryChart({ history, range }: { history: HistoryEntry[]; range: stri
   const lastX = pad.left + (history.length - 1) * stepX
   const bottomY = pad.top + ch
   const areaPoints = `${firstX},${bottomY} ${points} ${lastX},${bottomY}`
-  
+
+  // ─── Tooltip state & handlers ───────────────────────────────
+  const svgRef = useRef<SVGSVGElement>(null)
+  const [hoveredIdx, setHoveredIdx] = useState<number | null>(null)
+
+  const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    const svg = svgRef.current
+    if (!svg) return
+    const rect = svg.getBoundingClientRect()
+    const scaleX = w / rect.width
+    const svgX = (e.clientX - rect.left) * scaleX
+
+    let closest = 0
+    let minDist = Infinity
+    for (let i = 0; i < history.length; i++) {
+      const dx = Math.abs(pad.left + i * stepX - svgX)
+      if (dx < minDist) { minDist = dx; closest = i }
+    }
+    setHoveredIdx(closest)
+  }
+  const handleMouseLeave = () => setHoveredIdx(null)
+
   return (
-    <svg width="100%" height={h} viewBox={`0 0 ${w} ${h}`} className="w-full">
+    <svg
+      ref={svgRef}
+      width="100%" height={h} viewBox={`0 0 ${w} ${h}`}
+      className="w-full cursor-crosshair select-none"
+      style={{ overflow: 'visible' }}
+      onMouseMove={handleMouseMove}
+      onMouseLeave={handleMouseLeave}
+    >
+      {/* WHY: Transparent hit-area rect to eliminate dead zones */}
+      <rect width="100%" height="100%" fill="transparent" />
       {/* Y-axis grid lines + labels */}
       {yLabels.map((v, i) => {
         const y = pad.top + ch - ((v - minVal) / rangeVal) * ch
@@ -109,13 +142,68 @@ function HistoryChart({ history, range }: { history: HistoryEntry[]; range: stri
           {l.label}
         </text>
       ))}
+
+      {/* ─── Interactive Tooltip ──────────────────────────── */}
+      {hoveredIdx !== null && (() => {
+        const entry = history[hoveredIdx]
+        const x = pad.left + hoveredIdx * stepX
+        const y = pad.top + ch - ((entry.request_rate - minVal) / rangeVal) * ch
+
+        // WHY: Tooltip box position — ưu tiên bên phải, nếu tràn thì sang trái
+        const tooltipW = 140
+        const tooltipH = 70
+        let tx = x + 12
+        let ty = y - tooltipH - 8
+        if (tx + tooltipW > w - pad.right) tx = x - tooltipW - 12
+        if (ty < 0) ty = y + 12
+
+        return (
+          <g className="chart-tooltip-group" style={{ pointerEvents: 'none' }}>
+            {/* Vertical crosshair line */}
+            <line x1={x} y1={pad.top} x2={x} y2={pad.top + ch} stroke="#22c55e" strokeWidth={1} strokeDasharray="3,3" strokeOpacity={0.5} />
+            {/* Horizontal crosshair line */}
+            <line x1={pad.left} y1={y} x2={w - pad.right} y2={y} stroke="#22c55e" strokeWidth={0.5} strokeDasharray="2,2" strokeOpacity={0.3} />
+            {/* Dot on the line */}
+            <circle cx={x} cy={y} r={4} fill="#22c55e" stroke="#0a0a0a" strokeWidth={2} />
+            <circle cx={x} cy={y} r={7} fill="transparent" stroke="#22c55e" strokeWidth={2} strokeOpacity={0.35} />
+            {/* Tooltip box via foreignObject */}
+            <foreignObject x={tx} y={ty} width={tooltipW} height={tooltipH}>
+              <div style={{
+                background: 'rgba(10, 10, 10, 0.92)',
+                border: '1px solid rgba(34, 197, 94, 0.3)',
+                borderRadius: '6px',
+                padding: '6px 10px',
+                fontFamily: '"JetBrains Mono", "Fira Code", monospace',
+                fontSize: '11px',
+                lineHeight: '1.5',
+                color: '#e0e0e0',
+                backdropFilter: 'blur(8px)',
+                boxShadow: '0 4px 16px rgba(0,0,0,0.4), 0 0 0 1px rgba(34,197,94,0.08)',
+              }}>
+                <div style={{ fontSize: '10px', color: '#22c55e', fontWeight: 600, marginBottom: 2 }}>
+                  {fmtTime(entry.timestamp)}
+                </div>
+                <div style={{ color: '#ccc' }}>
+                  Rate: <span style={{ color: '#22c55e' }}>{entry.request_rate.toFixed(2)}</span> req/s
+                </div>
+                <div style={{ color: '#ccc' }}>
+                  Count: <span style={{ color: '#fff' }}>{entry.request_count.toLocaleString()}</span>
+                </div>
+                <div style={{ color: '#888', fontSize: '9px', marginTop: 1 }}>
+                  {entry.status}
+                </div>
+              </div>
+            </foreignObject>
+          </g>
+        )
+      })()}
     </svg>
   )
-}
+})
 
 // WHY: Sparkline chart — vẽ biểu đồ request rate mini bằng SVG.
 // Tính rate từ diff giữa các snapshot, vẽ dạng đường polyline.
-function SparklineChart({ history, color = '#22c55e' }: { history: { t: number; c: number }[]; color?: string }) {
+const SparklineChart = memo(function SparklineChart({ history, color = '#22c55e' }: { history: { t: number; c: number }[]; color?: string }) {
   if (history.length < 2) return null
   
   // WHY: Tính request rate (requests/giây) giữa các snapshot
@@ -154,7 +242,7 @@ function SparklineChart({ history, color = '#22c55e' }: { history: { t: number; 
       <polyline points={points} fill="none" stroke={color} strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   )
-}
+})
 
 // WHY: Format seconds thành human-readable: 45s, 2m 34s, 1h 23m, 3d 5h
 function formatUptime(seconds: number): string {
@@ -179,20 +267,29 @@ interface CloudflaredInfo {
 interface TunnelsModuleProps {
   theme: 'dark' | 'light'
   setStatusText: (t: string) => void
+  inactive?: boolean
+  backgroundPolling?: boolean
+  onBackgroundPollingChange?: (enabled: boolean) => void
+  preloadedData?: PreloadedData
 }
 
 // WHY: Tunnel Dashboard tab — bang quan ly tat ca tunnels.
 // Hien thi cloudflared status, tunnel status, URL, watchdog.
 // Batch actions: Start all / Stop all.
-export default function TunnelsModule({ theme, setStatusText }: TunnelsModuleProps) {
-  const [projects, setProjects] = useState<Project[]>([])
+export default function TunnelsModule({ theme, setStatusText, inactive, backgroundPolling, onBackgroundPollingChange, preloadedData }: TunnelsModuleProps) {
+  const { addToast } = useToast()
+  // WHY: Dùng preloadedData từ LoadingScreen để skip initial loading
+  const preloadedProjs = preloadedData?.projects
+  const preloadedCf = preloadedData?.cloudflared
+  const hasPreload = !!(preloadedProjs || preloadedCf)
+  const [projects, setProjects] = useState<Project[]>(preloadedProjs || [])
   const [tunnelStates, setTunnelStates] = useState<Record<string, TunnelState>>({})
   const [tunnelLoading, setTunnelLoading] = useState<Record<string, boolean>>({})
   const [watchdogToggling, setWatchdogToggling] = useState<Record<string, boolean>>({})
   const [batchTunnelLoading, setBatchTunnelLoading] = useState(false)
-  const [cloudflaredInfo, setCloudflaredInfo] = useState<CloudflaredInfo | null>(null)
+  const [cloudflaredInfo, setCloudflaredInfo] = useState<CloudflaredInfo | null>(preloadedCf || null)
   const [installingCloudflared, setInstallingCloudflared] = useState(false)
-  const [initialLoading, setInitialLoading] = useState(true)
+  const [initialLoading, setInitialLoading] = useState(!hasPreload)
   const [searchQuery, setSearchQuery] = useState('')
   const [statusFilter, setStatusFilter] = useState<string>('all')
   const [showStopped, setShowStopped] = useState(true)
@@ -200,6 +297,8 @@ export default function TunnelsModule({ theme, setStatusText }: TunnelsModulePro
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [importing, setImporting] = useState(false)
   const [exportMetricsOpen, setExportMetricsOpen] = useState(false)
+  // WHY: Endpoint stats popover — project đang xem endpoint counts, null = đóng
+  const [endpointOpen, setEndpointOpen] = useState<string | null>(null)
   // WHY: History modal state — project đang xem history, null = đóng
   const [historyProject, setHistoryProject] = useState<string | null>(null)
   const [historyRange, setHistoryRange] = useState<string>('24h')
@@ -215,7 +314,7 @@ export default function TunnelsModule({ theme, setStatusText }: TunnelsModulePro
   const effectiveTheme = themeOverride || theme
 
   // WHY: Light/dark CSS variable values cho container override
-  const themeVars = effectiveTheme === 'light' ? {
+  const themeVars = useMemo(() => effectiveTheme === 'light' ? {
     '--bg': '#ffffff',
     '--fg': '#0f172a',
     '--fg-secondary': '#1e293b',
@@ -235,7 +334,7 @@ export default function TunnelsModule({ theme, setStatusText }: TunnelsModulePro
     '--bg-log': '#0f172a',
     '--input-bg': '#1e293b',
     '--border': 'rgba(255,255,255,0.08)',
-  }
+  }, [effectiveTheme])
   // WHY: Dùng Record<string,string> thay vì React.CSSProperties để hỗ trợ custom CSS vars
   const themeVarsStyle = themeOverride ? themeVars as Record<string, string> : {}
 
@@ -277,18 +376,18 @@ export default function TunnelsModule({ theme, setStatusText }: TunnelsModulePro
     } catch {}
   }, [])
 
-  // WHY: Polling mỗi 4s để cập nhật tunnel status + projects
+  // WHY: Polling tunnel — chỉ chạy khi module active. Khi inactive: clear interval.
   useEffect(() => {
+    if (inactive && !backgroundPolling) return
     fetchAll()
     const interval = setInterval(fetchAll, 4000)
     return () => clearInterval(interval)
-  }, [fetchAll])
+  }, [fetchAll, inactive, backgroundPolling])
 
   // WHY: Lightweight polling — phát hiện thay đổi project config.
-  // Poll /api/tunnels/changes mỗi 2s (trả về version number).
-  // Khi version thay đổi → gọi fetchAll() ngay lập tức.
-  // Điều này nhanh hơn nhiều so với poll full data mỗi 2s.
+  // Chỉ chạy khi module active. Khi inactive: clear interval.
   useEffect(() => {
+    if (inactive && !backgroundPolling) return
     let prevVersion = -1
     const interval = setInterval(async () => {
       try {
@@ -296,7 +395,6 @@ export default function TunnelsModule({ theme, setStatusText }: TunnelsModulePro
         if (res.ok) {
           const data = await res.json()
           if (prevVersion !== -1 && data.version !== prevVersion) {
-            // WHY: Project config changed! Trigger full refresh.
             fetchAll()
           }
           prevVersion = data.version
@@ -304,7 +402,7 @@ export default function TunnelsModule({ theme, setStatusText }: TunnelsModulePro
       } catch {}
     }, 2000)
     return () => clearInterval(interval)
-  }, [fetchAll])
+  }, [fetchAll, inactive, backgroundPolling])
 
   // WHY: Refetch history data khi range thay đổi hoặc modal mở với project mới
   useEffect(() => {
@@ -345,12 +443,17 @@ export default function TunnelsModule({ theme, setStatusText }: TunnelsModulePro
       if (res.ok) {
         setTunnelStates(prev => ({ ...prev, [name]: data }))
         setStatusText(`🌐 Tunnel started for ${name}`)
+        addToast({ type: 'success', title: `🌐 ${name}`, message: 'Tunnel đã được mở thành công' })
       } else {
         setStatusText(`❌ ${data.error || 'Failed'}`)
+        addToast({ type: 'error', title: `🌐 ${name}`, message: data.error || 'Mở tunnel thất bại' })
       }
-    } catch { setStatusText('Failed to start tunnel') }
+    } catch {
+      setStatusText('Failed to start tunnel')
+      addToast({ type: 'error', title: '🔌 Mất kết nối', message: 'Không thể kết nối tới backend' })
+    }
     finally { setTunnelLoading(l => ({ ...l, [name]: false })) }
-  }, [setStatusText])
+  }, [setStatusText, addToast])
 
   // WHY: Goi API stop tunnel + fetch status ngay de dong bo UI.
   // Tuong tu ServersModule stopTunnel pattern.
@@ -365,10 +468,14 @@ export default function TunnelsModule({ theme, setStatusText }: TunnelsModulePro
           setTunnelStates(prev => ({ ...prev, [name]: data }))
         }
         setStatusText(`Tunnel stopped for ${name}`)
+        addToast({ type: 'info', title: `🌐 ${name}`, message: 'Tunnel đã đóng' })
       }
-    } catch { setStatusText('Failed to stop tunnel') }
+    } catch {
+      setStatusText('Failed to stop tunnel')
+      addToast({ type: 'error', title: `🌐 ${name}`, message: 'Dừng tunnel thất bại' })
+    }
     finally { setTunnelLoading(l => ({ ...l, [name]: false })) }
-  }, [setStatusText])
+  }, [setStatusText, addToast])
 
   // WHY: Toggle watchdog — POST API + update local state ngay.
   // Kiem tra prev[name] ton tai truoc khi merge de tranh undefined.
@@ -386,10 +493,11 @@ export default function TunnelsModule({ theme, setStatusText }: TunnelsModulePro
           ...prev, [name]: { ...prev[name], watchdog_enabled: data.watchdog_enabled }
         } : prev)
         setStatusText(enabled ? '🛡️ Watchdog bật' : 'Watchdog tắt')
+        addToast({ type: 'info', title: `🛡️ ${name}`, message: enabled ? 'Watchdog đã được bật' : 'Watchdog đã tắt' })
       }
-    } catch { setStatusText('Lỗi khi thay đổi watchdog') }
+    } catch { setStatusText('Lỗi khi thay đổi watchdog'); addToast({ type: 'error', title: `🛡️ ${name}`, message: 'Thay đổi watchdog thất bại' }) }
     finally { setWatchdogToggling(w => ({ ...w, [name]: false })) }
-  }, [setStatusText])
+  }, [setStatusText, addToast])
 
   // WHY: Install cloudflared — POST install API + refresh cloudflaredInfo.
   // Hien thi progress text (dang tai / thanh cong / that bai).
@@ -399,15 +507,17 @@ export default function TunnelsModule({ theme, setStatusText }: TunnelsModulePro
       const res = await fetchWithRetry(`${API}/api/cloudflared/install`, { method: 'POST' })
       if (res.ok) {
         setStatusText('✅ Đã cài cloudflared!')
+        addToast({ type: 'success', title: '🌐 cloudflared', message: 'Đã cài cloudflared thành công' })
         const cfRes = await fetchWithRetry(`${API}/api/cloudflared/check`)
         if (cfRes.ok) setCloudflaredInfo(await cfRes.json())
       } else {
         const data = await res.json()
         setStatusText(`❌ ${data.error}`)
+        addToast({ type: 'error', title: '🌐 cloudflared', message: data.error || 'Cài đặt thất bại' })
       }
-    } catch { setStatusText('❌ Lỗi kết nối') }
+    } catch { setStatusText('❌ Lỗi kết nối'); addToast({ type: 'error', title: '🌐 cloudflared', message: 'Lỗi kết nối khi cài cloudflared' }) }
     finally { setInstallingCloudflared(false) }
-  }, [setStatusText])
+  }, [setStatusText, addToast])
 
   // WHY: 1-click: cai cloudflared + start tunnel + bat watchdog.
   // Refresh cloudflaredInfo trong finally de cap nhat UI.
@@ -420,16 +530,18 @@ export default function TunnelsModule({ theme, setStatusText }: TunnelsModulePro
       if (res.ok) {
         setTunnelStates(prev => ({ ...prev, [name]: data }))
         setStatusText('🌐 Tunnel started!')
+        addToast({ type: 'success', title: `🌐 ${name}`, message: 'Tunnel đã được cài và mở thành công' })
       } else {
         setStatusText(`❌ ${data.error || 'Failed'}`)
+        addToast({ type: 'error', title: `🌐 ${name}`, message: data.error || 'Cài & mở tunnel thất bại' })
       }
-    } catch { setStatusText('❌ Connection failed') }
+    } catch { setStatusText('❌ Connection failed'); addToast({ type: 'error', title: `🌐 ${name}`, message: 'Mất kết nối khi cài tunnel' }) }
     finally {
       setTunnelLoading(l => ({ ...l, [name]: false }))
       // WHY: Refresh cloudflaredInfo sau khi install thành công
       fetchWithRetry(`${API}/api/cloudflared/check`).then(r => r.ok && r.json()).then(d => d && setCloudflaredInfo(d)).catch(() => {})
     }
-  }, [setStatusText])
+  }, [setStatusText, addToast])
 
   // WHY: Dùng refs (projectsRef, tunnelStatesRef) để tránh stale closure
   // khi batch functions đọc state không kịp update.
@@ -474,20 +586,22 @@ export default function TunnelsModule({ theme, setStatusText }: TunnelsModulePro
 
   // WHY: Mo URL tunnel trong browser.
   // 2-layer fallback: Tauri shell.open > window.open.
-  const openBrowser = async (url: string) => {
+  const openBrowser = useCallback(async (url: string) => {
     try {
       const { open } = await import('@tauri-apps/plugin-shell')
       await open(url); return
     } catch {}
     window.open(url, '_blank')
-  }
+  }, [])
 
-  const activeTunnels = Object.values(tunnelStates).filter(s => s?.status === 'active').length
-  const totalTunnels = Object.keys(tunnelStates).length
-  const totalRestarts = Object.values(tunnelStates).reduce((sum, s) => sum + (s?.watchdog_restart_count || 0), 0)
+  const { activeTunnels, totalTunnels, totalRestarts } = useMemo(() => ({
+    activeTunnels: Object.values(tunnelStates).filter(s => s?.status === 'active').length,
+    totalTunnels: Object.keys(tunnelStates).length,
+    totalRestarts: Object.values(tunnelStates).reduce((sum, s) => sum + (s?.watchdog_restart_count || 0), 0),
+  }), [tunnelStates])
 
   // WHY: Filter projects dựa trên search query + status filter + showStopped
-  const filteredProjects = projects.filter(p => {
+  const filteredProjects = useMemo(() => projects.filter(p => {
     // WHY: Search theo tên project và port
     if (searchQuery) {
       const q = searchQuery.toLowerCase()
@@ -504,11 +618,11 @@ export default function TunnelsModule({ theme, setStatusText }: TunnelsModulePro
     // WHY: Toggle hiển thị project đã dừng
     if (!showStopped && !p.running) return false
     return true
-  })
+  }), [projects, searchQuery, statusFilter, showStopped, tunnelStates])
 
   // WHY: Sort filtered projects dựa trên sortConfig
   // Cycle: request_count desc → request_count asc → request_rate desc → request_rate asc → null
-  const cycleSort = () => {
+  const cycleSort = useCallback(() => {
     setSortConfig(prev => {
       if (!prev) return { key: 'request_count', direction: 'desc' }
       if (prev.key === 'request_count' && prev.direction === 'desc') return { key: 'request_count', direction: 'asc' }
@@ -516,31 +630,42 @@ export default function TunnelsModule({ theme, setStatusText }: TunnelsModulePro
       if (prev.key === 'request_rate' && prev.direction === 'desc') return { key: 'request_rate', direction: 'asc' }
       return null
     })
-  }
+  }, [])
   
   // WHY: Sort helper — lấy value sort từ tunnel state, xử lý undefined/null về -1
-  const getSortValue = (p: Project, key: 'request_count' | 'request_rate'): number => {
+  const getSortValue = useCallback((p: Project, key: 'request_count' | 'request_rate'): number => {
     const ts = tunnelStates[p.name]
     if (!ts) return -1
     const val = key === 'request_count' ? ts.request_count : ts.request_rate
     return val ?? -1
-  }
+  }, [tunnelStates])
   
   // WHY: Sort mảng filteredProjects theo sortConfig (không đột biến mảng gốc)
-  const sortedProjects = sortConfig
+  const sortedProjects = useMemo(() => sortConfig
     ? [...filteredProjects].sort((a, b) => {
         const va = getSortValue(a, sortConfig.key)
         const vb = getSortValue(b, sortConfig.key)
         return sortConfig.direction === 'desc' ? vb - va : va - vb
       })
-    : filteredProjects
+    : filteredProjects, [filteredProjects, sortConfig, getSortValue])
 
   return (
-    <div className="flex flex-col h-full p-4 gap-3"
-      style={themeVarsStyle}>
+    <div className="flex flex-col h-full p-4 gap-3 animate-header-in"
+      style={inactive ? { ...themeVarsStyle, display: 'none' } : themeVarsStyle}>
       {/* Cloudflared Status + Stats Bar */}
-      <div className="flex items-center justify-between shrink-0">
+      <div className="flex items-center justify-between shrink-0 animate-header-in" style={{ animationDelay: '0.05s' }}>
         <div className="flex items-center gap-3">
+          {/* Background Polling Toggle */}
+          {onBackgroundPollingChange && (
+            <button onClick={() => onBackgroundPollingChange(!backgroundPolling)}
+              className="flex items-center gap-1 px-2 py-1.5 text-[10px] font-medium rounded-lg border transition-all active:scale-95 cursor-pointer"
+              style={{ backgroundColor: backgroundPolling ? 'rgba(52,211,153,0.1)' : 'var(--input-bg)', borderColor: 'var(--border)', color: backgroundPolling ? '#34d399' : 'var(--fg-muted)' }}>
+              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+              </svg>
+              Nền: {backgroundPolling ? 'BẬT' : 'TẮT'}
+            </button>
+          )}
           {/* Cloudflared install status */}
           <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs"
             style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)' }}>
@@ -882,12 +1007,12 @@ export default function TunnelsModule({ theme, setStatusText }: TunnelsModulePro
                       </span>
                     </td>
                   </tr>
-                ) : sortedProjects.map(p => {
+                ) : sortedProjects.map((p, idx) => {
                 const ts = tunnelStates[p.name]
                 const loading = tunnelLoading[p.name]
                 return (
-                  <tr key={p.name} className="border-b transition-colors hover:bg-black/5 dark:hover:bg-white/5"
-                    style={{ borderColor: 'var(--border)', opacity: p.running ? 1 : 0.5 }}>
+                  <tr key={p.name} className="border-b tunnel-row-hover animate-tunnel-row"
+                    style={{ borderColor: 'var(--border)', opacity: p.running ? 1 : 0.5, animationDelay: `${idx * 0.03}s` }}>
                     {/* Project name + port */}
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2">
@@ -902,11 +1027,11 @@ export default function TunnelsModule({ theme, setStatusText }: TunnelsModulePro
                     {/* Status badge */}
                     <td className="px-3 py-3">
                       {ts?.status === 'active' ? (
-                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 animate-tunnel-glow">
                           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" /> HOẠT ĐỘNG
                         </span>
                       ) : ts?.status === 'connecting' ? (
-                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/10 text-amber-400 border border-amber-500/20 animate-pulse">
                           <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" /> ĐANG KẾT NỐI
                         </span>
                       ) : ts?.status === 'error' ? (
@@ -1033,23 +1158,65 @@ export default function TunnelsModule({ theme, setStatusText }: TunnelsModulePro
                         <span className="text-[10px]" style={{ color: 'var(--fg-dim)' }}>—</span>
                       )}
                     </td>
-                    {/* History sparkline button */}
+                    {/* Endpoint stats + History sparkline button */}
                     <td className="px-2 py-3 text-center">
-                      {ts?.status === 'active' || ts?.status === 'error' ? (
-                        <button onClick={() => {
-                          // WHY: Chỉ set project, useEffect sẽ fetch data tự động
-                          setHistoryProject(p.name)
-                          setHistoryRange('24h')
-                          setHistoryData([])
-                        }}
-                          className="px-1.5 py-1 text-[8px] font-semibold rounded border transition-all active:scale-95 cursor-pointer hover:bg-white/5"
-                          style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-dim)' }}
-                          title="Lịch sử request rate">
-                          📈
-                        </button>
-                      ) : (
-                        <span className="text-[10px]" style={{ color: 'var(--fg-dim)' }}>—</span>
-                      )}
+                      <div className="flex items-center justify-center gap-1">
+                        {ts?.endpoint_counts && Object.keys(ts.endpoint_counts).length > 0 ? (
+                          <div className="relative">
+                            <button onClick={() => setEndpointOpen(endpointOpen === p.name ? null : p.name)}
+                              className="px-1.5 py-1 text-[8px] font-semibold rounded border transition-all active:scale-95 cursor-pointer hover:bg-white/5"
+                              style={{
+                                backgroundColor: endpointOpen === p.name ? 'rgba(59,130,246,0.15)' : 'var(--input-bg)',
+                                borderColor: 'var(--border)',
+                                color: endpointOpen === p.name ? '#60a5fa' : 'var(--fg-dim)'
+                              }}
+                              title="Endpoint statistics">
+                              📊
+                            </button>
+                            {endpointOpen === p.name && (
+                              <>
+                                <div className="fixed inset-0 z-10" onClick={() => setEndpointOpen(null)} />
+                                <div className="absolute left-1/2 -translate-x-1/2 bottom-full mb-1 z-20 min-w-[180px] max-w-[220px] rounded-lg border shadow-lg overflow-hidden"
+                                  style={{
+                                    backgroundColor: 'var(--bg-card)',
+                                    borderColor: 'var(--border)',
+                                    color: 'var(--fg)'
+                                  }}>
+                                  <div className="px-3 py-2 text-[10px] font-semibold border-b"
+                                    style={{ borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+                                    📊 Top Endpoints
+                                  </div>
+                                  <div className="max-h-[150px] overflow-y-auto">
+                                    {Object.entries(ts.endpoint_counts)
+                                      .sort(([, a], [, b]) => b - a)
+                                      .slice(0, 10)
+                                      .map(([ep, count]) => (
+                                        <div key={ep} className="flex items-center justify-between px-3 py-1.5 text-[9px] hover:bg-black/5 dark:hover:bg-white/5">
+                                          <span className="font-mono truncate max-w-[120px]" style={{ color: 'var(--fg)' }}>{ep}</span>
+                                          <span className="font-mono ml-2 shrink-0" style={{ color: '#22c55e' }}>{count}</span>
+                                        </div>
+                                      ))}
+                                  </div>
+                                </div>
+                              </>
+                            )}
+                          </div>
+                        ) : null}
+                        {ts?.status === 'active' || ts?.status === 'error' ? (
+                          <button onClick={() => {
+                            setHistoryProject(p.name)
+                            setHistoryRange('24h')
+                            setHistoryData([])
+                          }}
+                            className="px-1.5 py-1 text-[8px] font-semibold rounded border transition-all active:scale-95 cursor-pointer hover:bg-white/5"
+                            style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-dim)' }}
+                            title="Lịch sử request rate">
+                            📈
+                          </button>
+                        ) : (
+                          <span className="text-[10px]" style={{ color: 'var(--fg-dim)' }}>—</span>
+                        )}
+                      </div>
                     </td>
                     {/* Actions */}
                     <td className="px-4 py-3 text-right">

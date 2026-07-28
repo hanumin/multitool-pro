@@ -2089,7 +2089,7 @@ dependencies = [
 
 [[package]]
 name = "multitool-pro"
-version = "1.9.10"
+version = "1.10.0"
 dependencies = [
  "serde",
  "serde_json",

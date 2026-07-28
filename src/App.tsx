@@ -1,6 +1,20 @@
-import { useEffect, useState, lazy, Suspense } from 'react'
+import { useEffect, useState, useRef, lazy, Suspense } from 'react'
 import Sidebar from './components/Sidebar'
-import { ModuleId, MODULES } from './types'
+import { ModuleId, MODULES, type PreloadedData } from './types'
+
+// WHY: Preload tất cả lazy-loaded components trước để tránh loading spinner khi chuyển tab.
+// Các module sẽ được import đồng thời trong LoadingScreen trước khi app chính hiển thị.
+const preloadModules = () => {
+  // Trigger dynamic imports để cache chunks
+  import('./components/modules/ServersModule')
+  import('./components/modules/PrintersModule')
+  import('./components/modules/AudioModule')
+  import('./components/modules/FileCopierModule')
+  import('./components/modules/DatabaseModule')
+  import('./components/modules/TunnelsModule')
+  import('./components/modules/LogModule')
+  import('./components/SettingsModal')
+}
 
 const ServersModule = lazy(() => import('./components/modules/ServersModule'))
 const PrintersModule = lazy(() => import('./components/modules/PrintersModule'))
@@ -9,7 +23,10 @@ const FileCopierModule = lazy(() => import('./components/modules/FileCopierModul
 const DatabaseModule = lazy(() => import('./components/modules/DatabaseModule'))
 const TunnelsModule = lazy(() => import('./components/modules/TunnelsModule'))
 const LogModule = lazy(() => import('./components/modules/LogModule'))
-import SettingsModal from './components/SettingsModal'
+const SettingsModal = lazy(() => import('./components/SettingsModal'))
+import LoadingScreen from './components/LoadingScreen'
+import { useToast } from './components/ToastManager'
+import { type LogColors, DEFAULT_LOG_COLORS } from './utils/logStyles'
 import { API, fetchWithRetry } from './utils/apiFetch'
 
 type Theme = 'dark' | 'light'
@@ -106,6 +123,8 @@ const SIDEBAR_BREAKPOINT = 1100
 // Sử dụng React.lazy + Suspense cho code-splitting theo module.
 // State tập trung ở đây, pass props xuống children (sidebar, modules).
 function App() {
+  const [appReady, setAppReady] = useState(false)
+  const [preloadedData, setPreloadedData] = useState<PreloadedData>({})
   const { theme, toggle: toggleTheme } = useTheme()
   const [activeModule, setActiveModule] = useState<ModuleId>('servers')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
@@ -116,6 +135,32 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsRefresh, setSettingsRefresh] = useState(0)
   const [systemIps, setSystemIps] = useState<string[]>(['localhost', '127.0.0.1'])
+  // WHY: Lưu tùy chọn màu sắc log. Merge với defaults để tránh thiếu key.
+  const [logColors, setLogColors] = useState<LogColors>(() => {
+    try {
+      const stored = localStorage.getItem('sd-log-colors')
+      if (stored) return JSON.parse(stored) as LogColors
+    } catch {}
+    return {} // Dùng DEFAULT_LOG_COLORS khi chưa có setting
+  })
+
+  // WHY: Persist logColors vào localStorage mỗi khi thay đổi.
+  // Luôn save (kể cả object rỗng) để reset có hiệu lực vĩnh viễn.
+  useEffect(() => {
+    localStorage.setItem('sd-log-colors', JSON.stringify(logColors))
+  }, [logColors])
+
+  // WHY: Lưu tùy chọn polling nền cho từng module. localStorage để persist giữa các lần mở app.
+  // Mặc định: tất cả đều false (không polling khi tab inactive).
+  const BG_POLLING_DEFAULTS: Record<ModuleId, boolean> = { servers: false, printers: false, audio: false, 'file-copier': false, database: false, tunnels: false, logs: false }
+  // WHY: Merge parsed data với defaults để tránh undefined khi localStorage có key thiếu.
+  const [backgroundPolling, setBackgroundPolling] = useState<Record<ModuleId, boolean>>(() => {
+    try {
+      const stored = localStorage.getItem('sd-bg-polling')
+      if (stored) return { ...BG_POLLING_DEFAULTS, ...JSON.parse(stored) }
+    } catch {}
+    return BG_POLLING_DEFAULTS
+  })
 
   // WHY: Dynamic import để không crash trong browser (Tauri API không available ngoài desktop runtime).
   // .catch(() => {}) — fail silently, fallback về version hardcoded.
@@ -134,6 +179,16 @@ function App() {
       if (d && Array.isArray(d.ips)) setSystemIps(d.ips)
     }).catch(() => {})
   }, [])
+
+  // WHY: Persist backgroundPolling settings vào localStorage mỗi khi thay đổi.
+  // CHỈ lưu các module có polls === true để tiết kiệm dung lượng.
+  useEffect(() => {
+    const pollingOnly: Record<string, boolean> = {}
+    for (const mod of MODULES) {
+      if (mod.polls) pollingOnly[mod.id] = backgroundPolling[mod.id]
+    }
+    localStorage.setItem('sd-bg-polling', JSON.stringify(pollingOnly))
+  }, [backgroundPolling])
 
   // WHY: Auto-collapse sidebar khi window < breakpoint (ví dụ: màn hình laptop nhỏ 1366px).
   // Check ngay khi mount + mỗi lần resize. Cleanup listener khi unmount.
@@ -220,7 +275,55 @@ function App() {
     return `http://${ip}:${activePort}`
   })
 
+  // WHY: Theo dõi module change để trigger page transition animation.
+  // Dùng useRef để tránh animation khi lần đầu mount (initial render).
+  const prevModuleRef = useRef<ModuleId | null>(null)
+  const [pageAnim, setPageAnim] = useState('')
+
+  // WHY: Khi activeModule thay đổi (trừ lần đầu mount), dùng rAF để restart animation:
+  //   Phase 1 - setPageAnim('') xóa class ngay (React commit DOM)
+  //   Phase 2 - rAF callback re-apply class → animation starts fresh
+  //   Phase 3 - setTimeout tự cleanup sau 350ms
+  // rAF giữa 2 state updates đảm bảo React đã commit 'clear' trước khi re-add.
+  useEffect(() => {
+    if (prevModuleRef.current !== null && prevModuleRef.current !== activeModule) {
+      setPageAnim('')
+      const raf = requestAnimationFrame(() => {
+        setPageAnim('animate-page-enter')
+      })
+      const timer = setTimeout(() => setPageAnim(''), 350)
+      prevModuleRef.current = activeModule
+      return () => {
+        cancelAnimationFrame(raf)
+        clearTimeout(timer)
+      }
+    }
+    prevModuleRef.current = activeModule
+  }, [activeModule])
+
   const moduleName = MODULES.find(m => m.id === activeModule)?.label || ''
+
+  // WHY: Thông báo welcome khi app khởi động xong.
+  const { addToast } = useToast()
+
+  // WHY: Gửi Windows toast + in-app toast khi app sẵn sàng.
+  useEffect(() => {
+    if (appReady) {
+      addToast({ type: 'success', title: 'MultiTool Pro đã sẵn sàng', message: 'Tất cả module đã được khởi tạo' })
+      fetchWithRetry(`${API}/api/notify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: 'MultiTool Pro', message: 'Dashboard đã sẵn sàng!' }),
+      }).catch(() => {})
+    }
+  }, [appReady])
+
+  // WHY: Preload tất cả lazy-loaded components ngay khi mount để cache chunks.
+  useEffect(() => { preloadModules() }, [])
+
+  if (!appReady) {
+    return <LoadingScreen onComplete={(data) => { setPreloadedData(data); setAppReady(true) }} />
+  }
 
   return (
     <>
@@ -271,22 +374,6 @@ function App() {
               <span className="tooltip-text">Cài đặt</span>
             </button>
 
-            {/* Theme toggle */}
-            <button onClick={toggleTheme}
-              className="p-1.5 rounded-lg transition-all active:scale-95 cursor-pointer border-0 group relative"
-              style={{ color: 'var(--fg-muted)', background: 'transparent' }}>
-              {theme === 'dark' ? (
-                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
-                </svg>
-              ) : (
-                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
-                </svg>
-              )}
-              <span className="tooltip-text">{theme === 'dark' ? 'Giao diện sáng' : 'Giao diện tối'}</span>
-            </button>
-
             {/* Minimize to tray */}
             <button onClick={minimizeToTray}
               className="p-1.5 rounded-lg transition-all active:scale-95 cursor-pointer border-0 group relative"
@@ -300,7 +387,7 @@ function App() {
         </header>
 
         {/* Module content - overflow-y-auto để nội dung scroll riêng, sidebar cố định */}
-        <div className="flex-1 min-h-0 overflow-y-auto">
+        <div className={`flex-1 min-h-0 overflow-y-auto ${pageAnim}`}>
           <Suspense fallback={
             <div className="flex items-center justify-center h-full">
               <div className="text-center space-y-3">
@@ -312,13 +399,19 @@ function App() {
               </div>
             </div>
           }>
-            {activeModule === 'servers' && <ServersModule theme={theme} setStatusText={setStatusText} />}
-            {activeModule === 'printers' && <PrintersModule theme={theme} setStatusText={setStatusText} />}
-            {activeModule === 'audio' && <AudioModule theme={theme} setStatusText={setStatusText} />}
-            {activeModule === 'file-copier' && <FileCopierModule theme={theme} setStatusText={setStatusText} />}
-            {activeModule === 'database' && <DatabaseModule theme={theme} setStatusText={setStatusText} />}
-            {activeModule === 'tunnels' && <TunnelsModule theme={theme} setStatusText={setStatusText} />}
-            {activeModule === 'logs' && <LogModule theme={theme} setStatusText={setStatusText} />}
+            <ServersModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'servers'} backgroundPolling={backgroundPolling.servers} logColors={logColors}
+              onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, servers: enabled }))}
+              onLogColorsChange={setLogColors} preloadedData={preloadedData} />
+            <PrintersModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'printers'} backgroundPolling={backgroundPolling.printers}
+              onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, printers: enabled }))} preloadedData={preloadedData} />
+            <AudioModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'audio'} backgroundPolling={backgroundPolling.audio}
+              onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, audio: enabled }))} preloadedData={preloadedData} />
+            <FileCopierModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'file-copier'} />
+            <DatabaseModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'database'} preloadedData={preloadedData} />
+            <TunnelsModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'tunnels'} backgroundPolling={backgroundPolling.tunnels}
+              onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, tunnels: enabled }))} preloadedData={preloadedData} />
+            <LogModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'logs'} backgroundPolling={backgroundPolling.logs} logColors={logColors}
+              onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, logs: enabled }))} preloadedData={preloadedData} />
           </Suspense>
         </div>
 
@@ -377,8 +470,17 @@ function App() {
     </div>
 
       {/* WHY: Render modals OUTSIDE root div để position: fixed hoạt động đúng (không bị ảnh hưởng bởi ancestor transform/overflow). */}
-      <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)}
-        onChanged={() => { setSettingsRefresh(prev => prev + 1) }} />
+      {/* WHY: Suspense boundary riêng để SettingsModal (lazy-loaded) không crash khi click mở lần đầu */}
+      <Suspense fallback={null}>
+        <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)}
+        onChanged={() => { setSettingsRefresh(prev => prev + 1) }}
+        backgroundPolling={backgroundPolling}
+        onBackgroundPollingChange={setBackgroundPolling}
+        logColors={logColors}
+        onLogColorsChange={setLogColors}
+        theme={theme}
+        onToggleTheme={toggleTheme} />
+      </Suspense>
 
       {/* Changelog Modal */}
       {changelogOpen && (

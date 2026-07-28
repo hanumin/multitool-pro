@@ -1,16 +1,30 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { getLineStyle, type LogColors } from '../../utils/logStyles'
 import { API, fetchWithRetry } from '../../utils/apiFetch'
+import { useToast } from '../../components/ToastManager'
+import type { PreloadedData } from '../../types'
 
 interface LogModuleProps {
   theme: 'dark' | 'light'
   setStatusText: (t: string) => void
+  inactive?: boolean
+  backgroundPolling?: boolean
+  logColors?: LogColors
+  onBackgroundPollingChange?: (enabled: boolean) => void
+  preloadedData?: PreloadedData
 }
 
 // WHY: Log viewer component — xem log hệ thống real-time từ backend debug.log.
 // Tự động refresh mỗi 2s, hỗ trợ search/filter, clear log, pause auto-refresh.
 // Giống Output Panel trong VS Code — dễ dàng copy log gửi cho dev.
-export default function LogModule({ theme, setStatusText }: LogModuleProps) {
-  const [lines, setLines] = useState<string[]>([])
+export default function LogModule({ theme, setStatusText, inactive, backgroundPolling, logColors, onBackgroundPollingChange, preloadedData }: LogModuleProps) {
+  const { addToast } = useToast()
+
+  // WHY: Dùng preloaded debugLog từ LoadingScreen để skip loading flash.
+  // preloadedData.debugLog.lines chính là log từ lần fetch cuối cùng trước khi app mount.
+  const preloadedLines = preloadedData?.debugLog?.lines
+  const preloadedLogStr = preloadedLines?.join('\n') || ''
+  const [lines, setLines] = useState<string[]>(preloadedLines || [])
   const [filteredLines, setFilteredLines] = useState<string[]>([])
   const [searchQuery, setSearchQuery] = useState('')
   const [autoRefresh, setAutoRefresh] = useState(true)
@@ -25,8 +39,9 @@ export default function LogModule({ theme, setStatusText }: LogModuleProps) {
   const connectionErrorRef = useRef(false)
 
   // WHY: Dùng useRef thay vì state để so sánh log thay đổi — tránh reset interval mỗi lần re-render.
+  // Khởi tạo với preloaded log content để fetchLog đầu tiên so sánh đúng, tránh re-render trùng lặp.
   // fetchLog ổn định (không phụ thuộc state), interval không bị clear/recreate liên tục.
-  const lastLogRef = useRef('')
+  const lastLogRef = useRef(preloadedLogStr)
   const fetchLog = useCallback(async () => {
     try {
       const res = await fetchWithRetry(`${API}/api/debug-log`)
@@ -52,13 +67,14 @@ export default function LogModule({ theme, setStatusText }: LogModuleProps) {
   }, []) // WHY: Empty deps — fetchLog ổn định, không recreate interval mỗi lần connectionError thay đổi.
   // connectionError dùng ref để auto-dismiss mà không cần dependency.
 
-  // WHY: Auto-refresh interval — 2.5s (nhanh hơn để bắt kịp log real-time)
+  // WHY: Auto-refresh interval — chỉ chạy khi module active + autoRefresh bật.
+  // Khi inactive: clear interval (tiết kiệm 1 API call mỗi 2.5s).
   useEffect(() => {
-    if (!autoRefresh) return
+    if ((inactive && !backgroundPolling) || !autoRefresh) return
     fetchLog()
     const interval = setInterval(fetchLog, 2500)
     return () => clearInterval(interval)
-  }, [autoRefresh, fetchLog])
+  }, [autoRefresh, fetchLog, inactive, backgroundPolling])
 
   // WHY: Filter lines dựa trên search query và level filter
   useEffect(() => {
@@ -108,8 +124,15 @@ export default function LogModule({ theme, setStatusText }: LogModuleProps) {
         setLines([])
         setFilteredLines([])
         setStatusText('🧹 Đã xóa log')
+        addToast({ type: 'success', title: '🧹 Xóa log', message: 'Đã xóa toàn bộ log thành công' })
+      } else {
+        const errData = await res.json().catch(() => ({ error: 'Lỗi không xác định' }))
+        addToast({ type: 'error', title: '🧹 Xóa log thất bại', message: errData.error })
       }
-    } catch { setStatusText('❌ Không thể xóa log') }
+    } catch {
+      setStatusText('❌ Không thể xóa log')
+      addToast({ type: 'error', title: '🔌 Mất kết nối', message: 'Không thể kết nối tới backend' })
+    }
     finally { setClearing(false) }
   }
 
@@ -136,29 +159,7 @@ export default function LogModule({ theme, setStatusText }: LogModuleProps) {
     setStatusText(`📥 Exported ${filteredLines.length} dòng log`)
   }
 
-  // WHY: Màu sắc cho từng loại log entry — tô màu inline style thay vì ANSI parse
-  const getLineStyle = (line: string): React.CSSProperties => {
-    const lower = line.toLowerCase()
-    if (lower.includes('error') || lower.includes('fail') || lower.includes('❌')) {
-      return { color: '#ef4444' }
-    }
-    if (lower.includes('warn') || lower.includes('⚠️')) {
-      return { color: '#f59e0b' }
-    }
-    if (lower.includes('tunnel') && (lower.includes('url') || lower.includes('active'))) {
-      return { color: '#22c55e' }
-    }
-    if (lower.includes('[tunnel') || lower.includes('[watchdog') || lower.includes('[alert') || lower.includes('[sleep')) {
-      return { color: '#60a5fa' }
-    }
-    if (lower.includes('[request-history') || lower.includes('[hourly-metrics')) {
-      return { color: '#a78bfa' }
-    }
-    if (lower.includes('[cleanup') || lower.includes('[migrate')) {
-      return { color: '#f472b6' }
-    }
-    return {}
-  }
+  // WHY: Dùng getLineStyle chung từ utils/logStyles thay vì local copy
 
   // WHY: Lấy timestamp từ đầu dòng log [YYYY-MM-DD HH:MM:SS]
   const getTimestamp = (line: string): string => {
@@ -183,10 +184,21 @@ export default function LogModule({ theme, setStatusText }: LogModuleProps) {
   ]
 
   return (
-    <div className="flex flex-col h-full p-4 gap-3">
+    <div className="flex flex-col h-full p-4 gap-3" style={{ display: inactive ? 'none' : 'flex' }}>
       {/* Controls bar */}
       <div className="flex items-center justify-between shrink-0 gap-2">
         <div className="flex items-center gap-2">
+          {/* Background Polling Toggle */}
+          {onBackgroundPollingChange && (
+            <button onClick={() => onBackgroundPollingChange(!backgroundPolling)}
+              className="flex items-center gap-1 px-2 py-1.5 text-[10px] font-medium rounded-lg border transition-all active:scale-95 cursor-pointer"
+              style={{ backgroundColor: backgroundPolling ? 'rgba(52,211,153,0.1)' : 'var(--input-bg)', borderColor: 'var(--border)', color: backgroundPolling ? '#34d399' : 'var(--fg-muted)' }}>
+              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+              </svg>
+              Nền: {backgroundPolling ? 'BẬT' : 'TẮT'}
+            </button>
+          )}
           {/* Stats */}
           <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs"
             style={{
@@ -397,31 +409,35 @@ export default function LogModule({ theme, setStatusText }: LogModuleProps) {
                 ↓ Auto-scroll
               </button>
             )}
-            {filteredLines.map((line, i) => (
-              <div key={i} className="flex gap-2 hover:bg-black/5 dark:hover:bg-white/5 px-1 py-0.5 rounded transition-colors">
-                {/* Line number */}
-                <span className="text-right select-none shrink-0"
-                  style={{ color: 'var(--fg-muted)', width: `${String(filteredLines.length).length}ch`, fontSize: `${fontSize - 2}px` }}>
-                  {i + 1}
-                </span>
-                {/* Timestamp */}
-                {getTimestamp(line) && (
-                  <span className="shrink-0 select-none font-mono"
-                    style={{ color: 'var(--fg-muted)', fontSize: `${fontSize - 1}px` }}>
-                    {getTimestamp(line)}
+            {filteredLines.map((line, i) => {
+              const style = getLineStyle(line, i, logColors)
+              return (
+                <div key={i} className="flex items-start gap-2 px-2 py-0.5 rounded transition-colors hover:bg-white/[0.04] group"
+                  style={{ backgroundColor: style.backgroundColor }}>
+                  {/* Line number */}
+                  <span className="text-right select-none shrink-0 font-mono"
+                    style={{ color: 'var(--fg-muted)', width: `${String(filteredLines.length).length}ch`, fontSize: `${fontSize - 2}px`, lineHeight: '1.5rem' }}>
+                    {i + 1}
                   </span>
-                )}
-                {/* Content */}
-                <span className={lineWrap ? 'whitespace-pre-wrap' : 'whitespace-nowrap'}
-                  style={getLineStyle(line)}>
-                  {searchQuery ? (
-                    highlightText(getContent(line) || line, searchQuery)
-                  ) : (
-                    getContent(line) || line
+                  {/* Timestamp */}
+                  {getTimestamp(line) && (
+                    <span className="shrink-0 select-none font-mono"
+                      style={{ color: 'var(--fg-muted)', fontSize: `${fontSize - 1}px`, lineHeight: '1.5rem' }}>
+                      {getTimestamp(line)}
+                    </span>
                   )}
-                </span>
-              </div>
-            ))}
+                  {/* Content */}
+                  <span className={`${lineWrap ? 'whitespace-pre-wrap' : 'whitespace-nowrap'} flex-1`}
+                    style={{ color: style.color, borderLeft: style.borderLeft, paddingLeft: style.paddingLeft, lineHeight: '1.5rem' }}>
+                    {searchQuery ? (
+                      highlightText(getContent(line) || line, searchQuery)
+                    ) : (
+                      getContent(line) || line
+                    )}
+                  </span>
+                </div>
+              )
+            })}
           </div>
         )}
       </div>

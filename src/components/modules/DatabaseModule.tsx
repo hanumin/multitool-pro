@@ -6,6 +6,8 @@ const ConnectionForm = lazy(() => import('./database/ConnectionForm'))
 const DataTable = lazy(() => import('./database/DataTable'))
 
 import { API, fetchWithRetry } from '../../utils/apiFetch'
+import { useToast } from '../../components/ToastManager'
+import type { PreloadedData } from '../../types'
 
 interface DbConnection {
   id?: string
@@ -26,13 +28,20 @@ interface TableInfo {
 interface DatabaseModuleProps {
   theme: 'dark' | 'light'
   setStatusText: (t: string) => void
+  inactive?: boolean
+  preloadedData?: PreloadedData
 }
 
 // WHY: Module quản lý database — kết nối PostgreSQL/MySQL, duyệt schema/tables, SQL query editor.
 // Sidebar trái: danh sách connections + tree view databases/schemas/tables.
 // Content chính: DataTable browser hoặc SQL Query view (tab switch).
-export default function DatabaseModule({ theme, setStatusText }: DatabaseModuleProps) {
-  const [connections, setConnections] = useState<DbConnection[]>([])
+export default function DatabaseModule({ theme, setStatusText, inactive, preloadedData }: DatabaseModuleProps) {
+  const { addToast } = useToast()
+
+  // WHY: Dùng preloaded databaseConnections để connections list hiển thị ngay
+  // khi app khởi động, không cần chờ fetch API lần đầu.
+  const preloadedConns = preloadedData?.databaseConnections
+  const [connections, setConnections] = useState<DbConnection[]>(preloadedConns || [])
   const [showConnectionForm, setShowConnectionForm] = useState(false)
   const [editConn, setEditConn] = useState<Partial<DbConnection>>({
     name: '', type: 'postgresql', host: 'localhost', port: 5432, database: '', user: 'postgres', password: ''
@@ -87,6 +96,7 @@ export default function DatabaseModule({ theme, setStatusText }: DatabaseModuleP
     setScanningLocal(false)
     if (results.length > 0) {
       setStatusText(`🔍 Phát hiện ${results.length} database server local`)
+      addToast({ type: 'info', title: '🗄️ Database local', message: `Phát hiện ${results.length} database server` })
     }
   }
 
@@ -118,15 +128,16 @@ export default function DatabaseModule({ theme, setStatusText }: DatabaseModuleP
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(connPayload)
       })
-      if (!saveRes.ok) { setStatusText(`❌ Failed to save connection`); setTesting(false); return }
+      if (!saveRes.ok) { setStatusText(`❌ Failed to save connection`); addToast({ type: 'error', title: '🗄️ Database', message: 'Lưu kết nối thất bại' }); setTesting(false); return }
       const saved = await saveRes.json()
-      if (!saved.connection?.id) { setStatusText(`❌ Invalid response from server`); setTesting(false); return }
+      if (!saved.connection?.id) { setStatusText(`❌ Invalid response from server`); addToast({ type: 'error', title: '🗄️ Database', message: 'Phản hồi từ server không hợp lệ' }); setTesting(false); return }
       setStatusText(`✅ Connected to ${db.name}`)
+      addToast({ type: 'success', title: '🗄️ Database', message: `Đã kết nối ${db.name}` })
       const listRes = await fetchWithRetry(`${API}/api/database/connections`)
       const listData = await listRes.json()
       setConnections(listData.connections || [])
       await connectToDb(saved.connection.id)
-    } catch (e: any) { setStatusText(`❌ ${e.message}`) }
+    } catch (e: any) { setStatusText(`❌ ${e.message}`); addToast({ type: 'error', title: '🗄️ Lỗi kết nối', message: e.message }) }
     finally { setTesting(false) }
   }
 
@@ -149,6 +160,7 @@ export default function DatabaseModule({ theme, setStatusText }: DatabaseModuleP
       })
       const result = await res.json()
       if (result.success) {
+        addToast({ type: 'success', title: '🗄️ Database', message: 'Kết nối thành công' })
         const saveRes = await fetchWithRetry(`${API}/api/database/connections`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(editConn)
@@ -164,8 +176,9 @@ export default function DatabaseModule({ theme, setStatusText }: DatabaseModuleP
         }
       } else {
         setStatusText(`❌ ${result.error}`)
+        addToast({ type: 'error', title: '🗄️ Lỗi database', message: result.error })
       }
-    } catch (e: any) { setStatusText(`❌ ${e.message}`) }
+    } catch (e: any) { setStatusText(`❌ ${e.message}`); addToast({ type: 'error', title: '🗄️ Lỗi database', message: e.message }) }
     finally { setTesting(false) }
   }
 
@@ -187,11 +200,13 @@ export default function DatabaseModule({ theme, setStatusText }: DatabaseModuleP
         setDatabases(data.databases || [])
         setSelectedDb(data.databases?.[0] || '')
         setStatusText(`✅ Connected to ${data.connection?.name || 'DB'}`)
+        addToast({ type: 'success', title: '🗄️ Đã kết nối', message: `Kết nối ${data.connection?.name || 'DB'} thành công` })
       } else {
         setStatusText(`❌ ${data.error}`)
+        addToast({ type: 'error', title: '🗄️ Kết nối thất bại', message: data.error })
         setConnectedDb(null)
       }
-    } catch (e: any) { setStatusText(`❌ ${e.message}`) }
+    } catch (e: any) { setStatusText(`❌ ${e.message}`); addToast({ type: 'error', title: '🗄️ Lỗi kết nối', message: e.message }) }
     finally { setLoading(false) }
   }
 
@@ -272,10 +287,11 @@ export default function DatabaseModule({ theme, setStatusText }: DatabaseModuleP
           schema: selectedSchema, table: selectedTable, format
         })
       })
-      if (!res.ok) { const err = await res.json(); setStatusText(`❌ ${err.error}`); return }
+      if (!res.ok) { const err = await res.json(); setStatusText(`❌ ${err.error}`); addToast({ type: 'error', title: '📤 Lỗi xuất dữ liệu', message: err.error }); return }
       const filename = await downloadBlobFromResponse(res, `${selectedTable}.${format}`)
       setStatusText(`✅ Exported ${filename}`)
-    } catch (e: any) { setStatusText(`❌ ${e.message}`) }
+      addToast({ type: 'success', title: '📤 Xuất dữ liệu', message: `Đã xuất ${filename}` })
+    } catch (e: any) { setStatusText(`❌ ${e.message}`); addToast({ type: 'error', title: '📤 Lỗi xuất dữ liệu', message: e.message }) }
   }
 
   // WHY: Clear tất cả state liên quan đến connection — không chỉ setConnectedDb(null).
@@ -287,6 +303,7 @@ export default function DatabaseModule({ theme, setStatusText }: DatabaseModuleP
     setTables([])
     setTableData(null)
     setStatusText('Disconnected')
+    addToast({ type: 'info', title: '🗄️ Database', message: 'Đã ngắt kết nối' })
   }
 
   // WHY: Xóa kết nối — DELETE /api/database/connections?id=...
@@ -296,6 +313,7 @@ export default function DatabaseModule({ theme, setStatusText }: DatabaseModuleP
     if (!window.confirm('Delete this connection?')) return
     try {
       await fetchWithRetry(`${API}/api/database/connections?id=${connId}`, { method: 'DELETE' })
+      addToast({ type: 'info', title: '🗄️ Database', message: 'Đã xóa kết nối' })
       const res = await fetchWithRetry(`${API}/api/database/connections`)
       const data = await res.json()
       setConnections(data.connections || [])
@@ -305,7 +323,7 @@ export default function DatabaseModule({ theme, setStatusText }: DatabaseModuleP
 
   // ─── RENDER ──────────────────────────────────────────────────
   return (
-    <div className="flex h-full">
+    <div className="flex h-full" style={{ display: inactive ? 'none' : 'flex' }}>
       {/* Sidebar: Connection list + DB tree */}
       {!showConnectionForm && (
         <div className="w-56 shrink-0 border-r flex flex-col" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-sidebar)' }}>

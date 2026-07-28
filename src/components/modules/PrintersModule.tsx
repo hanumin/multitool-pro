@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Printer } from '../../types'
-
+import { Printer, type PreloadedData } from '../../types'
 import { API, fetchWithRetry } from '../../utils/apiFetch'
+import { useToast } from '../../components/ToastManager'
 
 interface PrintHistoryEntry {
   datetime: string
@@ -71,6 +71,10 @@ interface WmiDetails {
 interface PrintersModuleProps {
   theme: 'dark' | 'light'
   setStatusText: (t: string) => void
+  inactive?: boolean
+  backgroundPolling?: boolean
+  onBackgroundPollingChange?: (enabled: boolean) => void
+  preloadedData?: PreloadedData
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -167,15 +171,19 @@ const statusGradients: Record<string, string> = {
 // WHY: Module quản lý máy in — dashboard, WMI status, print history, settings, PJL diagnostics.
 // Polling 5s: printers + reminder + settings + history + stats + activity + WMI.
 // Kiến trúc: fetchAll() gọi song song 4 API chính → xử lý settings trước → printers sau.
-export default function PrintersModule({ theme, setStatusText }: PrintersModuleProps) {
-  const [printers, setPrinters] = useState<Printer[]>([])
-  const [loading, setLoading] = useState(true)
+export default function PrintersModule({ theme, setStatusText, inactive, backgroundPolling, onBackgroundPollingChange, preloadedData }: PrintersModuleProps) {
+  const { addToast } = useToast()
+  // WHY: Nếu có preloadedData từ LoadingScreen, dùng làm initial state để skip loading flash
+  const preloadedPrinters = preloadedData?.printers?.printers
+  const preloadedSettingsObj = preloadedData?.printerSettings?.settings
+  const [printers, setPrinters] = useState<Printer[]>(preloadedPrinters || [])
+  const [loading, setLoading] = useState(!preloadedPrinters)
   const [selectedPrinter, setSelectedPrinter] = useState<string | null>(null)
   const [printerJobs, setPrinterJobs] = useState<string[]>([])
   const [jobsLoading, setJobsLoading] = useState(false)
 
   const [reminderInfo, setReminderInfo] = useState<ReminderInfo | null>(null)
-  const [printerSettings, setPrinterSettings] = useState<PrinterSettings>({
+  const [printerSettings, setPrinterSettings] = useState<PrinterSettings>(preloadedSettingsObj || {
     days_between_prints: 5, selected_printer: '', remind_minutes: 15,
     reminder_enabled: true, last_print_date: null,
     excluded_printers: [], page_count: {}
@@ -223,12 +231,15 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
         setImportResult(`✅ Đã nhập: ${items || 'không có gì'}`)
         if (result.warnings?.length) setImportResult(prev => prev + ` | ⚠️ ${result.warnings.join(', ')}`)
         setStatusText('✅ Import thành công!')
+        addToast({ type: 'success', title: '📥 Import máy in', message: 'Dữ liệu đã được nhập thành công' })
         fetchAll()
       } else {
         setImportResult(`❌ Import thất bại: ${result.error || 'lỗi không xác định'}`)
+        addToast({ type: 'error', title: '📥 Import thất bại', message: result.error || 'lỗi không xác định' })
       }
     } catch (err: any) {
       setImportResult(`❌ Lỗi đọc file: ${err.message}`)
+      addToast({ type: 'error', title: '📥 Import thất bại', message: `Lỗi đọc file: ${err.message}` })
     }
     // Reset input để chọn lại file khác
     if (importFileInputRef.current) importFileInputRef.current.value = ''
@@ -242,11 +253,14 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
       if (res.ok) {
         const data = await res.json()
         setStatusText(`✅ Đã sao lưu: ${(data.size / 1024).toFixed(1)} KB`)
+        addToast({ type: 'success', title: '💾 Sao lưu', message: `Hoàn tất (${(data.size / 1024).toFixed(1)} KB)` })
       } else {
         setStatusText('❌ Sao lưu thất bại')
+        addToast({ type: 'error', title: '💾 Sao lưu thất bại', message: 'Không thể tạo bản sao lưu' })
       }
     } catch {
       setStatusText('❌ Lỗi kết nối')
+      addToast({ type: 'error', title: '🔌 Mất kết nối', message: 'Không thể sao lưu dữ liệu máy in' })
     }
   }
 
@@ -315,8 +329,10 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
       document.body.removeChild(a)
       URL.revokeObjectURL(url)
       setStatusText('✅ Đã xuất lịch sử in')
+      addToast({ type: 'success', title: '📤 Xuất dữ liệu', message: 'Lịch sử in đã được xuất thành công' })
     } catch (e) {
       setStatusText('❌ Xuất thất bại')
+      addToast({ type: 'error', title: '📤 Xuất thất bại', message: 'Không thể xuất lịch sử in' })
     }
   }
 
@@ -424,11 +440,14 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
     finally { setLoading(false) }
   }, [setStatusText])
 
+  // WHY: Polling máy in — chỉ chạy khi module active. Khi inactive: clear interval.
+  // Khi active trở lại: fetch ngay lập tức + restart interval (không đợi 5s).
   useEffect(() => {
+    if (inactive && !backgroundPolling) return
     fetchAll()
     const interval = setInterval(fetchAll, 5000)
     return () => clearInterval(interval)
-  }, [fetchAll])
+  }, [fetchAll, inactive, backgroundPolling])
 
   // WHY: Countdown timer — tính từ reminderInfo.days_left + hours_left + minutes_left.
   // Laser printer bypass: is_laser = true → không hiển thị countdown.
@@ -466,8 +485,14 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
     if (!window.confirm(`Xóa tất cả lệnh in của "${name}"?`)) return
     try {
       const res = await fetchWithRetry(`${API}/api/printers/${encodeURIComponent(name)}/jobs`, { method: 'DELETE' })
-      if (res.ok) { setPrinterJobs([]); setStatusText(`Đã xóa lệnh in của ${name}`); fetchJobs(name) }
-    } catch { setStatusText('Xóa lệnh in thất bại') }
+      if (res.ok) {
+        setPrinterJobs([]); setStatusText(`Đã xóa lệnh in của ${name}`); fetchJobs(name)
+        addToast({ type: 'success', title: `🧹 ${name}`, message: 'Đã xóa tất cả lệnh in' })
+      }
+    } catch {
+      setStatusText('Xóa lệnh in thất bại')
+      addToast({ type: 'error', title: `❌ ${name}`, message: 'Xóa lệnh in thất bại' })
+    }
   }
 
   // WHY: POST /default API + fetchAll refresh toàn bộ (không chỉ fetchJobs).
@@ -475,8 +500,14 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
   const setDefaultPrinter = async (name: string) => {
     try {
       const res = await fetchWithRetry(`${API}/api/printers/${encodeURIComponent(name)}/default`, { method: 'POST' })
-      if (res.ok) { setStatusText(`Đã đặt ${name} làm mặc định`); fetchAll() }
-    } catch { setStatusText('Thất bại') }
+      if (res.ok) {
+        setStatusText(`Đã đặt ${name} làm mặc định`); fetchAll()
+        addToast({ type: 'success', title: `🖨️ ${name}`, message: 'Đã đặt làm máy in mặc định' })
+      }
+    } catch {
+      setStatusText('Thất bại')
+      addToast({ type: 'error', title: `❌ ${name}`, message: 'Đặt máy in mặc định thất bại' })
+    }
   }
 
   // WHY: Gửi trang thử qua backend — backend dùng win32print.StartDocPrinter.
@@ -484,9 +515,17 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
   const testPrint = async (name: string) => {
     try {
       const res = await fetchWithRetry(`${API}/api/printers/${encodeURIComponent(name)}/test`, { method: 'POST' })
-      if (res.ok) { setStatusText(`Đã gửi trang thử đến ${name}`); fetchAll() }
-      else { const e = await res.json(); setStatusText(e.error || 'Thất bại') }
-    } catch { setStatusText('In thử thất bại') }
+      if (res.ok) {
+        setStatusText(`Đã gửi trang thử đến ${name}`); fetchAll()
+        addToast({ type: 'success', title: `🖨️ ${name}`, message: 'Đã gửi trang thử' })
+      } else {
+        const e = await res.json(); setStatusText(e.error || 'Thất bại')
+        addToast({ type: 'error', title: `🖨️ ${name}`, message: e.error || 'In thử thất bại' })
+      }
+    } catch {
+      setStatusText('In thử thất bại')
+      addToast({ type: 'error', title: `🔌 Mất kết nối`, message: 'Không thể gửi trang thử' })
+    }
   }
 
   // WHY: Ghi nhận in thủ công — user tự bấm khi in xong.
@@ -573,7 +612,20 @@ export default function PrintersModule({ theme, setStatusText }: PrintersModuleP
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full" style={{ display: inactive ? 'none' : 'flex' }}>
+      {/* Background Polling Toggle */}
+      {onBackgroundPollingChange && (
+        <div className="flex items-center justify-end px-4 pt-3 pb-0">
+          <button onClick={() => onBackgroundPollingChange(!backgroundPolling)}
+            className="flex items-center gap-1 px-2 py-1 text-[10px] rounded-lg transition-all active:scale-95 cursor-pointer border-0"
+            style={{ color: backgroundPolling ? '#34d399' : 'var(--fg-muted)', backgroundColor: backgroundPolling ? 'rgba(52,211,153,0.1)' : 'transparent' }}>
+            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+            </svg>
+            <span>Nền: {backgroundPolling ? 'BẬT' : 'TẮT'}</span>
+          </button>
+        </div>
+      )}
       {/* ═══════ DASHBOARD HEADER ═══════ */}
       <div className="shrink-0 grid grid-cols-1 lg:grid-cols-3 gap-3 p-4">
         {/* ── Card 1: Status Dashboard ── */}

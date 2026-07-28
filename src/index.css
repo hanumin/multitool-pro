@@ -1,4 +1,5 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:opsz@14..32&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap');
 @import "tailwindcss";
 
 :root {
@@ -95,6 +96,45 @@ body {
   animation: fade-in 0.3s ease-out;
 }
 
+@keyframes glow-pulse {
+  0% { filter: brightness(1); }
+  50% { filter: brightness(1.8); }
+  100% { filter: brightness(1); }
+}
+
+.animate-glow-pulse {
+  animation: glow-pulse 0.4s ease-out;
+}
+
+@keyframes badge-pop {
+  0% { transform: scale(0); opacity: 0; }
+  50% { transform: scale(1.3); }
+  100% { transform: scale(1); opacity: 1; }
+}
+.animate-badge-pop {
+  animation: badge-pop 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@keyframes loading-bar-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+@keyframes page-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.animate-page-enter {
+  animation: page-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
 /* WHY: Custom tooltip — nhanh hơn native title (0s delay), style đồng bộ dark theme.
    Dùng group-hover để hiện tooltip ngay khi hover, pointer-events:none để không block click. */
 .tooltip-text {
@@ -114,7 +154,7 @@ body {
   color: #e2e8f0;
   border: 1px solid #334155;
   box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-  z-index: 100;
+  z-index: 9999;
 }
 
 .group:hover .tooltip-text {
@@ -131,4 +171,322 @@ body {
   transform: translateX(-50%);
   border: 4px solid transparent;
   border-top-color: #334155;
+}
+
+/* ─── Terminal-style Log Viewer ──────────────────────────── */
+/* WHY: Terminal header với traffic-light dots (macOS style) */
+.terminal-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 8px 8px 0 0;
+  background: #1a1b26;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  user-select: none;
+}
+
+.terminal-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  transition: all 0.15s ease;
+}
+
+.terminal-dot:hover {
+  filter: brightness(1.3);
+  transform: scale(1.15);
+}
+
+.terminal-dot.red {
+  background: #ff5f56;
+  box-shadow: 0 0 4px rgba(255,95,86,0.4);
+}
+
+.terminal-dot.yellow {
+  background: #ffbd2e;
+  box-shadow: 0 0 4px rgba(255,189,46,0.4);
+}
+
+.terminal-dot.green {
+  background: #27c93f;
+  box-shadow: 0 0 4px rgba(39,201,63,0.4);
+}
+
+.terminal-body {
+  background: #0d1117;
+  font-family: 'JetBrains Mono', 'Consolas', 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #e6edf3;
+}
+
+.terminal-tab {
+  transition: all 0.15s ease;
+}
+
+.terminal-tab:hover {
+  opacity: 0.8;
+}
+
+.terminal-tab.active {
+  background: rgba(16,185,129,0.15);
+  color: #34d399;
+  border-color: rgba(16,185,129,0.3);
+}
+
+@keyframes terminal-blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+.animate-terminal-blink {
+  animation: terminal-blink 1s step-end infinite;
+}
+
+/* WHY: Terminal scrollbar — mỏng hơn, matching dark theme */
+.terminal-body::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+.terminal-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.terminal-body::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.08);
+  border-radius: 2px;
+}
+
+.terminal-body::-webkit-scrollbar-thumb:hover {
+  background: rgba(255,255,255,0.15);
+}
+
+/* ─── Toast Notifications ───────────────────────────────── */
+/* ─── Server Card Animations ─────────────────────────── */
+/* WHY: Card enter animation — staggered fade-in + slide-up */
+@keyframes card-enter {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.animate-card-enter {
+  animation: card-enter 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* WHY: Card hover — lift + glow border */
+.card-hover {
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.card-hover:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 25px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(52, 211, 153, 0.1);
+}
+
+[data-theme="light"] .card-hover:hover {
+  box-shadow: 0 8px 25px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(52, 211, 153, 0.2);
+}
+
+/* WHY: Card running indicator glow — pulse nhẹ liên tục */
+@keyframes running-bar-glow {
+  0%, 100% {
+    box-shadow: 0 0 4px rgba(52, 211, 153, 0.3);
+  }
+  50% {
+    box-shadow: 0 0 8px rgba(52, 211, 153, 0.6);
+  }
+}
+
+.animate-running-bar {
+  animation: running-bar-glow 2s ease-in-out infinite;
+}
+
+/* WHY: Status badge pulse ring — hiệu ứng sóng lan */
+@keyframes status-ring {
+  0% {
+    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.4);
+  }
+  70% {
+    box-shadow: 0 0 0 6px rgba(52, 211, 153, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0);
+  }
+}
+
+.animate-status-ring {
+  animation: status-ring 2s ease-out infinite;
+}
+
+/* WHY: Tunnel active flash — glow xanh lá nhất thời khi tunnel bật */
+@keyframes tunnel-flash {
+  0% {
+    background-color: rgba(52, 211, 153, 0.12);
+    border-color: rgba(52, 211, 153, 0.3);
+  }
+  100% {
+    background-color: transparent;
+    border-color: var(--border);
+  }
+}
+
+.animate-tunnel-flash {
+  animation: tunnel-flash 0.8s ease-out forwards;
+}
+
+/* WHY: Expand section slide-down */
+.expand-enter {
+  animation: expand-enter 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes expand-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+    max-height: 0;
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+    max-height: 1000px;
+  }
+}
+
+/* WHY: Nút action trong card — glow animation khi click */
+@keyframes action-glow {
+  0% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.4); }
+  100% { box-shadow: 0 0 0 6px rgba(59, 130, 246, 0); }
+}
+
+.animate-action-glow {
+  animation: action-glow 0.5s ease-out;
+}
+
+/* ─── Tunnel Table Animations ───────────────────────── */
+/* WHY: Tunnel row enter — fade-in + slide-up với stagger */
+@keyframes tunnel-row-enter {
+  from {
+    opacity: 0;
+    transform: translateX(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.animate-tunnel-row {
+  animation: tunnel-row-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* WHY: Tunnel row hover — highlight + subtle scale */
+.tunnel-row-hover {
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.tunnel-row-hover:hover {
+  background-color: rgba(255, 255, 255, 0.03) !important;
+  backdrop-filter: brightness(1.05);
+}
+
+[data-theme="light"] .tunnel-row-hover:hover {
+  background-color: rgba(0, 0, 0, 0.03) !important;
+  backdrop-filter: brightness(0.98);
+}
+
+/* WHY: Tunnel status badge glow — cho trạng thái active */
+
+/* WHY: Tunnel status badge glow — cho trạng thái active */
+@keyframes tunnel-status-glow {
+  0%, 100% {
+    box-shadow: 0 0 4px rgba(52, 211, 153, 0.2);
+  }
+  50% {
+    box-shadow: 0 0 8px rgba(52, 211, 153, 0.5);
+  }
+}
+
+.animate-tunnel-glow {
+  animation: tunnel-status-glow 2s ease-in-out infinite;
+}
+
+/* WHY: Tunnel URL copy flash */
+@keyframes copy-flash {
+  0% { background-color: rgba(59, 130, 246, 0.15); }
+  100% { background-color: transparent; }
+}
+
+.animate-copy-flash {
+  animation: copy-flash 0.5s ease-out forwards;
+}
+
+/* WHY: Tunnel header fade-in */
+@keyframes header-fade-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-header-in {
+  animation: header-fade-in 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* ─── Toast Notifications ───────────────────────────────── */
+/* WHY: Toast slide-in từ bottom-right */
+@keyframes toast-enter {
+  from {
+    opacity: 0;
+    transform: translateX(100%) scale(0.9);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+.animate-toast-enter {
+  animation: toast-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* WHY: Toast slide-out về bên phải */
+@keyframes toast-exit {
+  from {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(100%) scale(0.9);
+  }
+}
+
+.animate-toast-exit {
+  animation: toast-exit 0.25s ease-in forwards;
+}
+
+/* WHY: Progress bar countdown — từ right sang left */
+@keyframes toast-timer {
+  from { transform: scaleX(1); }
+  to { transform: scaleX(0); }
+}
+
+.animate-toast-timer {
+  animation: toast-timer linear forwards;
+}
+
+/* WHY: Respect reduced motion preferences */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

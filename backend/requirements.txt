@@ -1,5 +1,8 @@
 flask>=3.0
 flask-cors>=4.0
+psutil>=7.0
+pywin32>=310
+requests>=2.32
 psycopg2-binary>=2.9
 mysql-connector-python>=9.0
 pycaw>=2025.10

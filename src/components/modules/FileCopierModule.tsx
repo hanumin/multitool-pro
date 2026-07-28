@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 
 import { API, fetchWithRetry } from '../../utils/apiFetch'
+import { useToast } from '../../components/ToastManager'
 
 interface SourceDir {
   key: string
@@ -12,12 +13,14 @@ interface SourceDir {
 interface FileCopierModuleProps {
   theme: 'dark' | 'light'
   setStatusText: (t: string) => void
+  inactive?: boolean
 }
 
 // WHY: Module sao chép file audio/video theo từ khóa từ nhiều thư mục nguồn.
 // Hỗ trợ dry-run (chạy thử) và copy thật với MD5 verification.
 // Dùng Tauri dialog để chọn thư mục, backend xử lý scan + copy.
-export default function FileCopierModule({ theme, setStatusText }: FileCopierModuleProps) {
+export default function FileCopierModule({ theme, setStatusText, inactive }: FileCopierModuleProps) {
+  const { addToast } = useToast()
   const [sourceDirs, setSourceDirs] = useState<SourceDir[]>([
     { key: 'src1', label: 'Audio Tách Ghép Âm', path: '', count: 0 },
     { key: 'src2', label: 'Video Tách Ghép Âm', path: '', count: 0 },
@@ -67,11 +70,12 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
             const data = await res.json()
             setSourceDirs(prev => prev.map(d => d.key === key ? { ...d, count: data.count } : d))
             addLog(`📁 ${key}: ${data.count} file`, 'success')
+            addToast({ type: 'info', title: '📂 Thư mục nguồn', message: `${key}: ${data.count} file` })
           }
-        } catch { addLog(`Không thể đếm file trong ${key}`, 'error') }
+        } catch { addLog(`Không thể đếm file trong ${key}`, 'error'); addToast({ type: 'error', title: '📂 File Copier', message: `Không thể đếm file trong ${key}` }) }
         finally { setScanningDir(null) }
       }
-    } catch { addLog('Không thể mở hộp thoại chọn thư mục', 'error') }
+    } catch { addLog('Không thể mở hộp thoại chọn thư mục', 'error'); addToast({ type: 'error', title: '📂 File Copier', message: 'Không thể mở hộp thoại chọn thư mục' }) }
   }
 
   // WHY: Tương tự selectSourceDir, dùng Tauri dialog chọn thư mục đích.
@@ -84,8 +88,9 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
         const path = typeof selected === 'string' ? selected : selected[0]
         setDestDir(path)
         addLog(`📁 Đích: ${path}`, 'info')
+        addToast({ type: 'info', title: '📂 File Copier', message: 'Đã chọn thư mục đích' })
       }
-    } catch { addLog('Không thể mở hộp thoại chọn thư mục', 'error') }
+    } catch { addLog('Không thể mở hộp thoại chọn thư mục', 'error'); addToast({ type: 'error', title: '📂 File Copier', message: 'Không thể mở hộp thoại chọn thư mục' }) }
   }
 
   // WHY: Chọn file .txt chứa từ khóa, gửi lên backend parse.
@@ -107,10 +112,11 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
             const data = await res.json()
             setKeywords(data.keywords?.join('\n') || '')
             addLog(`📄 Đã tải ${data.count} từ khóa từ file`, 'success')
+            addToast({ type: 'info', title: '🔑 Từ khóa', message: `Đã tải ${data.count} từ khóa từ file` })
           }
-        } catch { addLog('Không thể đọc file từ khóa', 'error') }
+        } catch { addLog('Không thể đọc file từ khóa', 'error'); addToast({ type: 'error', title: '🔑 Từ khóa', message: 'Không thể đọc file từ khóa' }) }
       }
-    } catch { addLog('Không thể mở hộp thoại chọn file', 'error') }
+    } catch { addLog('Không thể mở hộp thoại chọn file', 'error'); addToast({ type: 'error', title: '🔑 Từ khóa', message: 'Không thể mở hộp thoại chọn file' }) }
   }
 
   // WHY: Reset toàn bộ state về mặc định — không gọi API,
@@ -124,6 +130,7 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
     setProgress(0)
     setStatusMessage('Sẵn sàng')
     addLog('🔄 Đã đặt lại tất cả', 'info')
+    addToast({ type: 'info', title: '📂 File Copier', message: 'Đã đặt lại tất cả' })
   }
 
   // WHY: Hàm chính — gửi lệnh copy/dry-run lên backend.
@@ -133,12 +140,12 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
   // Backend trả về found_count + not_found_count + logs chi tiết.
   const runCopy = async (dryRun: boolean) => {
     const validSources = sourceDirs.filter(d => d.path)
-    if (validSources.length === 0) { addLog('Vui lòng chọn ít nhất một thư mục nguồn', 'error'); return }
-    if (!destDir) { addLog('Vui lòng chọn thư mục đích', 'error'); return }
-    if (!keywords.trim()) { addLog('Vui lòng nhập từ khóa', 'error'); return }
+    if (validSources.length === 0) { addLog('Vui lòng chọn ít nhất một thư mục nguồn', 'error'); addToast({ type: 'error', title: '📂 File Copier', message: 'Vui lòng chọn thư mục nguồn' }); return }
+    if (!destDir) { addLog('Vui lòng chọn thư mục đích', 'error'); addToast({ type: 'error', title: '📂 File Copier', message: 'Vui lòng chọn thư mục đích' }); return }
+    if (!keywords.trim()) { addLog('Vui lòng nhập từ khóa', 'error'); addToast({ type: 'error', title: '📂 File Copier', message: 'Vui lòng nhập từ khóa' }); return }
 
     const keywordList = keywords.split('\n').map(k => k.trim()).filter(k => k)
-    if (keywordList.length === 0) { addLog('Không có từ khóa hợp lệ', 'error'); return }
+    if (keywordList.length === 0) { addLog('Không có từ khóa hợp lệ', 'error'); addToast({ type: 'error', title: '📂 File Copier', message: 'Không có từ khóa hợp lệ' }); return }
 
     setIsRunning(true)
     setProgress(0)
@@ -163,6 +170,7 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
       if (!res.ok) {
         const err = await res.json()
         addLog(`Lỗi: ${err.error || 'Lỗi không xác định'}`, 'error')
+        addToast({ type: 'error', title: '📂 File Copier', message: err.error || 'Lỗi không xác định' })
         setIsRunning(false)
         setStatusMessage('Thất bại')
         return
@@ -183,8 +191,10 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
       setProgress(100)
       setStatusMessage(dryRun ? 'Chạy thử hoàn tất' : 'Sao chép hoàn tất!')
       addLog(`\n${dryRun ? 'Chạy thử' : 'Sao chép'} hoàn tất!`, 'success')
+      addToast({ type: dryRun ? 'info' : 'success', title: '📂 File Copier', message: dryRun ? 'Chạy thử hoàn tất' : 'Sao chép hoàn tất!' })
     } catch (e: any) {
       addLog(`❌ ${e.message || 'Kết nối thất bại'}`, 'error')
+      addToast({ type: 'error', title: '📂 File Copier', message: e.message || 'Kết nối thất bại' })
       setStatusMessage('Lỗi')
     } finally {
       setIsRunning(false)
@@ -192,7 +202,7 @@ export default function FileCopierModule({ theme, setStatusText }: FileCopierMod
   }
 
   return (
-    <div className="flex flex-col h-full p-4 gap-4">
+    <div className="flex flex-col h-full p-4 gap-4" style={{ display: inactive ? 'none' : 'flex' }}>
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>

@@ -1160,8 +1160,10 @@ _tunnel_restart_counts = {}    # {project_name: int} - số lần watchdog đã 
 _tunnel_started_at = {}       # {project_name: float} - timestamp khi tunnel active (time.time())
 _tunnel_request_counts = {}   # {project_name: int} - số request đã qua tunnel
 _tunnel_request_history = {}  # {project_name: [{t: timestamp, c: count}, ...]} - lịch sử request rate
+_tunnel_endpoint_counts = {}  # {project_name: {endpoint: count}} - thống kê endpoint được gọi nhiều nhất
 _tunnel_alert_thresholds = {}  # {project_name: float} - ngưỡng request rate (0 = tắt)
 _tunnel_already_alerted = {}   # {project_name: float} - timestamp lần alert gần nhất (cooldown)
+_tunnel_metrics_ports = {}     # {project_name: int} - port metrics server của cloudflared (default 20241)
 _tunnel_lock = threading.Lock()
 
 # ─── Sleep/Resume Detection ────────────────────────────────────
@@ -1214,17 +1216,56 @@ threading.Thread(target=_sleep_detector, daemon=True).start()
 
 # ─── Request History Snapshots ──────────────────────────────────
 # WHY: Ghi snapshot request count mỗi 10s để vẽ chart request rate.
-# Giữ tối đa 30 snapshots (~5 phút). Mỗi snapshot: {t: timestamp, c: total_count}
-_REQUEST_HISTORY_MAX = 30
+# Giữ tối đa 60 snapshots (~10 phút). Mỗi snapshot: {t: timestamp, c: total_count}
+# WHY: Sử dụng cloudflared metrics endpoint (port 20241/metrics) thay vì parse stderr
+# vì cloudflared 2026+ dùng QUIC protocol, không log HTTP request lines ra stderr.
+# Metrics endpoint có cloudflared_tunnel_total_requests counter chính xác.
+
+def _get_tunnel_metrics_port(name):
+    """Lấy port metrics server của tunnel từ dict, fallback về 20241.
+    Port được parse từ dòng 'Starting metrics server on 127.0.0.1:PORT/metrics'
+    trong reader thread và lưu vào _tunnel_metrics_ports."""
+    return _tunnel_metrics_ports.get(name, 20241)
+
+def _fetch_tunnel_metrics(name):
+    """Đọc cloudflared_tunnel_total_requests từ metrics endpoint.
+    Dùng port động từ _tunnel_metrics_ports (parse từ stderr) thay vì hardcode 20241.
+    Trả về số request hoặc None nếu metrics chưa available."""
+    try:
+        port = _get_tunnel_metrics_port(name)
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/metrics")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            body = resp.read().decode('utf-8')
+            # WHY: Dùng regex tránh parse Prometheus format phức tạp
+            m = re.search(r'^cloudflared_tunnel_total_requests\s+(\d+)', body, re.MULTILINE)
+            if m:
+                return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+_REQUEST_HISTORY_MAX = 60
 _REQUEST_HISTORY_INTERVAL = 10
 
 def _request_history_worker():
-    """Thread ghi snapshot request count mỗi 10s cho tất cả tunnels đang active."""
+    """Thread ghi snapshot request count mỗi 10s cho tất cả tunnels đang active.
+    Sử dụng cloudflared metrics endpoint (port 20241) thay vì parse stderr."""
     while True:
         try:
             time.sleep(_REQUEST_HISTORY_INTERVAL)
+            # WHY: Fetch metrics từ cloudflared — đo request count realtime
+            # Metrics port 20241 là default cho cloudflared quick tunnel
             with _tunnel_lock:
-                # WHY: Chỉ snapshot tunnels đang active (có process alive)
+                active_tunnels = list(_tunnel_processes.keys())
+            
+            # WHY: Fetch metrics riêng cho từng tunnel (dùng port động)
+            for name in active_tunnels:
+                metrics_count = _fetch_tunnel_metrics(name)
+                if metrics_count is not None:
+                    with _tunnel_lock:
+                        _tunnel_request_counts[name] = metrics_count
+                
+                # WHY: Ghi snapshot cho tất cả tunnels active
                 for name, proc in list(_tunnel_processes.items()):
                     if proc.poll() is None:  # Process still alive
                         current_count = _tunnel_request_counts.get(name, 0)
@@ -1234,7 +1275,7 @@ def _request_history_worker():
                             't': time.time(),
                             'c': current_count,
                         })
-                        # WHY: Giữ tối đa 30 snapshots (~5 phút)
+                        # WHY: Giữ tối đa 60 snapshots (~10 phút)
                         if len(_tunnel_request_history[name]) > _REQUEST_HISTORY_MAX:
                             _tunnel_request_history[name] = _tunnel_request_history[name][-_REQUEST_HISTORY_MAX:]
         except Exception as e:
@@ -1419,6 +1460,7 @@ def _get_tunnel_status(name):
                 "request_count": _tunnel_request_counts.get(name, 0),
                 "request_rate": None,
                 "request_history": [],
+                "endpoint_counts": _tunnel_endpoint_counts.get(name, {}),
                 "alert_threshold": _tunnel_alert_thresholds.get(name, 0),
             }
         poll = proc.poll()
@@ -1437,6 +1479,7 @@ def _get_tunnel_status(name):
                 "request_count": _tunnel_request_counts.get(name, 0),
                 "request_rate": None,
                 "request_history": [],
+                "endpoint_counts": _tunnel_endpoint_counts.get(name, {}),
                 "alert_threshold": _tunnel_alert_thresholds.get(name, 0),
             }
         # WHY: Tính rate từ history (diff giữa snapshot gần nhất với snapshot cách đây 60s)
@@ -1450,7 +1493,8 @@ def _get_tunnel_status(name):
             "uptime_seconds": uptime if uptime > 0 else None,
             "request_count": _tunnel_request_counts.get(name, 0),
             "request_rate": round(_tunnel_request_counts.get(name, 0) / uptime, 2) if uptime > 0 else 0,
-            "request_history": history[-20:] if history else [],
+            "request_history": history[-40:] if history else [],
+            "endpoint_counts": _tunnel_endpoint_counts.get(name, {}),
             "alert_threshold": _tunnel_alert_thresholds.get(name, 0),
         }
 
@@ -1493,11 +1537,17 @@ def _launch_tunnel_process(project_name, port):
                             _tunnel_status[pname] = "active"
                             _tunnel_started_at[pname] = time.time()
                         debug_log(f"Tunnel URL for {pname}: {url}")
-                        # WHY: Không break — tiếp tục đọc để đếm request
-                    # WHY: Đếm request từ log cloudflared (HTTP request/response lines)
-                    if 'http' in line.lower() and ('request' in line.lower() or 'response' in line.lower()):
+                        # WHY: Không break — tiếp tục đọc để debug (dù cloudflared 2026+ không log request ra stderr)
+                    # WHY: Parse metrics server port từ stderr để tránh hardcode 20241
+                    # Dòng log: "Starting metrics server on 127.0.0.1:PORT/metrics"
+                    metrics_port_match = re.search(r'Starting metrics server on 127\.0\.0\.1:(\d+)/metrics', line)
+                    if metrics_port_match:
+                        mp = int(metrics_port_match.group(1))
                         with _tunnel_lock:
-                            _tunnel_request_counts[pname] = _tunnel_request_counts.get(pname, 0) + 1
+                            _tunnel_metrics_ports[pname] = mp
+                        debug_log(f"[tunnel-{pname}] Metrics port: {mp}")
+                    # WHY: Request counting dùng metrics endpoint (cloudflared_tunnel_total_requests)
+                    # trong _request_history_worker thay vì parse stderr (cloudflared 2026.7 không còn log HTTP request lines)
                     if "error" in line.lower() or "failed" in line.lower():
                         with _tunnel_lock:
                             _tunnel_errors[pname] = line.strip()
@@ -1509,6 +1559,8 @@ def _launch_tunnel_process(project_name, port):
                         _tunnel_started_at.pop(pname, None)
                         _tunnel_request_counts.pop(pname, None)
                         _tunnel_request_history.pop(pname, None)
+                        _tunnel_endpoint_counts.pop(pname, None)
+                        _tunnel_metrics_ports.pop(pname, None)
                         if pname not in _tunnel_urls:
                             _tunnel_status[pname] = "stopped"
             except Exception as e:
@@ -1522,6 +1574,8 @@ def _launch_tunnel_process(project_name, port):
             _tunnel_processes.pop(project_name, None)
             _tunnel_errors[project_name] = str(e)
             _tunnel_status[project_name] = "error"
+            _tunnel_endpoint_counts.pop(project_name, None)
+            _tunnel_metrics_ports.pop(project_name, None)
         return False, str(e)
 
 # WHY: Shared stop helper — terminate + wait + kill (3-step graceful).
@@ -1541,6 +1595,8 @@ def _stop_tunnel_process(name):
         _tunnel_started_at.pop(name, None)
         _tunnel_request_counts.pop(name, None)
         _tunnel_request_history.pop(name, None)
+        _tunnel_endpoint_counts.pop(name, None)
+        _tunnel_metrics_ports.pop(name, None)
     
     if proc:
         try:
@@ -1587,6 +1643,8 @@ def _auto_restart_tunnel(project_name):
         _tunnel_started_at.pop(project_name, None)
         _tunnel_request_counts.pop(project_name, None)
         _tunnel_request_history.pop(project_name, None)
+        _tunnel_endpoint_counts.pop(project_name, None)
+        _tunnel_metrics_ports.pop(project_name, None)
         _tunnel_status[project_name] = "connecting"
     
     if old_proc:
@@ -2346,6 +2404,20 @@ def api_open_browser():
         return jsonify({"status": "opened", "url": url})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+# ─── Notification API ──────────────────────────────────────────
+@app.route("/api/notify", methods=["POST"])
+def api_notify():
+    """Gửi Windows toast notification.
+    POST JSON: {"title": "...", "message": "..."}
+    Dùng chung _show_windows_toast() với tunnel alert system."""
+    data = request.get_json() or {}
+    title = data.get("title", "MultiTool Pro")
+    message = data.get("message", "")
+    if not message:
+        return jsonify({"error": "Yêu cầu message"}), 400
+    ok = _show_windows_toast(title, message)
+    return jsonify({"sent": ok})
 
 # ═══════════════════════════════════════════════════════════════
 # DATABASE APIs — Quản lý PostgreSQL/MySQL (giống phpMyAdmin)
@@ -5646,6 +5718,36 @@ def api_shutdown():
     # Schedule shutdown
     threading.Thread(target=lambda: os._exit(0), daemon=True).start()
     return jsonify({"status": "shutting down"})
+
+@app.route('/api/preload', methods=['GET'])
+def api_preload():
+    """WHY: Preload endpoint — trả về tất cả dữ liệu khởi tạo một lần."""
+    debug_log("Preload requested")
+    try:
+        projects = []
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                conf = json.load(f)
+            for p in conf.get('projects', []):
+                name = p.get('name', '')
+                projects.append({
+                    'name': name,
+                    'port': p.get('port', 3000),
+                    'path': p.get('path', ''),
+                    'command': p.get('command', ''),
+                    'running': is_running(name)
+                })
+        result = {
+            'status': 'ready',
+            'projects': projects,
+        }
+        return jsonify(result)
+    except Exception as e:
+        debug_log(f"Preload error: {e}")
+        return jsonify({'status': 'ready', 'projects': []})
+
+
+
 
 @app.route("/")
 def index():

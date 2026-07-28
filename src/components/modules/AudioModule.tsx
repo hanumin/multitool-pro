@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { AudioDevice, MicStatus } from '../../types'
+import { AudioDevice, MicStatus, type PreloadedData } from '../../types'
 
 import { API, fetchWithRetry } from '../../utils/apiFetch'
+import { useToast } from '../../components/ToastManager'
 
 
 interface AudioSession {
@@ -25,14 +26,23 @@ interface AudioSettings {
 interface AudioModuleProps {
   theme: 'dark' | 'light'
   setStatusText: (t: string) => void
+  inactive?: boolean
+  backgroundPolling?: boolean
+  onBackgroundPollingChange?: (enabled: boolean) => void
+  preloadedData?: PreloadedData
 }
 
 // WHY: Module quan ly am thanh — mic status, devices, timer, widget.
 // Polling: fetchAll 5s, fetchMicStatus 1s.
 // Widget mode: overlay nho hien thi mic status + timer.
-export default function AudioModule({ theme, setStatusText }: AudioModuleProps) {
+export default function AudioModule({ theme, setStatusText, inactive, backgroundPolling, onBackgroundPollingChange, preloadedData }: AudioModuleProps) {
+  const { addToast } = useToast()
   const [micStatus, setMicStatus] = useState<MicStatus | null>(null)
-  const [devices, setDevices] = useState<AudioDevice[]>([])
+  // WHY: Dùng preloaded data để skip loading flash.
+  // audioDevices chứa devices list từ LoadingScreen.
+  const preloadedDevices = preloadedData?.audioDevices?.devices
+  const preloadedAudioSettings = preloadedData?.audioSettings
+  const [devices, setDevices] = useState<AudioDevice[]>(preloadedDevices || [])
   const [selectedDevice, setSelectedDevice] = useState<number | null>(null)
   const [volume, setVolume] = useState(0)
   const [muted, setMuted] = useState(false)
@@ -53,7 +63,8 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
   const [audioSettings, setAudioSettings] = useState<AudioSettings>({
     sound_enabled: true, selected_sound: null, icon_theme: '1',
     color_mic_on: '#3498DB', color_mic_off: '#E74C3C',
-    show_widget_on_mic: false, always_on_top: false, widget_opacity: 1.0
+    show_widget_on_mic: false, always_on_top: false, widget_opacity: 1.0,
+    ...((preloadedAudioSettings as Partial<AudioSettings>) || {}),
   })
   const [soundFiles, setSoundFiles] = useState<string[]>([])
   const [sessionHistory, setSessionHistory] = useState<AudioSession[]>([])
@@ -94,8 +105,11 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
         const data = await historyRes.json()
         setSessionHistory(data.sessions || [])
       }
-    } catch { setStatusText('Đang kết nối lại...') }
-  }, [setStatusText])
+    } catch {
+      setStatusText('Đang kết nối lại...')
+      addToast({ type: 'warning', title: '🔌 Mất kết nối âm thanh', message: 'Không thể kết nối tới backend' })
+    }
+  }, [setStatusText, addToast])
 
   // WHY: Dùng refs để fetchMicStatus (chạy mỗi 1s) không cần re-create.
   // Nếu dùng state trực tiếp, useCallback phải rebuild mỗi khi state thay đổi → interval bị clear/reset.
@@ -119,9 +133,10 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
         
         // Timer management
         if (data.active && !previousWasActiveRef.current) {
-          // Mic just turned on
-          setSessionTimer(0)
-          previousWasActiveRef.current = true
+            // Mic just turned on
+            setSessionTimer(0)
+            previousWasActiveRef.current = true
+            addToast({ type: 'info', title: '🎤 Mic đang hoạt động', message: data.mic_name || 'Mic đã bật' })
           // Play alert sound if enabled
           if (settings.sound_enabled) {
             try {
@@ -145,6 +160,7 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
           // Mic just turned off - save session
           previousWasActiveRef.current = false
           setLastSessionDuration(sessionTimerRef.current)
+          addToast({ type: 'info', title: '🎤 Mic đã tắt', message: `Phiên mic kéo dài ${Math.floor(sessionTimerRef.current / 60)} phút` })
           // Auto-hide widget if enabled
           if (settings.show_widget_on_mic && widgetModeRef.current) {
             setWidgetMode(false)
@@ -188,14 +204,16 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
     }
   }, [micStatus?.active])
 
-  // Load data
+  // WHY: Polling audio — chỉ chạy khi module active. Khi inactive: clear intervals.
+  // fetchMicStatus 1s là interval nặng nhất (gọi API mỗi giây).
   useEffect(() => {
+    if (inactive && !backgroundPolling) return
     fetchAll()
     fetchMicStatus()
     const i1 = setInterval(fetchAll, 5000)
     const i2 = setInterval(fetchMicStatus, 1000)
     return () => { clearInterval(i1); clearInterval(i2) }
-  }, [fetchAll, fetchMicStatus])
+  }, [fetchAll, fetchMicStatus, inactive, backgroundPolling])
 
   // Device selection
   useEffect(() => {
@@ -208,10 +226,21 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
   // WHY: Toggle mute device — POST mute API + fetchAll refresh.
   // Local state muted cap nhat ngay (optimistic UI).
   const toggleMute = async (id: number) => {
+    const dev = devices.find(d => d.id === id)
+    const wasMuted = muted
     try {
       const res = await fetchWithRetry(`${API}/api/audio/devices/${id}/mute`, { method: 'POST' })
-      if (res.ok) { setMuted(!muted); fetchAll() }
-    } catch {}
+      if (res.ok) {
+        setMuted(!wasMuted)
+        fetchAll()
+        addToast({ type: 'success', title: wasMuted ? '🔊 Bật tiếng' : '🔇 Tắt tiếng', message: `${dev?.name || 'Thiết bị'} đã ${wasMuted ? 'bật' : 'tắt'} tiếng` })
+      } else {
+        const errData = await res.json().catch(() => ({ error: 'Lỗi không xác định' }))
+        addToast({ type: 'error', title: '🔇 Thao tác thất bại', message: errData.error })
+      }
+    } catch {
+      addToast({ type: 'error', title: '🔌 Mất kết nối', message: 'Không thể kết nối tới backend' })
+    }
   }
 
   // WHY: Set volume — PUT volume API + local state.
@@ -231,8 +260,14 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
   const setDefaultDevice = async (id: number) => {
     try {
       const res = await fetchWithRetry(`${API}/api/audio/devices/${id}/default`, { method: 'POST' })
-      if (res.ok) { setStatusText('Đã đặt mặc định'); fetchAll() }
-    } catch { setStatusText('Thất bại') }
+      if (res.ok) {
+        setStatusText('Đã đặt mặc định'); fetchAll()
+        addToast({ type: 'success', title: '🔊 Thiết bị âm thanh', message: 'Đã đặt làm mặc định' })
+      }
+    } catch {
+      setStatusText('Thất bại')
+      addToast({ type: 'error', title: '🔊 Lỗi', message: 'Đặt thiết bị mặc định thất bại' })
+    }
   }
 
   // WHY: Save audio settings (sound, widget opacity, colors).
@@ -243,8 +278,14 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(audioSettings)
       })
-      if (res.ok) { setStatusText('Đã lưu cài đặt'); setSettingsOpen(false) }
-    } catch { setStatusText('Thất bại') }
+      if (res.ok) {
+        setStatusText('Đã lưu cài đặt'); setSettingsOpen(false)
+        addToast({ type: 'success', title: '⚙️ Cài đặt âm thanh', message: 'Đã lưu cài đặt' })
+      }
+    } catch {
+      setStatusText('Thất bại')
+      addToast({ type: 'error', title: '⚙️ Lưu thất bại', message: 'Không thể lưu cài đặt âm thanh' })
+    }
   }
 
   // WHY: Dùng window-level event listeners để drag không bị giới hạn bởi kích thước component.
@@ -281,8 +322,8 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
   const activeColor = audioSettings.color_mic_on || '#3498DB'
   const inactiveColor = audioSettings.color_mic_off || '#E74C3C'
 
-  // Widget mode overlay
-  if (widgetMode) {
+  // Widget mode overlay — ẩn khi module inactive (tránh floating widget trên tab khác)
+  if (widgetMode && !inactive) {
     return (
       <div className="fixed" style={{
         left: widgetPos.x, top: widgetPos.y,
@@ -327,7 +368,7 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
   }
 
   return (
-    <div className="flex flex-col h-full p-4 gap-4">
+    <div className="flex flex-col h-full p-4 gap-4" style={{ display: inactive ? 'none' : 'flex' }}>
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
@@ -335,6 +376,16 @@ export default function AudioModule({ theme, setStatusText }: AudioModuleProps) 
           <p className="text-xs" style={{ color: 'var(--fg-muted)' }}>{devices.length} thiết bị · {sessionHistory.length} phiên</p>
         </div>
         <div className="flex gap-2">
+          {onBackgroundPollingChange && (
+            <button onClick={() => onBackgroundPollingChange(!backgroundPolling)}
+              className="flex items-center gap-1 px-2 py-1.5 text-[10px] font-medium rounded-lg border transition-all active:scale-95 cursor-pointer"
+              style={{ backgroundColor: backgroundPolling ? 'rgba(52,211,153,0.1)' : 'var(--input-bg)', borderColor: 'var(--border)', color: backgroundPolling ? '#34d399' : 'var(--fg-muted)' }}>
+              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+              </svg>
+              Nền: {backgroundPolling ? 'BẬT' : 'TẮT'}
+            </button>
+          )}
           <button onClick={() => setWidgetMode(true)}
             className="px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-all active:scale-95 cursor-pointer"
             style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
