@@ -1,5 +1,5 @@
 @echo off
-cd /d "C:\Users\Nguyen Thanh Dat\Desktop\Multi-App\Server-Dashboard"
+cd /d "C:\Users\nguyenthanhdat_pc\Desktop\Multi-App\Server-Dashboard"
 echo ==========================================
 echo    MultiTool Pro - Restart Backend
 echo ==========================================

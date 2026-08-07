@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **Server-Dashboard** (821 symbols, 877 relationships, 5 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **multitool-pro** (2076 symbols, 2791 relationships, 68 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -24,10 +24,10 @@ This project is indexed by GitNexus as **Server-Dashboard** (821 symbols, 877 re
 
 | Resource | Use for |
 |----------|---------|
-| `gitnexus://repo/Server-Dashboard/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/Server-Dashboard/clusters` | All functional areas |
-| `gitnexus://repo/Server-Dashboard/processes` | All execution flows |
-| `gitnexus://repo/Server-Dashboard/process/{name}` | Step-by-step execution trace |
+| `gitnexus://repo/multitool-pro/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/multitool-pro/clusters` | All functional areas |
+| `gitnexus://repo/multitool-pro/processes` | All execution flows |
+| `gitnexus://repo/multitool-pro/process/{name}` | Step-by-step execution trace |
 
 ## CLI
 

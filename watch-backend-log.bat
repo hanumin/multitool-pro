@@ -1,6 +1,6 @@
 @echo off
 title MultiTool Pro - Backend Log (ALL)
-cd /d "C:\Users\Nguyen Thanh Dat\Desktop\Server-Dashboard"
+cd /d "C:\Users\nguyenthanhdat_pc\Desktop\Multi-App\Server-Dashboard"
 
 echo ============================================
 echo  MultiTool Pro - Log Thoi Gian Thuc
