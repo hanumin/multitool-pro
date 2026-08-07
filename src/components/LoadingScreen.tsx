@@ -191,6 +191,7 @@ export default function LoadingScreen({ onComplete }: Props) {
 
   useEffect(() => {
     let cancelled = false
+    // WHY: Hàm async xử lý khởi chạy và lắng nghe kết quả preload API.
     const run = async () => {
       // WHY: Fire tất cả API calls song song ngay từ đầu.
       // Khi mỗi promise resolve, step tương ứng được đánh dấu hoàn thành.

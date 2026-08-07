@@ -147,6 +147,7 @@ pub fn run() {
                     }
                 }
                 tauri::WindowEvent::Focused(false) => {
+                    // WHY: Tự động ẩn cửa sổ tray_menu khi mất focus (click bên ngoài).
                     if window.label() == "tray_menu" {
                         let _ = window.hide();
                     }

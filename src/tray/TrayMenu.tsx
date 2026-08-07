@@ -8,10 +8,11 @@ interface ModuleItem {
   icon: React.ReactNode;
 }
 
+// WHY: Component hiển thị menu thanh công cụ hệ thống (tray menu) với danh sách chức năng và thao tác nhanh.
 export default function TrayMenu() {
   const [audioWidgetActive, setAudioWidgetActive] = useState<boolean>(false);
   const [runningServices, setRunningServices] = useState<number>(3);
-  const [totalServices] = useState<number>(7);
+  const [totalServices, setTotalServices] = useState<number>(7);
 
   useEffect(() => {
     setAudioWidgetActive(isAudioWidgetOpen());
@@ -21,6 +22,52 @@ export default function TrayMenu() {
     return () => unsubscribe();
   }, []);
 
+  // WHY: Lắng nghe sự kiện blur để tự động ẩn window tray_menu khi người dùng click ra ngoài.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    import('@tauri-apps/api/window').then(({ getCurrentWindow }) => {
+      const win = getCurrentWindow();
+      win.listen('tauri://blur', () => {
+        win.hide();
+      }).then(un => { unlisten = un; });
+    });
+    return () => { if (unlisten) unlisten(); };
+  }, []);
+
+  // WHY: Cập nhật động số lượng service đang chạy từ Flask API hoặc window.__serverStatus.
+  useEffect(() => {
+    const fetchStatus = async () => {
+      try {
+        if (typeof window !== 'undefined' && (window as any).__serverStatus) {
+          const s = (window as any).__serverStatus;
+          if (typeof s.running === 'number') setRunningServices(s.running);
+          if (typeof s.total === 'number') setTotalServices(s.total);
+          return;
+        }
+        const res = await fetch('http://127.0.0.1:5050/api/status').catch(() => null);
+        if (res && res.ok) {
+          const data = await res.json();
+          if (typeof data.running === 'number') setRunningServices(data.running);
+          if (typeof data.total === 'number') setTotalServices(data.total);
+        } else {
+          const projRes = await fetch('http://127.0.0.1:5050/api/projects').catch(() => null);
+          if (projRes && projRes.ok) {
+            const projects = await projRes.json();
+            if (Array.isArray(projects)) {
+              setTotalServices(projects.length);
+              setRunningServices(projects.filter((p: any) => p.running).length);
+            }
+          }
+        }
+      } catch {}
+    };
+
+    fetchStatus();
+    const interval = setInterval(fetchStatus, 3000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // WHY: Mở & focus main window, thực thi IPC action (openSettings hoặc navigateModule) trên main window qua eval, sau đó ẩn tray_menu.
   const openDashboard = async (moduleId?: string) => {
     try {
       const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
@@ -29,8 +76,11 @@ export default function TrayMenu() {
         await mainWindow.show();
         await mainWindow.setFocus();
         if (moduleId) {
-          const { emit } = await import('@tauri-apps/api/event');
-          await emit('navigate-module', moduleId);
+          if (moduleId === 'settings') {
+            await (mainWindow as any).eval('window.__openSettings?.()');
+          } else {
+            await (mainWindow as any).eval(`window.__navigateModule?.('${moduleId}')`);
+          }
         }
       }
       const trayWindow = await WebviewWindow.getByLabel('tray_menu');
@@ -42,26 +92,49 @@ export default function TrayMenu() {
     }
   };
 
+  // WHY: Gửi lệnh start all tới main window qua eval và ẩn tray_menu window.
   const handleStartAll = async () => {
-    setRunningServices(7);
+    setRunningServices(totalServices);
     try {
-      const { emit } = await import('@tauri-apps/api/event');
-      await emit('tray-action-start-all');
-    } catch {}
+      const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+      const mainWindow = await WebviewWindow.getByLabel('main');
+      if (mainWindow) {
+        await (mainWindow as any).eval('window.__startAll?.()');
+      }
+      const trayWindow = await WebviewWindow.getByLabel('tray_menu');
+      if (trayWindow) {
+        await trayWindow.hide();
+      }
+    } catch (err) {
+      console.warn('[TrayMenu] handleStartAll error:', err);
+    }
   };
 
+  // WHY: Gửi lệnh stop all tới main window qua eval và ẩn tray_menu window.
   const handleStopAll = async () => {
     setRunningServices(0);
     try {
-      const { emit } = await import('@tauri-apps/api/event');
-      await emit('tray-action-stop-all');
-    } catch {}
+      const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+      const mainWindow = await WebviewWindow.getByLabel('main');
+      if (mainWindow) {
+        await (mainWindow as any).eval('window.__stopAll?.()');
+      }
+      const trayWindow = await WebviewWindow.getByLabel('tray_menu');
+      if (trayWindow) {
+        await trayWindow.hide();
+      }
+    } catch (err) {
+      console.warn('[TrayMenu] handleStopAll error:', err);
+    }
   };
 
+  // WHY: Bật/tắt Widget Âm thanh và tự động cập nhật state local.
   const handleToggleAudioWidget = () => {
     toggleAudioWidget({ width: 200, height: 200 }).catch(() => {});
+    setAudioWidgetActive((prev) => !prev);
   };
 
+  // WHY: Gửi lệnh thoát ứng dụng hoàn toàn thông qua plugin-process exit(0).
   const handleQuit = async () => {
     try {
       const { exit } = await import('@tauri-apps/plugin-process');
