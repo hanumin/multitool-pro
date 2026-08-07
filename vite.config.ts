@@ -32,6 +32,7 @@ export default defineConfig({
       input: {
         main: resolve(__dirname, 'index.html'),
         widget: resolve(__dirname, 'widget.html'),
+        tray: resolve(__dirname, 'tray.html'),
       },
       output: {
         manualChunks: {
