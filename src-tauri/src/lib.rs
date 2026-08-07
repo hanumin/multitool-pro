@@ -97,7 +97,7 @@ pub fn run() {
                 tauri::WebviewUrl::App("tray.html".into()),
             )
             .title("MultiTool Pro Menu")
-            .inner_size(300.0, 420.0)
+            .inner_size(320.0, 490.0)
             .decorations(false)
             .transparent(true)
             .always_on_top(true)

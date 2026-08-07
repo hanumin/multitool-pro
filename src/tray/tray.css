@@ -29,50 +29,54 @@ html, body, #tray-root {
   height: 100%;
   display: flex;
   flex-direction: column;
-  background: rgba(15, 23, 42, 0.82);
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(15, 23, 42, 0.88);
+  backdrop-filter: blur(28px) saturate(190%);
+  -webkit-backdrop-filter: blur(28px) saturate(190%);
+  border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 14px;
-  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
-  padding: 10px;
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.65);
+  padding: 12px;
   color: #f8fafc;
   overflow: hidden;
   box-sizing: border-box;
 }
 
-/* Zero left margin alignment for list items */
+/* Zero left margin alignment with comfortable touch/click spacing */
 .tray-menu-item {
   width: 100%;
+  min-height: 38px;
   margin-left: 0 !important;
   margin-right: 0 !important;
-  padding: 6px 8px;
+  margin-bottom: 3px;
+  padding: 8px 10px;
   border-radius: 8px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 500;
-  color: #cbd5e1;
+  line-height: 1.4;
+  color: #e2e8f0;
   background: transparent;
   border: none;
   cursor: pointer;
   transition: all 0.15s cubic-bezier(0.16, 1, 0.3, 1);
   text-align: left;
+  box-sizing: border-box;
 }
 
 .tray-menu-item:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.09);
   color: #ffffff;
 }
 
 .tray-menu-item:active {
-  background: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.15);
   transform: scale(0.985);
 }
 
 .tray-menu-item-danger:hover {
-  background: rgba(239, 68, 68, 0.15);
+  background: rgba(239, 68, 68, 0.18);
   color: #fca5a5;
 }
 
@@ -147,3 +151,4 @@ html, body, #tray-root {
 .tray-scroll-container::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, 0.3);
 }
+
