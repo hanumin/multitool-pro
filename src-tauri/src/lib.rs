@@ -1,7 +1,7 @@
 use std::process::{Child, Command};
 use std::sync::Mutex;
 use tauri::{
-    menu::{MenuBuilder, MenuItemBuilder},
+    menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager,
 };
@@ -65,6 +65,7 @@ pub fn run() {
         .args(["backend/app.py", "5050"])
         .current_dir(&project_root)
         .env("SERVER_DASHBOARD_EXE", &exe_path_str)
+        .env("MULTITOOL_PRO_EXE", &exe_path_str)
         .spawn()
         .ok();
 
@@ -110,16 +111,64 @@ pub fn run() {
         .manage(FlaskProcess(Mutex::new(flask)))
         .invoke_handler(tauri::generate_handler![get_backend_url, update_tray_status])
         .setup(|app| {
-            let open = MenuItemBuilder::with_id("open", "Open Dashboard").build(app)?;
-            let start_all = MenuItemBuilder::with_id("start_all", "Start All").build(app)?;
-            let stop_all = MenuItemBuilder::with_id("stop_all", "Stop All").build(app)?;
-            let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+            // --- ULTRA-COMPACT SYSTEM TRAY CONTEXT MENU ---
+            // WHY: KHÔNG dùng emoji trong native Windows menu.
+            // Windows native menus không render được emoji → chúng xuất hiện
+            // như ký tự vô hình, tạo khoảng trống giữa lề trái và text.
+            //
+            // 1. Title Header Bar
+            let title_header = MenuItemBuilder::with_id("title", "MultiTool Pro v1.11.3")
+                .enabled(false)
+                .build(app)?;
+
+            // 2. Main Dashboard & Batch Controls
+            let open_dash = MenuItemBuilder::with_id("open", "Mở Dashboard").build(app)?;
+            let start_all = MenuItemBuilder::with_id("start_all", "Bắt đầu tất cả máy chủ").build(app)?;
+            let stop_all = MenuItemBuilder::with_id("stop_all", "Dừng tất cả máy chủ").build(app)?;
+
+            // 2b. Audio Widget Toggle
+            let toggle_widget = MenuItemBuilder::with_id("toggle_widget", "Bật/Tắt Widget Âm thanh").build(app)?;
+
+            // 3. Quick Navigation Submenu for All 7 Modules
+            let nav_servers = MenuItemBuilder::with_id("nav_servers", "Máy chủ Web").build(app)?;
+            let nav_printers = MenuItemBuilder::with_id("nav_printers", "Máy in").build(app)?;
+            let nav_audio = MenuItemBuilder::with_id("nav_audio", "Âm thanh Studio").build(app)?;
+            let nav_tunnels = MenuItemBuilder::with_id("nav_tunnels", "Cloudflare Tunnel").build(app)?;
+            let nav_database = MenuItemBuilder::with_id("nav_database", "Cơ sở dữ liệu").build(app)?;
+            let nav_logs = MenuItemBuilder::with_id("nav_logs", "Terminal Logs").build(app)?;
+            let nav_copier = MenuItemBuilder::with_id("nav_copier", "Sao chép tập tin").build(app)?;
+
+            let modules_submenu = SubmenuBuilder::new(app, "Chuyển phân hệ")
+                .item(&nav_servers)
+                .item(&nav_printers)
+                .item(&nav_audio)
+                .item(&nav_tunnels)
+                .item(&nav_database)
+                .item(&nav_logs)
+                .item(&nav_copier)
+                .build()?;
+
+            // 4. Utility Items
+            let settings = MenuItemBuilder::with_id("settings", "Cài đặt").build(app)?;
+            let check_updates = MenuItemBuilder::with_id("check_updates", "Kiểm tra cập nhật").build(app)?;
+            let about = MenuItemBuilder::with_id("about", "Giới thiệu").build(app)?;
+
+            // 5. Quit Item
+            let quit = MenuItemBuilder::with_id("quit", "Thoát").build(app)?;
 
             let menu = MenuBuilder::new(app)
-                .item(&open)
+                .item(&title_header)
                 .separator()
+                .item(&open_dash)
                 .item(&start_all)
                 .item(&stop_all)
+                .separator()
+                .item(&modules_submenu)
+                .item(&toggle_widget)
+                .separator()
+                .item(&settings)
+                .item(&check_updates)
+                .item(&about)
                 .separator()
                 .item(&quit)
                 .build()?;
@@ -130,7 +179,7 @@ pub fn run() {
             }
 
             tray_builder
-                .tooltip("Server Dashboard")
+                .tooltip("MultiTool Pro - Hệ thống Quản trị Nội bộ")
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => show_window(app),
@@ -142,6 +191,72 @@ pub fn run() {
                     "stop_all" => {
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.eval("window.__stopAll?.()");
+                        }
+                    }
+                    "nav_servers" => {
+                        show_window(app);
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.eval("window.__navigateModule?.('servers')");
+                        }
+                    }
+                    "nav_printers" => {
+                        show_window(app);
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.eval("window.__navigateModule?.('printers')");
+                        }
+                    }
+                    "nav_audio" => {
+                        show_window(app);
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.eval("window.__navigateModule?.('audio')");
+                        }
+                    }
+                    "nav_tunnels" => {
+                        show_window(app);
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.eval("window.__navigateModule?.('tunnels')");
+                        }
+                    }
+                    "nav_database" => {
+                        show_window(app);
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.eval("window.__navigateModule?.('database')");
+                        }
+                    }
+                    "nav_logs" => {
+                        show_window(app);
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.eval("window.__navigateModule?.('logs')");
+                        }
+                    }
+                    "nav_copier" => {
+                        show_window(app);
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.eval("window.__navigateModule?.('file-copier')");
+                        }
+                    }
+                    "settings" => {
+                        show_window(app);
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.eval("window.__openSettings?.()");
+                        }
+                    }
+                    "check_updates" => {
+                        show_window(app);
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.eval("window.__checkUpdates?.()");
+                        }
+                    }
+                    "toggle_widget" => {
+                        show_window(app);
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.eval("window.__toggleAudioWidget?.()");
+                        }
+                    }
+                    "about" => {
+                        show_window(app);
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.eval("window.__openAbout?.()");
                         }
                     }
                     "quit" => {
@@ -174,9 +289,11 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                // Hide to tray instead of closing
-                let _ = window.hide();
-                api.prevent_close();
+                // WHY: Chỉ main window hide xuống tray. Widget window (audio-widget) đóng thật.
+                if window.label() == "main" {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
             }
         })
         .run(tauri::generate_context!())

@@ -1,10 +1,11 @@
-import json, os, subprocess, sys, time, threading, signal, shutil
+import json, os, subprocess, sys, time, threading, signal, shutil, re
 import psutil
 import pythoncom
 from pathlib import Path
 from flask import Flask, jsonify, request, Response, send_from_directory
 from flask_cors import CORS
 from datetime import datetime, timedelta
+from detector import detect_project
 
 # Thư mục gốc của project (chứa backend/, dist/, ...)
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -146,12 +147,182 @@ def _bump_config_version():
 def get_log_file(proj):
     return Path(os.environ.get("TEMP", os.environ.get("TMP", "/tmp"))) / f"sd_{proj['name']}.log"
 
+# WHY: Giới hạn mặc định khi đọc log — log file có thể lên tới 100MB, frontend
+# chỉ cần ~300 dòng cuối mỗi project. Đọc full file mỗi 5s là nghẽn I/O vô ích.
+LOG_TAIL_LIMIT = 2000
+LOG_ROTATE_MAX_BYTES = 10 * 1024 * 1024
+LOG_ROTATE_KEEP_LINES = 5000
+
+# WHY: Đọc N dòng cuối từ file log — seek ngược từ cuối theo chunk, không load
+# toàn bộ file vào memory (log có thể 100MB).
+# QUAN TRỌNG: f phải mở BINARY ("rb"). Text mode + Windows CRLF không an toàn
+# khi seek ngược: chunk boundary cắt ngang cặp \r\n → universal newline translate
+# \r một mình thành \n → sinh dòng rỗng giả → slice(-limit) mất dòng thật.
+def _read_tail_lines(f, limit):
+    f.seek(0, 2)  # SEEK_END
+    size = f.tell()
+    if size == 0:
+        return []
+    pos = size
+    buf = b""
+    chunk = 65536
+    while pos > 0 and buf.count(b"\n") <= limit:
+        read_len = min(chunk, pos)
+        pos -= read_len
+        f.seek(pos)
+        buf = f.read(read_len) + buf
+    text = buf.decode("utf-8", errors="replace")
+    lines = []
+    for l in text.split("\n"):
+        # Boundary: cặp \r\n bị cắt → "\n" cuối chunk trước + "\r" đầu chunk sau
+        # → dòng đầu chunk bị dính \r thừa. Strip 1 leading \r (log thật không
+        # bao giờ bắt đầu bằng \r — đó chỉ là control char của spinner/loader).
+        if l.startswith("\r"):
+            l = l[1:]
+        l = l.rstrip("\r")
+        if l:
+            lines.append(l)
+    if pos > 0:
+        # Cắt giữa file → bỏ dòng đầu (có thể bị cắt nửa chừng giữa buffer)
+        lines = lines[1:]
+    return lines[-limit:]
+
+# WHY: Rotation best-effort — log > 10MB → truncate giữ 5000 dòng cuối.
+# Windows: child process (node.exe) có thể khóa file (WinError 32) → skip lần này,
+# lần sau gọi lại khi process giải phóng handle.
+def _rotate_log_if_needed(lf):
+    try:
+        if not lf.exists():
+            return
+        size = lf.stat().st_size
+        if size <= LOG_ROTATE_MAX_BYTES:
+            return
+        with open(lf, "rb") as f:
+            lines = _read_tail_lines(f, LOG_ROTATE_KEEP_LINES)
+        with open(lf, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + ("\n" if lines else ""))
+        debug_log(f"Rotated log {lf.name}: {size} -> {lf.stat().st_size} bytes")
+    except PermissionError:
+        debug_log(f"Log rotate SKIP (file locked): {lf.name}")
+    except Exception as e:
+        debug_log(f"Log rotate error {lf.name}: {e}")
+
+# WHY: Whitelist tên process dev server — dùng chung cho kill_process_on_port()
+# và is_running() fallback (tránh lệch giữa 2 nơi, làm is_running báo sai).
+DEV_SERVER_WHITELIST = ['node.exe', 'node', 'npm.exe', 'npm', 'cmd.exe', 'next.exe', 'next', 'python.exe', 'python']
+
+# WHY: Cache kết quả kiểm tra port listening (TTL 2s). is_running() được gọi từ
+# /api/projects mỗi 5s + diagnostics mỗi 2s — không thể quét psutil.net_connections
+# mỗi lần gọi (tốn CPU, hàng trăm connections).
+_port_listen_cache = {}  # port -> (running: bool, timestamp)
+
+# WHY: Tìm PID của process đang LISTEN trên port. Dùng psutil.net_connections
+# (1 lần quét tất cả TCP tại PID) thay vì iterate từng process + connections()
+# như kill_process_on_port — nhanh hơn nhiều và chính xác hơn.
+def _pids_listening_on_port(port):
+    pids = set()
+    try:
+        for conn in psutil.net_connections(kind='tcp'):
+            try:
+                if conn.status == "LISTEN" and conn.laddr and conn.laddr.port == port and conn.pid:
+                    pids.add(conn.pid)
+            except Exception:
+                continue
+    except (psutil.AccessDenied, psutil.Error):
+        return set()
+    return pids
+
+# WHY: Wrapper names — cmd.exe/npm.exe là cha (chạy script), KHÔNG phải dev-server
+# thật. Dùng để chọn canonical PID + xếp thứ tự kill.
+_WRAPPER_NAMES = ("cmd.exe", "npm.exe", "npm", "sh", "bash")
+
+def _build_ppid_map():
+    """Snapshot (pid → ppid) 1 lần từ process_iter — tránh gọi proc.parent() lặp
+    (race condition + chậm)."""
+    try:
+        return {p.pid: p.ppid for p in psutil.process_iter(["pid", "ppid"])}
+    except Exception:
+        return {}
+
+# WHY: Độ sâu cây từ pid lên tới root — seen set chống vòng lặp, cap 64.
+# Lá sâu nhất trong cây là process dev thật (không phải wrapper cmd.exe).
+def _tree_depth(pid, ppid_map, max_depth=64):
+    """Độ sâu cây từ pid lên tới root."""
+    depth = 0
+    seen = set()
+    cur = pid
+    while cur in ppid_map and ppid_map.get(cur) and cur not in seen and depth < max_depth:
+        seen.add(cur)
+        cur = ppid_map[cur]
+        depth += 1
+    return depth
+
+# WHY: Chọn PID "chính" đại diện dev-server trên port (dùng cho diagnostics/uptime).
+# Trước đây lấy pids[0] bừa — có thể là cmd.exe wrapper (cha) thay vì node.exe thật.
+# Thứ tự ưu tiên: (1) dev thật (node.exe/next.exe/python.exe) > wrapper,
+# (2) lá sâu nhất trong cây (process thật nằm ở đáy), (3) RSS lớn nhất,
+# (4) create_time cũ nhất (PID có thể bị recycle nhanh).
+def _canonical_pid_for_port(port):
+    pids = list(_pids_listening_on_port(port))
+    if not pids:
+        return None
+    if len(pids) == 1:
+        return pids[0]
+    ppid_map = _build_ppid_map()
+    best, best_key = None, None
+    for pid in pids:
+        try:
+            proc = psutil.Process(pid)
+            name = proc.name().lower()
+            rss = proc.memory_info().rss
+            create = proc.create_time()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        wrapper = 1 if any(w in name for w in _WRAPPER_NAMES) else 0
+        key = (wrapper, -_tree_depth(pid, ppid_map), -rss, -create)
+        if best_key is None or key < best_key:
+            best_key, best = key, pid
+    return best or pids[0]
+
+# WHY: Kiểm tra liveness của dev-server bằng PORT-PROBE: port nào có process
+# whitelist đang LISTEN thì coi là chạy (KHÔNG tin PID lưu trên đĩa — root cause
+# bug "server đang chạy hiển thị không chạy"). Cache 2s tránh quét psutil mỗi call.
+def _is_port_running_for_dev(port):
+    """Trả về True nếu có process thuộc whitelist dev server đang LISTEN trên port."""
+    now = time.time()
+    hit = _port_listen_cache.get(port)
+    if hit and now - hit[1] < 2.0:
+        return hit[0]
+    result = False
+    for pid in _pids_listening_on_port(port):
+        try:
+            name = psutil.Process(pid).name().lower()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        if any(w in name for w in DEV_SERVER_WHITELIST):
+            result = True
+            break
+    _port_listen_cache[port] = (result, now)
+    return result
+
 # WHY: Kiểm tra process còn sống bằng poll() — không dùng returncode vì process có thể vừa chết.
-# Thread-safe (with lock). p.poll() = None nghĩa là process vẫn đang chạy.
+# Thread-safe: process sẽ chạy trong processes dict.
+# FIX: Trước đây chỉ check processes dict → server chạy ngoài app (hoặc backend restart,
+# node.exe orphan từ phiên cũ) hiển thị "không chạy" dù server thực sự đang chiếm port.
+# Fallback: kiểm tra port thực tế đang được dev-server LISTEN.
 def is_running(name):
     with lock:
         p = processes.get(name)
-        return p is not None and p.poll() is None
+        if p is not None and p.poll() is None:
+            return True
+    proj = get_project(name)
+    if proj is not None:
+        try:
+            if _is_port_running_for_dev(proj.get("port")):
+                return True
+        except Exception:
+            pass
+    return False
 
 # WHY: Tìm project trong config.projects theo name. O(n) nhưng n nhỏ (< 20).
 # Trả về None nếu không tìm thấy — caller xử lý 404.
@@ -326,11 +497,10 @@ def api_logs(name):
     if not lf.exists():
         return jsonify({"lines": []})
 
-    with open(lf, encoding="utf-8", errors="replace") as f:
-        content = f.read()
+    with open(lf, "rb") as f:
+        lines = _read_tail_lines(f, 200)
 
-    lines = [l for l in content.split("\n") if l]
-    return jsonify({"lines": lines[-200:]})
+    return jsonify({"lines": lines})
 
 @app.route("/api/projects/<name>/logs/stream")
 # WHY: Server-Sent Events (SSE) — không phải WebSocket. Đơn giản hơn, native HTTP.
@@ -347,6 +517,11 @@ def api_logs_stream(name):
         while True:
             if lf.exists():
                 with open(lf, encoding="utf-8", errors="replace") as f:
+                    # WHY: File có thể bị truncate/rotate bên ngoài → pos cũ vượt quá
+                    # kích thước mới → stream kẹt (f.read() trả rỗng vĩnh viễn).
+                    f.seek(0, 2)
+                    if pos > f.tell():
+                        pos = 0
                     if pos > 0:
                         f.seek(pos)
                     new_data = f.read()
@@ -362,57 +537,89 @@ def api_logs_stream(name):
 @app.route("/api/logs/all")
 # WHY: Gộp tất cả log files vào 1 response (key=project name).
 # Frontend dùng để render log tabs (All + từng project).
+# Cap theo ?limit= (mặc định 2000) — trước đây đọc FULL file mỗi 5s (nghẽn I/O).
 def api_logs_all():
+    limit = request.args.get("limit", default=LOG_TAIL_LIMIT, type=int)
+    limit = max(100, min(limit, 10000))
     all_lines = {}
     for p in config["projects"]:
         lf = get_log_file(p)
+        _rotate_log_if_needed(lf)
         if lf.exists():
-            with open(lf, encoding="utf-8", errors="replace") as f:
-                all_lines[p["name"]] = [l for l in f.read().split("\n") if l]
+            with open(lf, "rb") as f:
+                all_lines[p["name"]] = _read_tail_lines(f, limit)
         else:
             all_lines[p["name"]] = []
     return jsonify(all_lines)
 
 AUTOSTART_SCRIPT = str(BASE_DIR / "auto-start.ps1")
+REG_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+APP_NAME = "MultiToolPro"
 
-# WHY: Kiểm tra file .lnk trong Windows Startup folder thay vì query Registry.
-# File-based check đơn giản hơn, không cần COM permissions.
-def autostart_shortcut_exists():
-    startup = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
-    if not startup:
+# WHY: Lấy đường dẫn exe của ứng dụng MultiTool Pro từ env (do Tauri truyền) hoặc fallback.
+def get_app_exe_path():
+    exe_path = os.environ.get("SERVER_DASHBOARD_EXE") or os.environ.get("MULTITOOL_PRO_EXE")
+    if exe_path and os.path.exists(exe_path):
+        return exe_path
+    
+    possible_paths = [
+        BASE_DIR / "src-tauri" / "target" / "release" / "multitool-pro.exe",
+        BASE_DIR / "multitool-pro.exe",
+    ]
+    for p in possible_paths:
+        if p.exists():
+            return str(p)
+    return None
+
+# WHY: Kiểm tra autostart trong Windows Registry (HKCU\Software\Microsoft\Windows\CurrentVersion\Run).
+def is_registry_autostart_enabled():
+    if sys.platform != "win32":
         return False
-    return os.path.exists(os.path.join(startup, "MultiToolPro.lnk"))
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_RUN_KEY, 0, winreg.KEY_READ)
+        val, _ = winreg.QueryValueEx(key, APP_NAME)
+        winreg.CloseKey(key)
+        return bool(val)
+    except Exception:
+        return False
 
-# WHY: PowerShell WScript.Shell COM object để tạo .lnk (WScript.CreateShortcut).
-# Không dùng mklink vì Windows shortcut (.lnk) không phải symlink.
-# Tạo trực tiếp tới exe (nếu có MULTITOOL_PRO_EXE env) hoặc fallback PS1.
+# WHY: Kiểm tra tự động khởi động bằng cả Windows Registry & Startup folder shortcut (.lnk).
+def autostart_shortcut_exists():
+    if is_registry_autostart_enabled():
+        return True
+    startup = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+    if startup and os.path.exists(os.path.join(startup, f"{APP_NAME}.lnk")):
+        return True
+    return False
+
+# WHY: Thiết lập tự động khởi động kép:
+#   1. Tạo entry trong Windows Registry (HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run)
+#   2. Tạo shortcut (.lnk) trong thư mục Windows Startup làm fallback
 def set_autostart(enabled: bool):
     startup = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
-    lnk = os.path.join(startup, "MultiToolPro.lnk")
-    if enabled:
-        # WHY: Ưu tiên dùng đường dẫn exe từ biến môi trường do Tauri truyền xuống
-        exe_path = os.environ.get("MULTITOOL_PRO_EXE")
-        if not exe_path or not os.path.exists(exe_path):
-            # Fallback: dùng auto-start.ps1 nếu không tìm thấy exe
-            if os.path.exists(AUTOSTART_SCRIPT):
-                esc_script = AUTOSTART_SCRIPT.replace("\\", "\\\\")
-                esc_dir = str(BASE_DIR).replace("\\", "\\\\")
-                ps_code = f'''
-$wsh = New-Object -ComObject WScript.Shell
-$lnk = $wsh.CreateShortcut("{lnk}")
-$lnk.TargetPath = "powershell.exe"
-$lnk.Arguments = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"{esc_script}`""
-$lnk.WorkingDirectory = "{esc_dir}"
-$lnk.Description = "MultiTool Pro"
-$lnk.Save()
-'''
-                subprocess.run(["powershell", "-NoProfile", "-Command", ps_code], capture_output=True,
-                               startupinfo=get_startupinfo(),
-                               creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+    lnk = os.path.join(startup, f"{APP_NAME}.lnk")
+    exe_path = get_app_exe_path()
+
+    # 1. Cập nhật Windows Registry
+    if sys.platform == "win32":
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_RUN_KEY, 0, winreg.KEY_ALL_ACCESS)
+            if enabled and exe_path:
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, f'"{exe_path}"')
             else:
-                raise Exception("Cannot find MultiTool Pro executable or auto-start.ps1")
-        else:
-            # WHY: Tạo shortcut trực tiếp tới exe (không qua PS1 script) để khởi động app trực tiếp
+                try:
+                    winreg.DeleteValue(key, APP_NAME)
+                except FileNotFoundError:
+                    pass
+            winreg.CloseKey(key)
+        except Exception as e:
+            logger.warning(f"Lỗi cập nhật registry autostart: {e}")
+
+    # 2. Cập nhật Startup Folder .lnk Shortcut
+    if enabled:
+        if exe_path:
             esc_exe = exe_path.replace("\\", "\\\\")
             esc_dir = str(os.path.dirname(exe_path)).replace("\\", "\\\\")
             ps_code = f'''
@@ -426,9 +633,31 @@ $lnk.Save()
             subprocess.run(["powershell", "-NoProfile", "-Command", ps_code], capture_output=True,
                            startupinfo=get_startupinfo(),
                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        elif os.path.exists(AUTOSTART_SCRIPT):
+            esc_script = AUTOSTART_SCRIPT.replace("\\", "\\\\")
+            esc_dir = str(BASE_DIR).replace("\\", "\\\\")
+            ps_code = f'''
+$wsh = New-Object -ComObject WScript.Shell
+$lnk = $wsh.CreateShortcut("{lnk}")
+$lnk.TargetPath = "powershell.exe"
+$lnk.Arguments = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"{esc_script}`""
+$lnk.WorkingDirectory = "{esc_dir}"
+$lnk.Description = "MultiTool Pro"
+$lnk.Save()
+'''
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps_code], capture_output=True,
+                           startupinfo=get_startupinfo(),
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        else:
+            raise Exception("Cannot find MultiTool Pro executable or auto-start.ps1")
     else:
-        if os.path.exists(lnk):
-            os.remove(lnk)
+        for fname in [f"{APP_NAME}.lnk", "MultiToolPro.lnk", "ServerDashboard.lnk", "Server Dashboard.lnk"]:
+            fpath = os.path.join(startup, fname)
+            if os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                except Exception:
+                    pass
 
 @app.route("/api/settings")
 # WHY: GET-only. Trả về autostart status. Dùng để frontend hiển thị checkbox.
@@ -483,10 +712,83 @@ def api_add_project():
     port = data.get("port", 4000 + len(config["projects"]))
     command = data.get("command", "npm run dev")
     new_proj = {"name": name, "path": data["path"], "command": command, "port": port}
+    if "start_on_launch" in data:
+        new_proj["start_on_launch"] = bool(data["start_on_launch"])
     config["projects"].append(new_proj)
     save_config()
     _bump_config_version()
     return jsonify(new_proj), 201
+
+# WHY: Tránh trùng tên khi auto-detect thêm project ("My App" → "My App (2)").
+def _unique_name(name):
+    if not get_project(name):
+        return name
+    i = 2
+    while get_project(f"{name} ({i})"):
+        i += 1
+    return f"{name} ({i})"
+
+# WHY: Trích (path, name, framework) từ cmdline khi không đọc được cwd của process
+# khác (Windows). Pattern từ check-dev-services: đường dẫn đứng trước \node_modules.
+def _guess_project_from_cmdline(cmdline):
+    info = {"name": None, "path": None, "framework": None}
+    text = " ".join(cmdline or [])
+    m = re.search(r"([A-Za-z]:\\[^\"']*?)(?:\\node_modules|\\package\.json|$)", text)
+    if m:
+        p = Path(m.group(1))
+        if (p / "package.json").exists():
+            info["path"] = str(p)
+            det = detect_project(str(p))
+            if det:
+                info["name"] = det["name"]
+                info["framework"] = det["framework"]
+    return info
+
+@app.route("/api/config/projects/detect", methods=["POST"])
+# WHY: Auto-detect framework + command + port cho 1 folder (SettingsModal
+# "Browse Folder" → auto-fill form). Trả detected=False nếu không có marker.
+def api_detect_project():
+    data = request.get_json() or {}
+    result = detect_project(data.get("path", ""))
+    if result is None:
+        return jsonify({"detected": False, "error": "Không phát hiện project dev trong thư mục này"}), 404
+    result["name"] = _unique_name(result["name"])
+    return jsonify({"detected": True, "project": result})
+
+@app.route("/api/projects/detected")
+# WHY: Quét port đang có dev-server LISTEN (1 lần psutil scan, <100ms) trả về
+# server CHƯA nằm trong config → UI đề xuất "Thêm vào cấu hình".
+# KHÔNG merge vào /api/projects — contract start/stop/tunnel giữ nguyên.
+def api_detected_projects():
+    configured_ports = {p.get("port") for p in config["projects"]}
+    detected = []
+    try:
+        for conn in psutil.net_connections(kind="tcp"):
+            if conn.status != "LISTEN" or not conn.laddr or not conn.pid:
+                continue
+            port = conn.laddr.port
+            if port < 1024 or port in configured_ports or any(d["port"] == port for d in detected):
+                continue
+            try:
+                proc = psutil.Process(conn.pid)
+                name = proc.name().lower()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            if not any(w in name for w in DEV_SERVER_WHITELIST):
+                continue
+            guess = _guess_project_from_cmdline(proc.cmdline())
+            detected.append({
+                "port": port,
+                "pid": conn.pid,
+                "process": proc.name(),
+                "name": guess["name"] or f"Server :{port}",
+                "path": guess["path"],
+                "framework": guess["framework"],
+                "command": "npm run dev",
+            })
+    except Exception as e:
+        debug_log(f"api_detected_projects error: {e}")
+    return jsonify({"detected": detected, "count": len(detected)})
 
 @app.route("/api/config/projects/<name>", methods=["PUT"])
 # WHY: Full update — không phải PATCH. User gửi toàn bộ fields muốn thay đổi.
@@ -506,7 +808,7 @@ def api_update_project(name):
         proj["name"] = data["name"]
         if old_name in processes:
             processes[data["name"]] = processes.pop(old_name)
-    for k in ("path", "command", "port"):
+    for k in ("path", "command", "port", "start_on_launch"):
         if k in data:
             proj[k] = data[k]
     save_config()
@@ -568,37 +870,101 @@ def kill_process_on_port(port):
     gọi .connections() riêng cho từng process (pattern giống api_port_scan).
     """
     try:
+        candidates = []
+        seen_pids = set()
         for proc in psutil.process_iter(['pid', 'name']):
             try:
+                # WHY: Bỏ ngay PID 0 (System Idle Process) — nó sở hữu socket "orphan"
+                # của process đã chết và thường có LISTEN trùng port cần kill → log SKIP
+                # spam (hàng chục dòng/lần kill) nhưng không thể kill. Bỏ sớm để tiết kiệm
+                # gọi connections() + tránh nhiễu log.
+                if proc.pid <= 1 or proc.name().lower() in ("system idle process", "system"):
+                    continue
                 for conn in proc.connections(kind='inet'):
-                    if conn.laddr.port == port:
-                        proc_name = proc.name().lower()
-                        # WHITELIST: Chỉ kill các process liên quan đến dev servers
-                        # WHY: Thêm python.exe để dọn Python dev server/script chiếm port.
-                        allowed = ['node.exe', 'node', 'npm.exe', 'npm', 'cmd.exe', 'next.exe', 'next', 'python.exe', 'python']
-                        if any(allowed_name in proc_name for allowed_name in allowed):
-                            debug_log(f"Killing process on port {port}: PID={proc.pid}, name={proc.name()}")
-                            proc.kill()
-                        else:
-                            debug_log(f"SKIP killing on port {port}: PID={proc.pid}, name={proc.name()} (not in whitelist)")
+                    # WHY: Chỉ xử lý connection LISTEN — TIME_WAIT/ESTABLISHED của
+                    # process đã chết thường để lại socket "owned" bởi PID 0
+                    # (System Idle Process) → log SPAM + risk kill nhầm trước đây.
+                    if conn.status != "LISTEN" or conn.laddr.port != port:
+                        continue
+                    proc_name = proc.name().lower()
+                    # WHITELIST: Chỉ kill các process liên quan đến dev servers
+                    # WHY: Thêm python.exe để dọn Python dev server/script chiếm port.
+                    if any(allowed_name in proc_name for allowed_name in DEV_SERVER_WHITELIST):
+                        # WHY: Dedupe theo PID — 1 process có thể có NHIỀU LISTEN socket
+                        # trên cùng port (IPv4+IPv6, đa interface) → trước đây bị thêm
+                        # lặp, log "Killing" nhiều lần + gọi kill() thừa lần 2 (NoSuchProcess).
+                        if proc.pid not in seen_pids:
+                            seen_pids.add(proc.pid)
+                            candidates.append((proc.pid, proc.name()))
+                    else:
+                        debug_log(f"SKIP killing on port {port}: PID={proc.pid}, name={proc.name()} (not in whitelist)")
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 pass
+        if candidates:
+            # WHY: Kill lá → gốc (con trước, cha sau). Kill cha trước để con mồ côi
+            # tiếp tục chiếm port → is_running vẫn báo "đang chạy" (bug).
+            ppid_map = _build_ppid_map()
+            order = sorted(candidates, key=lambda c: -_tree_depth(c[0], ppid_map))
+            for pid, name in order:
+                try:
+                    debug_log(f"Killing process on port {port}: PID={pid}, name={name}")
+                    psutil.Process(pid).kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
     except Exception as e:
         debug_log(f"kill_process_on_port error: {e}")
 
+# WHY: Cache psutil.Process instances theo pid để cpu_percent() có baseline thật.
+# interval=None trả delta so với lần gọi TRƯỚC trên CÙNG instance — code cũ tạo
+# instance mới mỗi lần → luôn trả 0.0 → CPU hiển thị 0% mãi (bug).
+# Cache bị prune sau 60s (process có thể restart, pid bị tái sử dụng).
+_cpu_proc_cache = {}  # pid -> (psutil.Process instance, last_seen_time)
+
+# WHY: _get_cpu_percent — CPU % của 1 pid, tái dùng instance cache để có baseline.
+# Lần đầu gặp pid: seed baseline (trả 0.0), lần sau trả delta thật (poll 4s).
+def _get_cpu_percent(pid):
+    now = time.time()
+    entry = _cpu_proc_cache.get(pid)
+    if entry and now - entry[1] < 60:
+        inst = entry[0]
+        try:
+            val = inst.cpu_percent(interval=None)
+            _cpu_proc_cache[pid] = (inst, now)
+            return val if val is not None else 0.0
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            _cpu_proc_cache.pop(pid, None)
+            return 0.0
+    try:
+        inst = psutil.Process(pid)
+        inst.cpu_percent(interval=None)  # seed: lần gọi đầu luôn trả 0.0
+        _cpu_proc_cache[pid] = (inst, now)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return 0.0
+    return 0.0
+
+# WHY: Prune cache — xóa mọi entry chưa được truy cập trong 60s.
+# Tránh dict phình vô hạn khi process restart liên tục (mỗi restart = pid mới).
+def _prune_cpu_cache():
+    now = time.time()
+    for pid in [p for p, (_, seen) in _cpu_proc_cache.items() if now - seen > 60]:
+        _cpu_proc_cache.pop(pid, None)
+
 # WHY: Tính tổng memory + CPU của parent + children (recursive) — Node.js thường spawn child processes.
-# interval=None trong cpu_percent() để đọc giá trị tức thời, không chờ 0.1s.
+# CPU dùng _get_cpu_percent() (cache baseline) thay vì tạo instance mới mỗi lần (bug CPU 0%).
 def get_process_memory_and_cpu(pid):
     """Lấy thông tin memory và CPU của process bằng psutil"""
+    # WHY: Prune cache định kỳ — xóa entry cũ hơn 60s (pid chết/restart) để
+    # dict không phình vô hạn trong session dài. Gọi mỗi poll diagnostics (4s).
+    _prune_cpu_cache()
     try:
         parent = psutil.Process(pid)
         mem = parent.memory_info().rss
-        cpu = parent.cpu_percent(interval=None)
+        cpu = _get_cpu_percent(pid)
         try:
             for child in parent.children(recursive=True):
                 try:
                     mem += child.memory_info().rss
-                    cpu += child.cpu_percent(interval=None)
+                    cpu += _get_cpu_percent(child.pid)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
         except Exception:
@@ -626,7 +992,12 @@ def api_project_diagnostics(name):
             p = processes.get(name)
             if p:
                 pid = p.pid
-                mem_bytes, cpu_percent = get_process_memory_and_cpu(pid)
+        if pid is None:
+            # WHY: Chọn canonical PID (dev thật, lá sâu nhất, RSS cao) thay vì
+            # pids[0] bừa — tránh đo nhầm memory/CPU của wrapper cmd.exe.
+            pid = _canonical_pid_for_port(proj.get("port"))
+        if pid:
+            mem_bytes, cpu_percent = get_process_memory_and_cpu(pid)
                 
     # Git Info
     git_info = None
@@ -1035,53 +1406,34 @@ def api_reload_config():
     return jsonify({"status": "reloaded", "count": len(config["projects"])})
 
 # ─── Performance History ────────────────────────────────────────
-# Lưu memory/cpu usage history của từng project
+# Lưu memory/cpu usage history của từng project — GIỮ TRONG MEMORY (không ghi đĩa).
+# WHY: Trước đây ghi perf_history.json xuống đĩa mỗi 4s/project đang expand —
+# I/O phí phạm vì frontend KHÔNG hề gọi /api/projects/<name>/perf-history
+# (grep toàn src/ = 0 kết quả). Giữ API + test hoạt động nhưng bỏ ghi đĩa.
 # Format: {project_name: [{timestamp, memory, cpu}, ...]}
-PERF_HISTORY_FILE = str(CONFIG_DIR / "perf_history.json")
 PERF_HISTORY_MAX = 60  # Giữ tối đa 60 entries/project (~2 phút với polling 2s)
 perf_lock = threading.Lock()
+_perf_history_memory = {}  # in-memory history — không còn file JSON
 
-# WHY: Thread-safe (perf_lock). Return {} nếu file không tồn tại — không raise exception.
+# WHY: load_perf_history — Thread-safe (perf_lock). Trả về history từ memory.
+# Trả bản copy (deep-ish) để caller không mutate dict gốc.
 def load_perf_history():
     with perf_lock:
-        try:
-            if os.path.exists(PERF_HISTORY_FILE):
-                with open(PERF_HISTORY_FILE, 'r') as f:
-                    return json.load(f)
-        except Exception:
-            pass
-    return {}
+        return {k: list(v) for k, v in _perf_history_memory.items()}
 
-# WHY: Save perf history ra file JSON — mỗi snapshot ghi lại toàn bộ file (file nhỏ, < 1MB).
-# Con: không scale cho nhiều projects. Pro: đơn giản, không cần database.
-def save_perf_history(data):
-    with perf_lock:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(PERF_HISTORY_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
-
-# WHY: Lock xuyên suốt read-modify-write để tránh race condition khi 2 diagnostics requests chạy đồng thời.
+# WHY: record_perf_snapshot — append snapshot vào memory dict, giữ tối đa
+# PERF_HISTORY_MAX entries. KHÔNG ghi đĩa (data này frontend không đọc).
+# Lock xuyên suốt để tránh race khi 2 diagnostics requests chạy đồng thời.
 def record_perf_snapshot(name, memory, cpu):
     with perf_lock:
-        try:
-            if os.path.exists(PERF_HISTORY_FILE):
-                with open(PERF_HISTORY_FILE, 'r') as f:
-                    history = json.load(f)
-            else:
-                history = {}
-        except Exception:
-            history = {}
-        if name not in history:
-            history[name] = []
-        history[name].append({
+        if name not in _perf_history_memory:
+            _perf_history_memory[name] = []
+        _perf_history_memory[name].append({
             "timestamp": datetime.now().isoformat(),
             "memory": memory,
             "cpu": cpu
         })
-        history[name] = history[name][-PERF_HISTORY_MAX:]
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(PERF_HISTORY_FILE, 'w') as f:
-            json.dump(history, f, indent=2)
+        _perf_history_memory[name] = _perf_history_memory[name][-PERF_HISTORY_MAX:]
 
 @app.route("/api/projects/<name>/perf-history")
 # WHY: GET-only — trả về history của 1 project. Frontend vẽ chart từ data này.
@@ -1221,18 +1573,24 @@ threading.Thread(target=_sleep_detector, daemon=True).start()
 # vì cloudflared 2026+ dùng QUIC protocol, không log HTTP request lines ra stderr.
 # Metrics endpoint có cloudflared_tunnel_total_requests counter chính xác.
 
+# WHY: Lấy port metrics server của tunnel. KHÔNG fallback về 20241 mặc định —
+# cloudflared chạy nhiều tunnel sẽ tự tăng port (20241, 20242...) nếu bận,
+# đoán 20241 bừa sẽ đọc nhầm metrics của tunnel khác (race khi reader thread
+# chưa kịp parse dòng 'Starting metrics server on 127.0.0.1:PORT/metrics').
 def _get_tunnel_metrics_port(name):
-    """Lấy port metrics server của tunnel từ dict, fallback về 20241.
-    Port được parse từ dòng 'Starting metrics server on 127.0.0.1:PORT/metrics'
-    trong reader thread và lưu vào _tunnel_metrics_ports."""
-    return _tunnel_metrics_ports.get(name, 20241)
+    """Lấy port metrics server của tunnel. Trả None nếu chưa parse được."""
+    return _tunnel_metrics_ports.get(name)
 
+# WHY: Worker đọc request count từ cloudflared metrics endpoint (port ĐỘNG đã
+# parse từ stderr) — đo số thực thay vì ước lượng; tránh read nhầm tunnel khác.
 def _fetch_tunnel_metrics(name):
     """Đọc cloudflared_tunnel_total_requests từ metrics endpoint.
     Dùng port động từ _tunnel_metrics_ports (parse từ stderr) thay vì hardcode 20241.
     Trả về số request hoặc None nếu metrics chưa available."""
     try:
         port = _get_tunnel_metrics_port(name)
+        if port is None:
+            return None
         req = urllib.request.Request(f"http://127.0.0.1:{port}/metrics")
         with urllib.request.urlopen(req, timeout=3) as resp:
             body = resp.read().decode('utf-8')
@@ -1247,14 +1605,18 @@ def _fetch_tunnel_metrics(name):
 _REQUEST_HISTORY_MAX = 60
 _REQUEST_HISTORY_INTERVAL = 10
 
+# WHY: Background thread DUY NHẤT ghi snapshot request count mỗi 10s cho MỌI
+# tunnel active. Ghi 1 lần/chu kỳ sau khi fetch xong toàn bộ (bug cũ: vòng ghi
+# LỒNG trong vòng fetch + shadow biến `name` → N lần snapshot/tunnel mỗi chu kỳ).
 def _request_history_worker():
     """Thread ghi snapshot request count mỗi 10s cho tất cả tunnels đang active.
     Sử dụng cloudflared metrics endpoint (port 20241) thay vì parse stderr."""
     while True:
         try:
             time.sleep(_REQUEST_HISTORY_INTERVAL)
-            # WHY: Fetch metrics từ cloudflared — đo request count realtime
-            # Metrics port 20241 là default cho cloudflared quick tunnel
+            # WHY: Fetch metrics từ cloudflared — đo request count realtime.
+            # Port metrics là port ĐỘNG (parse từ stderr, xem _get_tunnel_metrics_port)
+            # vì cloudflared chạy nhiều tunnel sẽ tự tăng port khi 20241 bận.
             with _tunnel_lock:
                 active_tunnels = list(_tunnel_processes.keys())
             
@@ -1264,20 +1626,25 @@ def _request_history_worker():
                 if metrics_count is not None:
                     with _tunnel_lock:
                         _tunnel_request_counts[name] = metrics_count
-                
-                # WHY: Ghi snapshot cho tất cả tunnels active
-                for name, proc in list(_tunnel_processes.items()):
-                    if proc.poll() is None:  # Process still alive
-                        current_count = _tunnel_request_counts.get(name, 0)
-                        if name not in _tunnel_request_history:
-                            _tunnel_request_history[name] = []
-                        _tunnel_request_history[name].append({
-                            't': time.time(),
-                            'c': current_count,
-                        })
-                        # WHY: Giữ tối đa 60 snapshots (~10 phút)
-                        if len(_tunnel_request_history[name]) > _REQUEST_HISTORY_MAX:
-                            _tunnel_request_history[name] = _tunnel_request_history[name][-_REQUEST_HISTORY_MAX:]
+
+            # WHY: Ghi snapshot 1 lần mỗi chu kỳ cho tất cả tunnels active.
+            # (Bug cũ: vòng này LỒNG trong vòng for name bên trên + dùng lại biến `name`
+            #  → shadow biến vòng ngoài. Với N tunnel mỗi chu kỳ append N snapshot/tunnel,
+            #  history đầy nhanh gấp N lần và count bị lẫn giữa các tunnel.)
+            with _tunnel_lock:
+                active_now = list(_tunnel_processes.items())
+            for pname, proc in active_now:
+                if proc.poll() is None:  # Process still alive
+                    current_count = _tunnel_request_counts.get(pname, 0)
+                    if pname not in _tunnel_request_history:
+                        _tunnel_request_history[pname] = []
+                    _tunnel_request_history[pname].append({
+                        't': time.time(),
+                        'c': current_count,
+                    })
+                    # WHY: Giữ tối đa 60 snapshots (~10 phút)
+                    if len(_tunnel_request_history[pname]) > _REQUEST_HISTORY_MAX:
+                        _tunnel_request_history[pname] = _tunnel_request_history[pname][-_REQUEST_HISTORY_MAX:]
         except Exception as e:
             debug_log(f"[request-history] Error: {e}")
 
@@ -1291,6 +1658,8 @@ threading.Thread(target=_request_history_worker, daemon=True).start()
 ALERT_CHECK_INTERVAL = 30    # Check mỗi 30s
 ALERT_COOLDOWN = 300          # Cooldown 5 phút giữa các notification
 
+# WHY: Toast Windows không cần .exe phụ — dùng PowerShell Windows.UI.Notifications
+# trực tiếp (BurntToast không luôn có). Escape `''` tránh injection vào chuỗi PS.
 def _show_windows_toast(title, message):
     """Gửi Windows toast notification bằng PowerShell.
     Sử dụng BurntToast module nếu có, fallback về Windows.UI.Notifications."""
@@ -1317,6 +1686,8 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($template)
         debug_log(f"[alert] Toast notification failed: {e}")
         return False
 
+# WHY: Cảnh báo khi request rate vượt ngưỡng — rate tính từ diff ~60s window
+# (không phải count/uptime lifetime bị pha loãng bởi uptime dài) + cooldown 5p.
 def _tunnel_alert_worker():
     """Background thread: check request rate mỗi 30s, gửi notification nếu vượt ngưỡng.
     Alert threshold = 0 có nghĩa là tắt alert cho project đó."""
@@ -1338,9 +1709,9 @@ def _tunnel_alert_worker():
                     if not started:
                         continue
                     
-                    uptime = int(time.time() - started)
-                    count = _tunnel_request_counts.get(name, 0)
-                    rate = round(count / uptime, 2) if uptime > 0 else 0
+                    # WHY: Rate = diff history window ~60s (không phải count/uptime
+                    # lifetime average — bị pha loãng bởi uptime dài, bỏ lỡ spike).
+                    rate = _tunnel_recent_rate(name)
                     
                     # WHY: Kiểm tra rate vượt ngưỡng và cooldown
                     if rate > threshold:
@@ -1440,6 +1811,35 @@ def _get_cloudflared_version():
         pass
     return None
 
+# WHY: Rate thật = diff count giữa snapshot gần nhất và snapshot cách ~60s,
+# chia cho khoảng thời gian. KHÔNG dùng count/uptime (lifetime average —
+# bị pha loãng bởi uptime dài, bỏ lỡ spike request).
+def _tunnel_recent_rate(name):
+    """Request rate hiện tại (req/s) từ request history window ~60s.
+    Trả 0 nếu chưa đủ 2 snapshots hoặc window <= 0."""
+    # WHY: Copy list TRƯỚC khi đọc — _request_history_worker append + rebind
+    # list này NGOÀI _tunnel_lock, còn hàm này được gọi từ Flask thread (không lock).
+    # Lặp reversed() trên list đang bị append đồng thời có thể raise
+    # RuntimeError "list changed size during iteration" → copy trước là an toàn.
+    history = list(_tunnel_request_history.get(name, []))
+    if len(history) < 2:
+        return 0
+    latest = history[-1]
+    # WHY: Tìm snapshot cách đây >= 50s (gần nhất với window 1 phút)
+    base = None
+    for e in reversed(history):
+        if latest['t'] - e['t'] >= 50:
+            base = e
+            break
+    if base is None:
+        base = history[0]
+    dt = latest['t'] - base['t']
+    if dt <= 0:
+        return 0
+    # WHY: Clamp max(0, ...) — sau khi tunnel restart, counter metrics reset về 0
+    # trong khi history cũ vẫn còn → diff có thể âm (rate âm vô nghĩa).
+    return round(max(0, latest['c'] - base['c']) / dt, 2)
+
 # WHY: Auto-cleanup process đã chết (pop khi poll != None) để tránh zombie.
 # Trả về watchdog_enabled + restart_count để UI hiển thị mà không cần API riêng.
 def _get_tunnel_status(name):
@@ -1492,7 +1892,7 @@ def _get_tunnel_status(name):
             "watchdog_restart_count": _tunnel_restart_counts.get(name, 0),
             "uptime_seconds": uptime if uptime > 0 else None,
             "request_count": _tunnel_request_counts.get(name, 0),
-            "request_rate": round(_tunnel_request_counts.get(name, 0) / uptime, 2) if uptime > 0 else 0,
+            "request_rate": _tunnel_recent_rate(name),
             "request_history": history[-40:] if history else [],
             "endpoint_counts": _tunnel_endpoint_counts.get(name, {}),
             "alert_threshold": _tunnel_alert_thresholds.get(name, 0),
@@ -1591,6 +1991,10 @@ def _stop_tunnel_process(name):
         _tunnel_errors.pop(name, None)
         _tunnel_status[name] = "stopped"
         _tunnel_watchdog_threads.pop(name, None)  # Clean zombie thread ref
+        # WHY: Tắt watchdog khi stop thủ công — nếu không, flag dính "enabled" →
+        # UI hiển thị watchdog BẬT cho tunnel đã dừng và worker thread loop vô ích.
+        # (Sleep-detector cũng sẽ không restart tunnel bị user tắt chủ đích.)
+        _tunnel_watchdog_enabled.pop(name, None)
         # WHY: Không clear _tunnel_restart_counts — giữ lifetime stats
         _tunnel_started_at.pop(name, None)
         _tunnel_request_counts.pop(name, None)
@@ -1614,59 +2018,93 @@ def _stop_tunnel_process(name):
 # WHY: Watchdog restart — dùng get() trước, không pop() ngay,
 # tránh race condition với manual start từ UI.
 # Sleep 2s trước launch để chờ process cleanup hoàn tất.
+# WHY: Khóa restart riêng cho từng tunnel — watchdog worker, sleep-detector và
+# api_tunnel_watchdog (restart ngay khi bật) đều có thể gọi _auto_restart_tunnel
+# đồng thời. Không có lock → 2 luồng cùng launch 2 cloudflared + đếm restart 2 lần.
+_tunnel_restart_locks = {}  # {project_name: threading.Lock}
+
+# WHY: Lấy (hoặc tạo) lock restart của tunnel. Gọi dưới _tunnel_lock để tránh
+# race tạo dict entry trùng. Lock giữ lại trong dict — 1 Lock/name, rất nhỏ.
+def _get_tunnel_restart_lock(name):
+    with _tunnel_lock:
+        if name not in _tunnel_restart_locks:
+            _tunnel_restart_locks[name] = threading.Lock()
+        return _tunnel_restart_locks[name]
+
+# WHY: Watchdog restart tunnel khi cloudflare chết — lock non-blocking chống
+# double-launch; nếu tunnel vừa được user/API start thủ công thì KHÔNG restart.
 def _auto_restart_tunnel(project_name):
     """Watchdog: dừng tunnel cũ + launch tunnel mới"""
-    proj = get_project(project_name)
-    if not proj or not is_running(project_name) or not _is_cloudflared_installed():
-        debug_log(f"[watchdog] Cannot restart {project_name}: preconditions not met")
-        return False
-    
-    port = proj["port"]
-    debug_log(f"[watchdog] Auto-restarting tunnel for {project_name}...")
-    
-    # Clean old state
-    with _tunnel_lock:
-        # WHY: Dùng get() trước, không pop() ngay — tránh race condition với manual start.
-        # Nếu process vẫn đang chạy (alive), tức là user vừa start thủ công → không pop.
-        old_proc = _tunnel_processes.get(project_name)
-        if old_proc is not None and old_proc.poll() is None:
-            # WHY: Tunnel vừa được start bởi ai đó (user manual / API), không restart!
-            debug_log(f"[watchdog] Tunnel {project_name} was just started by another request, skipping restart")
-            return True
-        if old_proc is None:
-            # WHY: Không có process cũ → chỉ cần launch mới
-            pass
-        else:
-            _tunnel_processes.pop(project_name, None)
-        _tunnel_urls.pop(project_name, None)
-        _tunnel_errors.pop(project_name, None)
-        _tunnel_started_at.pop(project_name, None)
-        _tunnel_request_counts.pop(project_name, None)
-        _tunnel_request_history.pop(project_name, None)
-        _tunnel_endpoint_counts.pop(project_name, None)
-        _tunnel_metrics_ports.pop(project_name, None)
-        _tunnel_status[project_name] = "connecting"
-    
-    if old_proc:
-        try:
-            old_proc.terminate()
-            old_proc.wait(timeout=3)
-        except:
-            try:
-                old_proc.kill()
-            except:
-                pass
-    
-    time.sleep(2)
-    
-    success, err = _launch_tunnel_process(project_name, port)
-    if success:
+    restart_lock = _get_tunnel_restart_lock(project_name)
+    # WHY: acquire non-blocking — nếu luồng khác đang restart tunnel này,
+    # bỏ qua ngay (tránh double-launch cloudflared + double-count restart_count).
+    if not restart_lock.acquire(blocking=False):
+        debug_log(f"[watchdog] Restart for {project_name} already in progress, skipping")
+        return True
+    try:
+        proj = get_project(project_name)
+        if not proj or not is_running(project_name) or not _is_cloudflared_installed():
+            debug_log(f"[watchdog] Cannot restart {project_name}: preconditions not met")
+            return False
+        
+        port = proj["port"]
+        debug_log(f"[watchdog] Auto-restarting tunnel for {project_name}...")
+        
+        # Clean old state
         with _tunnel_lock:
-            _tunnel_restart_counts[project_name] = _tunnel_restart_counts.get(project_name, 0) + 1
-        debug_log(f"[watchdog] Tunnel auto-restarted for {project_name} (#{_tunnel_restart_counts.get(project_name)})")
-    else:
-        debug_log(f"[watchdog] Auto-restart failed for {project_name}: {err}")
-    return success
+            # WHY: Dùng get() trước, không pop() ngay — tránh race condition với manual start.
+            # Nếu process vẫn đang chạy (alive), tức là user vừa start thủ công → không pop.
+            old_proc = _tunnel_processes.get(project_name)
+            if old_proc is not None and old_proc.poll() is None:
+                # WHY: Tunnel vừa được start bởi ai đó (user manual / API), không restart!
+                debug_log(f"[watchdog] Tunnel {project_name} was just started by another request, skipping restart")
+                return True
+            if old_proc is None:
+                # WHY: Không có process cũ → chỉ cần launch mới
+                pass
+            else:
+                _tunnel_processes.pop(project_name, None)
+            _tunnel_urls.pop(project_name, None)
+            _tunnel_errors.pop(project_name, None)
+            _tunnel_started_at.pop(project_name, None)
+            _tunnel_request_counts.pop(project_name, None)
+            _tunnel_request_history.pop(project_name, None)
+            _tunnel_endpoint_counts.pop(project_name, None)
+            _tunnel_metrics_ports.pop(project_name, None)
+            _tunnel_status[project_name] = "connecting"
+        
+        if old_proc:
+            try:
+                old_proc.terminate()
+                old_proc.wait(timeout=3)
+            except:
+                try:
+                    old_proc.kill()
+                except:
+                    pass
+        
+        time.sleep(2)
+        
+        # WHY: Re-check NGAY TRƯỚC khi launch — user có thể manual start (API) xen
+        # vào trong cửa sổ sleep(2) ở trên (sau khi old_proc đã bị pop). Lúc đó
+        # _tunnel_processes đã có process MỚI đang sống → bỏ launch để tránh
+        # 2 cloudflared chạy cùng lúc (double-launch).
+        with _tunnel_lock:
+            mid_proc = _tunnel_processes.get(project_name)
+            if mid_proc is not None and mid_proc.poll() is None:
+                debug_log(f"[watchdog] Tunnel {project_name} started manually during restart, aborting our launch")
+                return True
+        
+        success, err = _launch_tunnel_process(project_name, port)
+        if success:
+            with _tunnel_lock:
+                _tunnel_restart_counts[project_name] = _tunnel_restart_counts.get(project_name, 0) + 1
+            debug_log(f"[watchdog] Tunnel auto-restarted for {project_name} (#{_tunnel_restart_counts.get(project_name)})")
+        else:
+            debug_log(f"[watchdog] Auto-restart failed for {project_name}: {err}")
+        return success
+    finally:
+        restart_lock.release()
 
 # WHY: Check mỗi 15s — đủ nhanh để phát hiện die, đủ chậm để không spam restart.
 # Chỉ restart khi status không phải 'stopped' (tránh restart tunnel đã bị tắt chủ đích).
@@ -1956,6 +2394,8 @@ def api_tunnel_alert(name):
 
 # ─── Tunnel Changes Detection ────────────────────────────────────
 
+# WHY: Endpoint NHẸ để Dashboard poll 2s — chỉ trả version/config count; UI chỉ
+# fetch full data khi version đổi (tiết kiệm bandwidth/CPU so với poll full 4s).
 @app.route("/api/tunnels/changes")
 def api_tunnels_changes():
     """Lightweight endpoint — trả về version + project count.
@@ -1987,12 +2427,15 @@ def _load_hourly_metrics():
             pass
     return {}
 
+# WHY: Ghi toàn bộ dict metrics vào file JSON (file nhỏ <1MB) dưới lock — thread-safe.
 def _save_hourly_metrics(data):
     with _hourly_metrics_lock:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         with open(HOURLY_METRICS_FILE, 'w') as f:
             json.dump(data, f, indent=2)
 
+# WHY: Background thread snapshot mỗi giờ — chỉ lưu tunnel đang active, xóa data
+# >30 ngày khi ghi để file không phình vô hạn theo thời gian.
 def _hourly_metrics_worker():
     """Background thread: snapshot metrics mỗi giờ.
     Chỉ snapshot tunnels đang active (có URL).
@@ -2003,6 +2446,7 @@ def _hourly_metrics_worker():
             now = time.time()
             cutoff = now - (HOURLY_METRICS_MAX_DAYS * 86400)
             
+            existing = _load_hourly_metrics()
             with _tunnel_lock:
                 active_names = [
                     name for name, proc in _tunnel_processes.items()
@@ -2010,10 +2454,16 @@ def _hourly_metrics_worker():
                 ]
                 snapshot = {}
                 for name in active_names:
-                    started = _tunnel_started_at.get(name)
-                    uptime = int(now - started) if started else 0
                     count = _tunnel_request_counts.get(name, 0)
-                    rate = round(count / uptime, 2) if uptime > 0 else 0
+                    # WHY: Rate = diff so với snapshot giờ trước (không phải count/uptime
+                    # lifetime average — bị pha loãng bởi uptime dài, bỏ lỡ spike).
+                    prev = existing.get(name, [])[-1] if existing.get(name) else None
+                    if prev and now - prev['t'] > 0:
+                        # WHY: Clamp max(0, ...) — counter reset sau restart tunnel →
+                        # diff so với snapshot giờ trước có thể âm.
+                        rate = round(max(0, count - prev['c']) / (now - prev['t']), 2)
+                    else:
+                        rate = 0
                     snapshot[name] = {
                         't': now,
                         'c': count,
@@ -2025,7 +2475,6 @@ def _hourly_metrics_worker():
                 continue
             
             # WHY: Merge snapshot vào file, xóa data cũ hơn 30 ngày
-            existing = _load_hourly_metrics()
             for name, entry in snapshot.items():
                 if name not in existing:
                     existing[name] = []
@@ -2043,6 +2492,8 @@ def _hourly_metrics_worker():
 
 threading.Thread(target=_hourly_metrics_worker, daemon=True).start()
 
+# WHY: Trả lịch sử request rate đã lưu theo range (24h/7d/30d) — UI vẽ chart
+# request rate theo thời gian, không phải số liệu realtime.
 @app.route("/api/tunnels/history")
 def api_tunnels_history():
     """GET /api/tunnels/history?project=NAME&range=24h|7d|30d
@@ -2090,6 +2541,8 @@ def api_tunnels_history():
 
 # ─── Export / Import Tunnel Config ────────────────────────────────
 
+# WHY: Export cấu hình tunnels (watchdog/restart_count/cloudflared) ra JSON để
+# backup hoặc migrate sang máy khác — kể cả project chưa có tunnel config.
 @app.route("/api/tunnels/export")
 def api_tunnels_export():
     """Export tất cả cấu hình tunnels (watchdog settings, cloudflared info) ra JSON.
@@ -2121,6 +2574,8 @@ def api_tunnels_export():
     
     return jsonify(config_data)
 
+# WHY: Export metrics hiện tại của MỌI project (status/rate/uptime/watchdog...) ra
+# JSON hoặc CSV (CSV kèm BOM để Excel đọc UTF-8 đúng) — phục vụ phân tích ngoài app.
 @app.route("/api/tunnels/metrics/export")
 def api_tunnels_metrics_export():
     """Export tunnel metrics (request count, rate, uptime, status, etc.) ra JSON hoặc CSV.
@@ -2194,6 +2649,8 @@ def api_tunnels_metrics_export():
         }
     )
 
+# WHY: Import file export trước đó — chỉ restore WATCHDOG settings, KHÔNG tự động
+# start tunnel; project không tồn tại trong config thì skip (đếm vào skipped).
 @app.route("/api/tunnels/import", methods=["POST"])
 def api_tunnels_import():
     """Import cấu hình tunnels từ file JSON (export trước đó).
@@ -2236,16 +2693,24 @@ project_start_times = {}
 # WHY: Dùng psutil.Process.create_time() thay vì lưu start_time riêng — chính xác hơn,
 # không bị sai lệch nếu process được restart bên ngoài (không qua API).
 def get_process_uptime(name):
-    """Lấy thời gian process đã chạy (giây)"""
+    """Lấy thời gian process đã chạy (giây). Hỗ trợ server chạy ngoài app:
+    nếu không có trong processes dict, fallback sang PID đang nghe trên port."""
+    pid = None
     with lock:
         p = processes.get(name)
         if p and p.pid:
-            try:
-                proc = psutil.Process(p.pid)
-                create_time = proc.create_time()
-                return int(time.time() - create_time)
-            except:
-                pass
+            pid = p.pid
+    if pid is None:
+        proj = get_project(name)
+        if proj:
+            pid = _canonical_pid_for_port(proj.get("port"))
+    if pid:
+        try:
+            proc = psutil.Process(pid)
+            create_time = proc.create_time()
+            return int(time.time() - create_time)
+        except Exception:
+            pass
     return 0
 
 # WHY: Format giây sang readable string (bỏ qua days vì server thường chạy < 24h).
@@ -2406,6 +2871,8 @@ def api_open_browser():
         return jsonify({"error": str(e)}), 500
 
 # ─── Notification API ──────────────────────────────────────────
+# WHY: Cho frontend bắn Windows toast qua API — dùng chung _show_windows_toast()
+# với tunnel alert system để có 1 nguồn toast duy nhất.
 @app.route("/api/notify", methods=["POST"])
 def api_notify():
     """Gửi Windows toast notification.
@@ -3035,6 +3502,8 @@ PRINTER_MONITOR_DIR = str(BASE_DIR / "printer-monitor")
 PRINTER_MONITOR_EXE = str(BASE_DIR / "printer-monitor" / "bin" / "Release" / "net8.0" / "win-x64" / "publish" / "PrinterMonitor.exe")
 PRINTER_MONITOR_PS1 = str(BASE_DIR / "printer-monitor" / "PrinterMonitor.ps1")
 
+# WHY: Giao diện thống nhất gọi PrinterMonitor — ưu tiên C# exe (nhanh, JSON trực
+# tiếp) rồi PowerShell fallback (luôn available trên Windows) cho query/stats/listen.
 def query_printer_monitor_cs(printer_name, action="query", timeout=15):
     """
     Gọi PrinterMonitor C# module hoặc PowerShell fallback.
@@ -3458,6 +3927,9 @@ _GDI_DRIVER_KEYWORDS = [
     'samsung ml-', 'samsung scx-',  # Samsung GDI
 ]
 
+# WHY: Quyết định CÁCH đếm trang theo loại driver: GDI/host-based (Brother,
+# Samsung...) KHÔNG sinh Event ID 307 → phải dùng WMI/manual; PCL/PostScript
+# đọc được từ EventLog. Brand + model override giúp chọn đúng tracking method.
 def _detect_printer_info(printer_name=None, driver_name=None):
     """
     Phát hiện loại driver máy in và brand.
@@ -3686,6 +4158,9 @@ def add_print_stats_entry(printer_name, document=''):
     save_printer_stats(stats)
     return stats
 
+# WHY: Cộng dồn page_count khi in xong — 3 lớp ưu tiên: (1) JOB_INFO_2 pages thật,
+# (2) WMI JobCountSinceLastReset diff (lần đầu chỉ lưu baseline, không increment),
+# (3) fallback +1 trang. Tránh đếm trùng khi nhiều nguồn báo cùng 1 job.
 def auto_increment_page_count(printer_name, known_pages=0):
     """
     Tự động tăng page_count khi phát hiện in xong.
@@ -4169,6 +4644,7 @@ def api_printer_wmi_status():
             pass
         
         # === 2. WMI cho thông tin mở rộng ===
+        # WHY: Thuộc tính WMI có thể None hoặc sai kiểu — ép int an toàn với default.
         def safe_get(obj, attr, default=0):
             val = getattr(obj, attr, None)
             if val is None:
@@ -4354,6 +4830,8 @@ def api_printer_wmi_status():
 #   3. Manual entry (người dùng nhập thủ công trong settings) ← KHUYẾN NGHỊ
 # ═══════════════════════════════════════════════════════════════
 
+# WHY: Cache 5 phút kết quả _detect_printer_info — tránh scan driver/name mỗi lần
+# poll printer status (UI poll 5s).
 def _get_cached_printer_info(printer_name, driver_name=""):
     """Lấy thông tin driver máy in (có cache 5 phút)"""
     with _printer_info_cache_lock:
@@ -4366,6 +4844,8 @@ def _get_cached_printer_info(printer_name, driver_name=""):
         _printer_info_cache[printer_name] = {'info': info, 'cached_at': time.time()}
     return info
 
+# WHY: Đếm job đang trong spooler cho real-time detection — thử Get-PrintJob trước
+# (Win8+/PS5), fallback Win32_PrintJob (WMI) vì Get-PrintJob không tồn tại mọi nơi.
 def _query_active_print_jobs(printer_name):
     """
     Đếm số job đang active trong spooler queue.
@@ -4419,6 +4899,9 @@ def _query_active_print_jobs(printer_name):
     
     return None
 
+# WHY: Hybrid 4 lớp đọc số trang: C#/PS module > cache 30s > EventLog PowerShell
+# (chỉ PCL/PostScript) > WMI+Get-PrintJob (GDI). Mỗi lớp failover sang lớp sau
+# khi không có dữ liệu — vì KHÔNG có 1 nguồn duy nhất cho mọi loại driver.
 def query_printer_page_count_eventlogs(printer_name, port_name):
     """
     Đọc tổng số trang từ Event Logs Windows (PrintService/Operational).
@@ -4661,6 +5144,8 @@ _pjl_cache = {}
 _pjl_cache_lock = threading.Lock()
 PJL_CACHE_TTL = 30
 
+# WHY: Gửi lệnh PJL qua RAW spooler (win32print) cho USB printers — one-way, không
+# đọc được response; GDI printers có thể in ra trang chứa lệnh nên chỉ dùng network.
 def _send_pjl_raw(printer_name, command):
     """
     Gửi lệnh PJL qua win32print RAW spooler.
@@ -4699,6 +5184,8 @@ def _send_pjl_raw(printer_name, command):
         debug_log(f"PJL send error for {printer_name}: {e}")
     return None
 
+# WHY: PJL qua TCP port 9100 cho network printers — đọc được response (khác RAW
+# one-way), dùng cho pagecount/toner/drum query với timeout chống treo.
 def _send_pjl_network(printer_ip, port, command, timeout=5):
     """
     Gửi lệnh PJL qua TCP socket (cho network printers).
@@ -4740,6 +5227,8 @@ def _send_pjl_network(printer_ip, port, command, timeout=5):
         debug_log(f"PJL network error: {e}")
     return None
 
+# WHY: Extract PAGECOUNT từ response PJL — format linh hoạt ("PAGECOUNT=6266"
+# hoặc khoảng trắng), regex tách số tránh parse nhầm chuỗi khác.
 def _parse_pjl_page_count(response):
     """Parse response từ @PJL INFO PAGECOUNT"""
     if not response:
@@ -4751,6 +5240,8 @@ def _parse_pjl_page_count(response):
         return int(m.group(1))
     return None
 
+# WHY: Parse status variables (toner, drum, total pages) — các hãng dùng format
+# khác nhau nên thử nhiều pattern regex, bỏ qua biến không có trong response.
 def _parse_pjl_status(response):
     """Parse response từ @PJL INFO STATUS để lấy toner, drum..."""
     result = {}
@@ -5092,11 +5583,15 @@ DEFAULT_AUDIO_SETTINGS = {
     "sound_enabled": True,
     "selected_sound": None,
     "icon_theme": "1",
-    "color_mic_on": "#3498DB",
-    "color_mic_off": "#E74C3C",
+    "color_mic_on": "#008000",
+    "color_mic_off": "#c3063c",
     "show_widget_on_mic": False,
-    "always_on_top": False,
+    "always_on_top": True,
     "widget_opacity": 1.0,
+    "widget_width": 220,
+    "widget_height": 220,
+    "pos_x": 100,
+    "pos_y": 100,
 }
 
 # WHY: Merge với DEFAULT_AUDIO_SETTINGS để đảm bảo không thiếu field.
@@ -5122,7 +5617,7 @@ def api_audio_settings():
     if request.method == "POST":
         data = request.get_json() or {}
         settings = load_audio_settings()
-        for key in ['sound_enabled', 'selected_sound', 'icon_theme', 'color_mic_on', 'color_mic_off', 'show_widget_on_mic', 'always_on_top', 'widget_opacity']:
+        for key in ['sound_enabled', 'selected_sound', 'icon_theme', 'color_mic_on', 'color_mic_off', 'show_widget_on_mic', 'always_on_top', 'widget_opacity', 'widget_width', 'widget_height', 'pos_x', 'pos_y']:
             if key in data:
                 settings[key] = data[key]
         save_audio_settings(settings)
@@ -5195,78 +5690,89 @@ def api_audio_sound_files():
     
     return jsonify({'sound_files': files})
 
+# WHY: Audio module v2 (REWRITE) — pycaw / Windows Core Audio là nguồn sự thật DUY NHẤT.
+# Trước đây dùng sounddevice làm nguồn chính gây loạt bug:
+#   - Danh sách đầy device ảo/trùng (Microsoft Sound Mapper, Primary Sound Capture
+#     Driver, cùng 1 mic hiện 4 lần) — bấm vào đó set-default trả 404 âm thầm.
+#   - index sounddevice ≠ index pycaw → mute/volume/default phải "resolve tên substring"
+#     mong manh, sai thiết bị, thất bại không lỗi.
+#   - is_default lấy từ sd.default.device (PortAudio cache lúc import) → badge KHÔNG
+#     cập nhật sau khi đổi default dù Windows đã đổi.
+# v2: liệt kê trực tiếp từ IMMDeviceEnumerator, chỉ endpoint Active, dùng device id
+# (chuỗi GUID) làm khóa định danh duy nhất — chính xác tuyệt đối.
+# WHY: Helper — lấy default endpoint id (role multimedia) cho 1 data flow.
+def _audio_default_endpoint_id(devEnum, flow_code):
+    """Trả id của default endpoint cho 1 data flow (eCapture/eRender) role multimedia."""
+    try:
+        from pycaw.constants import ERole
+        dev = devEnum.GetDefaultAudioEndpoint(flow_code, ERole.eMultimedia.value)
+        return dev.GetId() if dev is not None else None
+    except Exception:
+        return None
+
+# WHY: Helper — tìm AudioDevice pycaw theo id chuỗi, không nhập nhằng tên/index.
+def _find_pycaw_device(dev_id):
+    """Tìm thiết bị pycaw theo id chuỗi (GUID) — nhanh, không nhập nhằng tên."""
+    from pycaw.pycaw import AudioUtilities
+    for py_dev in AudioUtilities.GetAllDevices():
+        if py_dev.id == dev_id:
+            return py_dev
+    return None
+
 @app.route("/api/audio/devices")
-# WHY: Hybrid approach:
-# 1) Dùng sounddevice (PortAudio) để lấy danh sách device names — reliable, cross-platform.
-# 2) Dùng pycaw (Windows Core Audio API) để lấy volume/mute — nếu khả dụng.
-# WHY sounddevice: Pycaw.GetAllDevices() thường trả về 0 devices trên nhiều Windows config.
-# Mic-status dùng sounddevice.query_devices() thành công (18 devices), nên dùng lại pattern này.
+# WHY: Route chính audio v2 — xem block WHY lớn phía trên @app.route.
 def api_audio_devices():
-    """Lấy danh sách thiết bị audio (sounddevice + pycaw)"""
+    """Liệt kê thiết bị âm thanh thực (pycaw/Core Audio) + volume/mute + default thật."""
     try:
         pythoncom.CoInitialize()
-        
-        # ─── Bước 1: Lấy danh sách devices từ sounddevice ───────────
-        import sounddevice as sd
+        from pycaw.pycaw import AudioUtilities, IMMDeviceEnumerator
+        from pycaw.constants import AudioDeviceState, EDataFlow
+        from pycaw.utils import CLSID_MMDeviceEnumerator
+        from comtypes import CoCreateInstance, CLSCTX_INPROC_SERVER
+
+        devEnum = CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, CLSCTX_INPROC_SERVER)
+        default_capture_id = _audio_default_endpoint_id(devEnum, EDataFlow.eCapture.value)
+        default_render_id = _audio_default_endpoint_id(devEnum, EDataFlow.eRender.value)
+
         devices = []
-        sd_devices = sd.query_devices()
-        
-        # WHY: Lấy default device indices từ sounddevice
-        default_input_idx = sd.default.device[0]
-        default_output_idx = sd.default.device[1]
-        
-        for i, dev in enumerate(sd_devices):
-            if dev['name']:
-                is_input = dev['max_input_channels'] > 0
-                is_output = dev['max_output_channels'] > 0
-                devices.append({
-                    'id': i,
-                    'name': dev['name'],
-                    'is_input': is_input,
-                    'is_output': is_output,
-                    'is_default': (i == default_input_idx or i == default_output_idx),
-                    'channels': dev['max_input_channels'] if is_input else dev['max_output_channels'],
-                    'samplerate': int(dev['default_samplerate']) if dev['default_samplerate'] else 0,
-                    'volume': 50,
-                    'muted': False,
-                })
-        
-        # ─── Bước 2: Bổ sung volume/mute từ pycaw (nếu khả dụng) ───
-        try:
-            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-            from ctypes import cast, POINTER
-            from comtypes import CLSCTX_ALL
-            
-            all_devs = AudioUtilities.GetAllDevices()
-            if all_devs:
-                debug_log(f"[audio] pycaw found {len(all_devs)} devices, enriching volume data")
-                for py_dev in all_devs:
-                    try:
-                        py_name = str(py_dev.FriendlyName or '')
-                        # Match với device trong list (theo tên)
-                        for dev in devices:
-                            if py_name and (py_name in dev['name'] or dev['name'] in py_name):
-                                # Lấy volume
-                                interface = py_dev.Activate(
-                                    IAudioEndpointVolume._iid_, CLSCTX_ALL, None
-                                )
-                                vol = cast(interface, POINTER(IAudioEndpointVolume))
-                                dev['volume'] = round(vol.GetMasterVolumeLevelScalar() * 100)
-                                dev['muted'] = bool(vol.GetMute())
-                                break
-                    except Exception:
-                        pass
-        except ImportError:
-            pass  # pycaw không available — vẫn trả về devices từ sounddevice
-        except Exception as e:
-            debug_log(f"[audio] pycaw enrichment error: {e}")
-        
-        debug_log(f"[audio] Returned {len(devices)} devices")
-        return jsonify({'devices': devices, 'source': 'sounddevice', 'count': len(devices)})
+        seen = set()
+        for py_dev in AudioUtilities.GetAllDevices():
+            if py_dev.state != AudioDeviceState.Active:
+                continue
+            dev_id = py_dev.id
+            if dev_id in seen:
+                continue
+            seen.add(dev_id)
+            try:
+                flow_code = AudioUtilities.GetEndpointDataFlow(dev_id, outputType=1)
+            except Exception:
+                flow_code = EDataFlow.eAll.value
+            is_input = (flow_code == EDataFlow.eCapture.value)
+            volume = 50
+            muted = False
+            try:
+                vol_obj = py_dev.EndpointVolume
+                volume = round(vol_obj.GetMasterVolumeLevelScalar() * 100)
+                muted = bool(vol_obj.GetMute())
+            except Exception:
+                pass
+            devices.append({
+                'id': dev_id,
+                'name': str(py_dev.FriendlyName or 'Không tên'),
+                'is_input': is_input,
+                'is_output': not is_input,
+                'is_default': (dev_id == default_capture_id) if is_input else (dev_id == default_render_id),
+                'volume': volume,
+                'muted': muted,
+            })
+
+        devices.sort(key=lambda d: (d['is_input'], d['name'].lower()))
+        debug_log(f"[audio] devices v2: {len(devices)} active endpoints")
+        return jsonify({'devices': devices, 'source': 'core-audio', 'count': len(devices)})
     except ImportError:
-        return jsonify({'devices': [], 'error': 'sounddevice không khả dụng'}), 501
+        return jsonify({'devices': [], 'error': 'pycaw không khả dụng'}), 501
     except Exception as e:
-        debug_log(f"[audio] api_audio_devices error: {e}")
+        debug_log(f"[audio] api_audio_devices v2 error: {e}")
         return jsonify({'devices': [], 'error': str(e)}), 500
 
 @app.route("/api/audio/mic-status")
@@ -5290,24 +5796,65 @@ def api_audio_mic_status():
         volume_level = None  # None = không xác định
         available_mics = []
 
-        # ─── Sounddevice: Lấy tên mic mặc định + danh sách micro ───
+        # ─── Sounddevice: Lấy danh sách micro + tên mic mặc định ───
+        # WHY: v2 — tên mic mặc định lấy từ pycaw GetDefaultAudioEndpoint (thật, cập nhật
+        # tức thì sau khi đổi default). KHÔNG dùng sd.default.device (PortAudio cache lúc
+        # import — không đổi sau khi set-default → mic_name hiển thị sai thiết bị cũ).
         try:
             import sounddevice as sd
-            # Lấy tên mic mặc định
-            default_idx = sd.default.device[0]
-            if default_idx is not None:
-                dev_info = sd.query_devices(default_idx, 'input')
-                mic_name = dev_info['name']
-                if '(' in mic_name:
-                    mic_name = mic_name.split('(')[-1].rstrip(')')
+            default_mic_id = None
+            try:
+                pythoncom.CoInitialize()
+                from pycaw.pycaw import AudioUtilities
+                mic_obj = AudioUtilities.GetMicrophone()
+                if mic_obj is not None:
+                    default_mic_id = mic_obj.GetId()
+                if default_mic_id:
+                    for py_dev in AudioUtilities.GetAllDevices():
+                        if py_dev.id == default_mic_id:
+                            mic_name = str(py_dev.FriendlyName or mic_name)
+                            break
+            except Exception:
+                pass
+            # Fallback: nếu không lấy được từ pycaw, dùng sd.default.device
+            if not default_mic_id:
+                default_idx = sd.default.device[0]
+                if default_idx is not None:
+                    try:
+                        dev_info = sd.query_devices(default_idx, 'input')
+                        mic_name = dev_info['name']
+                        if '(' in mic_name:
+                            mic_name = mic_name.split('(')[-1].rstrip(')')
+                    except Exception:
+                        pass
             # Liệt kê tất cả input devices
+            # WHY: Map tên sounddevice → các capture device id pycaw để đánh dấu default
+            # chính xác theo thiết bị thật (không theo index PortAudio cũ).
+            _capture_id_by_name = {}
+            try:
+                from pycaw.pycaw import AudioUtilities
+                from pycaw.constants import EDataFlow
+                for py_dev in AudioUtilities.GetAllDevices():
+                    try:
+                        if AudioUtilities.GetEndpointDataFlow(py_dev.id, outputType=1) != EDataFlow.eCapture.value:
+                            continue
+                    except Exception:
+                        continue
+                    n = str(py_dev.FriendlyName or '')
+                    if n:
+                        _capture_id_by_name.setdefault(n, []).append(py_dev.id)
+            except Exception:
+                pass
             for i, dev in enumerate(sd.query_devices()):
                 if dev['max_input_channels'] > 0:
                     available_mics.append({
                         'id': i,
                         'name': dev['name'],
                         'channels': dev['max_input_channels'],
-                        'default': (i == default_idx),
+                        'default': bool(default_mic_id and any(
+                            default_mic_id in ids for n, ids in _capture_id_by_name.items()
+                            if n in dev['name'] or dev['name'] in n
+                        )),
                         'samplerate': int(dev['default_samplerate']) if dev['default_samplerate'] else 0
                     })
         except Exception:
@@ -5353,9 +5900,16 @@ def api_audio_mic_status():
                                     app_name = winreg.EnumKey(sub, j)
                                     with winreg.OpenKey(sub, app_name) as app:
                                         if winreg.QueryValueEx(app, 'LastUsedTimeStop')[0] == 0:
+                                            # WHY: Loại trừ chính backend (widget monitor mic-level)
+                                            # để pythonw.exe không bị báo là app đang dùng mic thật.
+                                            if _is_self_mic_app(parse_app(app_name, True)):
+                                                continue
                                             is_active = True
                                             app_using = parse_app(app_name, True)
                             elif winreg.QueryValueEx(sub, 'LastUsedTimeStop')[0] == 0:
+                                # WHY: Loại trừ chính mình ở nhánh packaged apps tương tự.
+                                if _is_self_mic_app(parse_app(sub_name)):
+                                    continue
                                 is_active = True
                                 app_using = parse_app(sub_name)
                     except Exception:
@@ -5392,91 +5946,256 @@ def api_audio_mic_status():
             'mic_count': 0, 'duration': 0, 'error': str(e)
         }), 500
 
-@app.route("/api/audio/devices/<int:dev_id>/mute", methods=["POST"])
-# WHY: Toggle mute — đọc current mute state → set opposite.
-# Dùng IAudioEndpointVolume (core audio API), không qua mixer.
-def api_audio_mute(dev_id):
-    """Bật/tắt mute cho thiết bị audio"""
+# ─── Mic Level Monitor (Background Thread, Idle Auto-Stop) ──────
+# WHY: Background thread đọc mức âm thanh RMS từ mic mặc định bằng
+# sounddevice.InputStream — không block API requests.
+# QUAN TRỌNG: Stream TỰ ĐỘNG DỪNG sau MIC_LEVEL_IDLE_TIMEOUT giây không có poll.
+# Trước đây stream mở 1 lần rồi giữ mãi → Windows báo pythonw.exe "đang dùng mic"
+# vĩnh viễn dù widget đã đóng. Giờ: widget đóng → widget ngừng poll → stream tự tắt
+# → mic được giải phóng. Khi cần lại, lazy start lại.
+
+_mic_level_lock = threading.Lock()
+_current_mic_level = 0.0
+_mic_level_stream = None
+_mic_level_started = False
+_mic_level_last_poll = 0.0          # time.monotonic() lúc poll gần nhất
+_mic_level_last_error = 0.0         # throttle log lỗi khởi động (tránh spam mỗi 200ms)
+MIC_LEVEL_IDLE_TIMEOUT = 5.0        # dừng stream sau 5s không có poll
+
+# WHY: Import numpy ở module level (trong try/except vì numpy là optional dependency).
+# sounddevice trả về numpy arrays, nhưng import callback mỗi 200ms là wasteful.
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+# WHY: Callback của InputStream — chạy trên thread âm thanh, tính RMS mỗi khối.
+# Smooth (lerp) để VU meter không nhảy giật.
+def _mic_level_callback(indata, frames, time_info, status):
+    """Callback sounddevice InputStream — tính RMS mỗi khi có audio data."""
+    global _current_mic_level
     try:
-        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-        from ctypes import cast, POINTER
-        from comtypes import CLSCTX_ALL
-        
-        all_devs = AudioUtilities.GetAllDevices()
-        if 0 <= dev_id < len(all_devs):
-            endpoint = AudioUtilities.GetEndpoint(all_devs[dev_id].Id)
-            volume = endpoint.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            vol_obj = cast(volume, POINTER(IAudioEndpointVolume))
-            current = vol_obj.GetMute()
-            vol_obj.SetMute(not current, None)
-        return jsonify({'status': 'toggled'})
+        if np is None:
+            return
+        # indata shape: (frames, channels)
+        # Tính RMS: sqrt(mean(samples^2))
+        rms = float(np.sqrt(np.mean(indata ** 2)))
+        # WHY: Amplify nhẹ (x3) để VU meter nhạy hơn, clamp về 1.0
+        # Smooth với giá trị cũ (lerp 0.35) để tránh nhảy giật
+        with _mic_level_lock:
+            _current_mic_level = _current_mic_level * 0.65 + min(rms * 3.0, 1.0) * 0.35
+    except Exception:
+        pass
+
+# WHY: Watchdog thread — quét mỗi 2s, dừng stream nếu không có poll nào
+# trong MIC_LEVEL_IDLE_TIMEOUT giây. Giải phóng microphone tự động khi
+# widget đóng (widget ngừng poll /api/audio/mic-level).
+def _mic_level_idle_watchdog():
+    global _mic_level_stream, _mic_level_started, _current_mic_level
+    while True:
+        time.sleep(2)
+        try:
+            stream_to_stop = None
+            # WHY: Check + take stream trong cùng 1 khóa lock (atomic) — tránh
+            # check-then-act race với _ensure_mic_level_monitor tạo stream mới.
+            with _mic_level_lock:
+                if (_mic_level_started and _mic_level_stream is not None and
+                        (time.monotonic() - _mic_level_last_poll) > MIC_LEVEL_IDLE_TIMEOUT):
+                    stream_to_stop = _mic_level_stream
+                    _mic_level_stream = None
+                    _mic_level_started = False
+                    _current_mic_level = 0.0
+            # WHY: Gọi stream.stop() NGOÀI lock — stop() chờ callback trả về mà callback
+            # cũng acquire _mic_level_lock → giữ lock khi stop() sẽ deadlock.
+            if stream_to_stop is not None:
+                try:
+                    stream_to_stop.stop()
+                except Exception:
+                    pass
+                debug_log("[mic-level] Monitor stopped (idle timeout)")
+        except Exception:
+            pass
+
+# WHY: Xác định app đang dùng mic có phải chính backend không.
+# Backend mở InputStream đo mic-level → Windows registry (CapabilityAccessManager)
+# ghi nhận pythonw.exe/python.exe là app đang dùng mic. Đây là chính mình
+# (widget monitor), không phải app thật — cần loại trừ khỏi kết quả mic-status.
+def _is_self_mic_app(exe_path):
+    try:
+        if not exe_path:
+            return False
+        norm = os.path.normcase(os.path.normpath(exe_path))
+        self_exe = os.path.normcase(sys.executable)
+        if norm == self_exe:
+            return True
+        # WHY: Backend có thể chạy bằng python.exe còn registry ghi pythonw.exe
+        # (hoặc ngược lại) — so sánh thư mục + basename là đủ.
+        if os.path.basename(norm) in ('python.exe', 'pythonw.exe'):
+            return os.path.dirname(norm) == os.path.dirname(self_exe)
+    except Exception:
+        pass
+    return False
+
+# WHY: Watchdog chỉ cần 1 thread duy nhất cho toàn app (daemon — tự tắt khi exit).
+threading.Thread(target=_mic_level_idle_watchdog, daemon=True).start()
+
+def _ensure_mic_level_monitor():
+    """Lazy start InputStream. Nếu stream đang chạy → return ngay (không mở lại)."""
+    global _mic_level_stream, _mic_level_started, _mic_level_last_error
+    # WHY: Check + start trong cùng 1 khóa lock (atomic) — tránh check-then-act race:
+    # widget poll /mic-level mỗi 200ms VÀ AudioModule cũng poll /mic-level mỗi 200ms
+    # → 2 request song song cùng thấy _mic_level_started=False → cùng tạo InputStream
+    # → mở 2 stream trên cùng device (log "Monitor started on device #1" xuất hiện 2 lần).
+    with _mic_level_lock:
+        if _mic_level_started and _mic_level_stream is not None:
+            return
+        if _mic_level_stream is not None:
+            return
+        _mic_level_stream = "starting"
+    try:
+        import sounddevice as sd
+        default_input = sd.default.device[0]
+        if default_input is not None:
+            # WHY: Gán vào biến local trước, commit vào global CHỈ SAU KHI start() thành công.
+            # Nếu start() throw, _mic_level_stream không giữ tham chiếu stream chưa start
+            # (tránh leak object + tránh ghi đè stream cũ đang chạy).
+            stream = sd.InputStream(
+                device=default_input,
+                channels=1,
+                samplerate=16000,
+                blocksize=1024,
+                callback=_mic_level_callback,
+            )
+            stream.start()
+            with _mic_level_lock:
+                _mic_level_stream = stream
+                _mic_level_started = True
+            debug_log(f"[mic-level] Monitor started on device #{default_input}")
+        elif time.monotonic() - _mic_level_last_error > 30:
+            # WHY: Không có mic mặc định — log tối đa 1 lần/30s (poll 200ms sẽ spam)
+            _mic_level_last_error = time.monotonic()
+            with _mic_level_lock:
+                _mic_level_stream = None
+            debug_log("[mic-level] No default input device found")
     except Exception as e:
+        if time.monotonic() - _mic_level_last_error > 30:
+            # WHY: Throttle log lỗi khởi động — tránh spam mỗi 200ms khi thiếu dependency
+            _mic_level_last_error = time.monotonic()
+            debug_log(f"[mic-level] Failed to start monitor: {e}")
+        with _mic_level_lock:
+            _mic_level_stream = None
+
+@app.route("/api/audio/mic-level")
+# WHY: Endpoint siêu nhẹ — chỉ trả về RMS level (float 0.0-1.0).
+# Widget poll mỗi 200ms để vẽ VU meter real-time.
+# Background thread tự khởi động ở request đầu tiên.
+def api_audio_mic_level():
+    """Trả về mức âm thanh micro real-time (RMS 0.0-1.0)
+    Dùng background sounddevice InputStream để đọc audio level liên tục.
+    """
+    global _mic_level_last_poll
+    _mic_level_last_poll = time.monotonic()
+    _ensure_mic_level_monitor()
+    with _mic_level_lock:
+        level = _current_mic_level
+    return jsonify({'level': round(level, 4)})
+
+@app.route("/api/audio/devices/<dev_id>/mute", methods=["POST"])
+# WHY: Audio v2 — dev_id là id chuỗi (GUID) từ pycaw, match chính xác tuyệt đối,
+# không còn nhập nhằng index/name. Toggle mute qua IAudioEndpointVolume.
+def api_audio_mute(dev_id):
+    """Bật/tắt mute cho thiết bị audio (theo device id chuỗi)"""
+    try:
+        pythoncom.CoInitialize()
+        py_dev = _find_pycaw_device(dev_id)
+        if py_dev is None:
+            return jsonify({'error': 'Không tìm thấy thiết bị'}), 404
+        name = str(py_dev.FriendlyName or dev_id)
+        vol_obj = py_dev.EndpointVolume
+        current = bool(vol_obj.GetMute())
+        vol_obj.SetMute(not current, None)
+        debug_log(f"[audio] mute '{name}' -> {'muted' if not current else 'unmuted'}")
+        return jsonify({'status': 'toggled', 'muted': not current, 'name': name})
+    except Exception as e:
+        debug_log(f"[audio] mute {dev_id} error: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route("/api/audio/devices/<int:dev_id>/volume", methods=["PUT"])
-# WHY: SetMasterVolumeLevelScalar với giá trị 0.0-1.0.
-# Clamp 0-100 từ frontend để tránh giá trị âm hoặc > 100%.
+@app.route("/api/audio/devices/<dev_id>/volume", methods=["PUT"])
+# WHY: Audio v2 — SetMasterVolumeLevelScalar 0.0-1.0, clamp 0-100 từ frontend.
 def api_audio_volume(dev_id):
-    """Điều chỉnh âm lượng thiết bị audio"""
+    """Điều chỉnh âm lượng thiết bị audio (theo device id chuỗi)"""
     try:
-        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-        from ctypes import cast, POINTER
-        from comtypes import CLSCTX_ALL
-        
+        pythoncom.CoInitialize()
         data = request.get_json() or {}
         vol = max(0, min(100, int(data.get('volume', 50)))) / 100.0
-        
-        all_devs = AudioUtilities.GetAllDevices()
-        if 0 <= dev_id < len(all_devs):
-            endpoint = AudioUtilities.GetEndpoint(all_devs[dev_id].Id)
-            volume = endpoint.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            vol_obj = cast(volume, POINTER(IAudioEndpointVolume))
-            vol_obj.SetMasterVolumeLevelScalar(vol, None)
-        return jsonify({'status': 'set', 'volume': int(vol * 100)})
+        py_dev = _find_pycaw_device(dev_id)
+        if py_dev is None:
+            return jsonify({'error': 'Không tìm thấy thiết bị'}), 404
+        name = str(py_dev.FriendlyName or dev_id)
+        py_dev.EndpointVolume.SetMasterVolumeLevelScalar(vol, None)
+        debug_log(f"[audio] volume '{name}' -> {int(vol * 100)}%")
+        return jsonify({'status': 'set', 'volume': int(vol * 100), 'name': name})
     except Exception as e:
+        debug_log(f"[audio] volume {dev_id} error: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route("/api/audio/devices/<int:dev_id>/default", methods=["POST"])
-# WHY: Dùng PolicyConfigClient (COM interface) — cách duy nhất để set default device programmatically.
-# Không dùng được win32 API SetDefaultEndpoint (chỉ có trong Windows 10+ SDK).
+@app.route("/api/audio/devices/<dev_id>/default", methods=["POST"])
+# WHY: Set default qua AudioUtilities.SetDefaultDevice (pycaw helper dùng
+# CLSID_CPolicyConfigClient/IPolicyConfig — verify hoạt động, HRESULT 0).
+# WHY: Set CẢ 3 role + verify default đổi thật, nếu không đổi trả lỗi rõ ràng.
 def api_audio_set_default(dev_id):
-    """Đặt thiết bị audio làm mặc định dùng PolicyConfigClient"""
+    """Đặt thiết bị audio làm mặc định (set 3 role + verify)"""
     try:
+        pythoncom.CoInitialize()
         from pycaw.pycaw import AudioUtilities
-        from pycaw.constants import CLSID_MMDeviceEnumerator, DEVICE_STATE_ACTIVE, ERole, EDataFlow
-        
-        all_devs = AudioUtilities.GetAllDevices()
-        if 0 <= dev_id < len(all_devs):
-            dev = all_devs[dev_id]
-            dev_id_str = dev.Id
-            
-            # Use PolicyConfigClient to set default endpoint
+        from pycaw.constants import ERole, EDataFlow
+
+        py_dev = _find_pycaw_device(dev_id)
+        if py_dev is None:
+            return jsonify({'error': 'Không tìm thấy thiết bị'}), 404
+        name = str(py_dev.FriendlyName or dev_id)
+        try:
+            flow_code = AudioUtilities.GetEndpointDataFlow(dev_id, outputType=1)
+        except Exception:
+            flow_code = EDataFlow.eAll.value
+        is_input = (flow_code == EDataFlow.eCapture.value)
+
+        roles = [ERole.eConsole, ERole.eMultimedia, ERole.eCommunications]
+        AudioUtilities.SetDefaultDevice(dev_id, roles=roles)
+
+        # WHY: Verify default đổi THẬT bằng cách đọc lại endpoint default đúng flow
+        # của thiết bị vừa đặt. Retry tăng dần (0.3s → 0.6s → 1.2s → 2.4s) vì Windows
+        # áp dụng SetDefaultEndpoint BẤT ĐỒNG BỘ — máy bận (audio service đang xử lý
+        # 3 role liên tiếp) có thể mất >200ms mới đổi. Trước đây chỉ sleep 0.2s 1 lần
+        # → nếu đọc sớm vẫn thấy device cũ → trả 500 "chưa thay đổi" dù đổi THÀNH CÔNG
+        # (lỗi giả — một nguyên nhân "lúc được lúc không").
+        # WHY: Helper local — đọc lại default endpoint (flow đúng của thiết bị vừa đặt,
+        # role eMultimedia) và so sánh id. Tách riêng để retry loop gọi nhiều lần.
+        def _verify_default():
             try:
-                from pycaw.policyconfig import PolicyConfigClient
-                policy = PolicyConfigClient()
-                data_flow = dev.DataFlow  # 0=render(output), 1=capture(input)
-                if data_flow == 0:
-                    policy.SetDefaultEndpoint(dev_id_str, ERole.ERole.console)
-                else:
-                    policy.SetDefaultEndpoint(dev_id_str, ERole.ERole.console)
+                from comtypes import CoCreateInstance, CLSCTX_INPROC_SERVER
+                from pycaw.pycaw import IMMDeviceEnumerator
+                from pycaw.utils import CLSID_MMDeviceEnumerator
+                devEnum = CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, CLSCTX_INPROC_SERVER)
+                flow_to_check = EDataFlow.eCapture.value if is_input else EDataFlow.eRender.value
+                curr = devEnum.GetDefaultAudioEndpoint(flow_to_check, ERole.eMultimedia.value)
+                return curr is not None and curr.GetId() == dev_id
             except Exception:
-                # Fallback: use comtypes directly
-                try:
-                    import comtypes
-                    from ctypes import OleDLL, POINTER, c_int
-                    POLARITY_CONFIG_CLSID = "{870af99c-171d-4f9e-af0d-e63df40c2bc9}"
-                    IPolicyConfig_IID = "{F8679F50-850A-41CF-9C72-430F290290C8}"
-                    policy = comtypes.CoCreateInstance(
-                        comtypes.GUID(POLARITY_CONFIG_CLSID),
-                        comtypes.IPolicyConfig,
-                        comtypes.CLSCTX_ALL
-                    )
-                    # If we got here without AttributeError, try to call SetDefaultEndpoint
-                    from ctypes import c_wchar_p, HRESULT
-                    policy.SetDefaultEndpoint(dev_id_str, 0)
-                except Exception: pass
-        return jsonify({'status': 'set_default'})
+                return False
+
+        changed = False
+        for _delay in (0.3, 0.6, 1.2, 2.4):
+            time.sleep(_delay)
+            changed = _verify_default()
+            if changed:
+                break
+
+        debug_log(f"[audio] set-default '{name}' roles={[r.name for r in roles]} verified={changed}")
+        if not changed:
+            return jsonify({'error': 'API đã gọi nhưng thiết bị mặc định chưa thay đổi'}), 500
+        return jsonify({'status': 'set_default', 'is_input': is_input, 'name': name})
     except Exception as e:
+        debug_log(f"[audio] set-default {dev_id} error: {e}")
         return jsonify({'error': str(e)}), 500
 
 
@@ -5675,6 +6394,8 @@ def api_file_copier_run():
 
 
 # ─── DEBUG LOG API ────────────────────────────────────────────────
+# WHY: Đọc debug.log cho màn hình Debug trong app — file log vòng lặp của backend,
+# giúp user gửi log khi gặp lỗi mà không cần mở terminal.
 @app.route("/api/debug-log")
 def api_debug_log():
     """Lấy nội dung file debug.log"""
@@ -5687,6 +6408,22 @@ def api_debug_log():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# WHY: Endpoint ghi log từ widget (webview riêng) vào debug.log — widget không
+# gọi được debug_log() trực tiếp vì chạy ngoài backend; mọi thao tác drag/resize/
+# close của widget POST qua đây để Log tab trong app chính thấy được, phục vụ
+# bắt bug liên quan widget. Fire-and-forget từ phía client, không validate gắt.
+@app.route("/api/log", methods=["POST"])
+def api_log_append():
+    """Nhận log từ widget và ghi vào debug.log"""
+    data = request.get_json(silent=True) or {}
+    msg = data.get("msg")
+    if isinstance(msg, str) and msg.strip():
+        debug_log(f"[widget] {msg.strip()[:500]}")
+        return jsonify({'ok': True})
+    return jsonify({'ok': False, 'error': 'Thiếu msg'}), 400
+
+# WHY: Xóa debug.log khi user bấm Clear — giải phóng dung lượng + bắt đầu log sạch
+# để debug vấn đề tiếp theo dễ hơn.
 @app.route("/api/debug-log/clear", methods=["POST"])
 def api_debug_log_clear():
     """Xóa file debug.log"""
@@ -5697,8 +6434,33 @@ def api_debug_log_clear():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# WHY: Ghi log đã lọc (client) xuống đường dẫn do user chọn qua save dialog Tauri.
+# Anchor download bị WebView2 chặn → backend ghi file trực tiếp; thêm BOM để
+# Notepad hiển thị UTF-8 (tiếng Việt) đúng. Chỉ nhận absolute path (user tự chọn).
+@app.route("/api/debug-log/export", methods=["POST"])
+def api_debug_log_export_write():
+    """Lưu nội dung log export xuống file (path do user chọn)."""
+    data = request.get_json(silent=True) or {}
+    path = data.get("path")
+    content = data.get("content")
+    if not isinstance(path, str) or not path.strip() or not isinstance(content, str):
+        return jsonify({"error": "Thiếu path hoặc content"}), 400
+    path = path.strip()
+    if not os.path.isabs(path):
+        return jsonify({"error": "Path phải là đường dẫn tuyệt đối"}), 400
+    try:
+        # WHY: BOM (\ufeff) đầu file — Notepad mặc định đọc ANSI, không có BOM
+        # thì tiếng Việt bị vỡ chữ. Backend app mở file đều dùng utf-8-sig nên an toàn.
+        with open(path, "w", encoding="utf-8-sig") as f:
+            f.write(content)
+        return jsonify({"ok": True, "path": path})
+    except OSError as e:
+        return jsonify({"error": str(e)}), 500
+
 shutdown_server = False
 
+# WHY: Tắt toàn bộ: terminate MỌI project đang quản lý rồi os._exit(0) qua thread
+# riêng — không chờ Flask teardown vì app phải chết ngay (kèm theo app Tauri chính).
 @app.route("/api/shutdown", methods=["POST"])
 def api_shutdown():
     global shutdown_server
@@ -5719,9 +6481,11 @@ def api_shutdown():
     threading.Thread(target=lambda: os._exit(0), daemon=True).start()
     return jsonify({"status": "shutting down"})
 
+# WHY: Preload endpoint — trả về toàn bộ dữ liệu khởi tạo 1 lần (projects +
+# running state) cho LoadingScreen render nhanh khi boot, tránh N request rời rạc.
 @app.route('/api/preload', methods=['GET'])
 def api_preload():
-    """WHY: Preload endpoint — trả về tất cả dữ liệu khởi tạo một lần."""
+    """Preload endpoint — trả về tất cả dữ liệu khởi tạo một lần."""
     debug_log("Preload requested")
     try:
         projects = []
@@ -5749,13 +6513,43 @@ def api_preload():
 
 
 
+# WHY: Route gốc serve SPA index.html từ FRONTEND_DIST (build production của Vite)
+# — Flask là web server duy nhất, không cần tách static server riêng.
 @app.route("/")
 def index():
     return send_from_directory(str(FRONTEND_DIST), "index.html")
 
+# WHY: Catch-all route serve assets/static của SPA (js/css/font...) — path đệ quy,
+# 404 nếu file không tồn tại sẽ do Flask trả lỗi mặc định.
 @app.route("/<path:path>")
 def static_files(path):
     return send_from_directory(str(FRONTEND_DIST), path)
+
+# WHY: Khôi phục project có start_on_launch khi app boot. Port đã có dev-server
+# listen (kể cả server ngoài app/user tự chạy) → KHÔNG start lại — đúng nguyên tắc
+# "liveness từ port probe, không từ PID lưu" (root cause bug running-state).
+# Idempotent: sau crash + auto-restart, server vẫn chiếm port → skip.
+def _autostart_servers():
+    if not config.get("projects_on_boot", True):
+        debug_log("_autostart_servers: disabled (projects_on_boot=false)")
+        return
+    started, skipped = [], []
+    for p in config["projects"]:
+        if not p.get("start_on_launch"):
+            continue
+        if _is_port_running_for_dev(p.get("port")):
+            skipped.append(f"{p['name']} (port {p.get('port')} busy)")
+            continue
+        try:
+            res = _start_project(p)
+            if res.get("status") == "started":
+                started.append(p["name"])
+            else:
+                skipped.append(f"{p['name']} ({res.get('error', 'fail')})")
+        except Exception as e:
+            skipped.append(f"{p['name']} ({e})")
+    if started or skipped:
+        debug_log(f"_autostart_servers: started={started} skipped={skipped}")
 
 if __name__ == "__main__":
     import sys, time
@@ -5773,6 +6567,16 @@ if __name__ == "__main__":
     while restart_count < max_restarts:
         try:
             print(f"Dashboard API running on http://127.0.0.1:{port} (attempt {restart_count + 1}/{max_restarts})")
+            # WHY: Ghi version vào debug.log mỗi lần boot — Log tab hiển thị được
+            # version app đang chạy, tránh nhầm lẫn khi kiểm tra bug trên bản cũ.
+            debug_log(f"[app] MultiTool Pro v1.11.3 started (attempt {restart_count + 1})")
+            # WHY: Khôi phục projects start_on_launch — chạy TRƯỚC app.run (chặn
+            # /api/projects trả running sau khi auto-start). Idempotent: server đã
+            # chạy sẵn trên port → skip.
+            try:
+                _autostart_servers()
+            except Exception as e:
+                debug_log(f"_autostart_servers error: {e}")
             app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
             # Nếu app.run() return không exception (hiếm), vẫn tính là 1 lần crash
             restart_count += 1

@@ -92,6 +92,8 @@ const HistoryChart = memo(function HistoryChart({ history, range }: { history: H
   const svgRef = useRef<SVGSVGElement>(null)
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null)
 
+  // WHY: Tooltip hover trên chart — scale clientX về tọa độ SVG (responsive),
+  // tìm điểm gần nhất theo khoảng cách X (nearest neighbor) để hiển thị giá trị.
   const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
     const svg = svgRef.current
     if (!svg) return
@@ -107,6 +109,7 @@ const HistoryChart = memo(function HistoryChart({ history, range }: { history: H
     }
     setHoveredIdx(closest)
   }
+  // WHY: Rời chart → tắt tooltip (không cần xử lý vì không giữ state khác).
   const handleMouseLeave = () => setHoveredIdx(null)
 
   return (

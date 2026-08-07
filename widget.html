@@ -1,0 +1,1754 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mic Widget</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --font-mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+      --transition-color: 0.55s cubic-bezier(0.4, 0, 0.2, 1);
+      --transition-bounce: 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+      --transition-smooth: 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      font-family: var(--font-mono);
+      background: transparent;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    /* WHY: KHÔNG flex-center body — #widget phải LUÔN phủ 100% cửa sổ.
+       Trước đây body căn giữa #widget (được set inline px sau resize) → khi window
+       ≠ widget, xuất hiện viền đen bao quanh "widget nhỏ ở giữa" (transparent window
+       render thành đen trên Windows). Window giờ opaque + #widget fixed inset:0. */
+    body {
+      overflow: hidden;
+    }
+
+    /*
+      WHY: KHÔNG dùng data-tauri-drag-region trên body.
+      data-tauri-drag-region (webkit-app-region: drag) không đáng tin cậy
+      trên body trong Tauri v2 — nhiều Chromium/webview version bỏ qua nó.
+      Thay vào đó dùng JS drag với pointer events + setPointerCapture.
+
+      data-tauri-no-drag vẫn giữ trên các nút (close, context menu)
+      để JS drag skip những element này.
+    */
+
+    #widget {
+      /* WHY: fixed inset:0 — widget LUÔN phủ kín cửa sổ, KHÔNG đặt px thủ công.
+         Mọi resize chỉ gọi win.setSize(); CSS tự giãn theo window → không thể có
+         khoảng trống đen giữa widget và cửa sổ. */
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      cursor: grab;
+      transition: background-color var(--transition-color),
+                  box-shadow var(--transition-color),
+                  opacity 0.3s ease;
+    }
+
+    /* WHY: Khi đang kéo chỉ đổi cursor — KHÔNG scale/filter nữa. Transform scale(0.98)
+       + brightness(0.92) cũ làm widget co nhỏ/tối đi trong lúc kéo → lộ nền cửa sổ
+       (tối) quanh viền → cảm giác "2 lớp: giao diện + cửa sổ đen bọc ngoài". */
+    #widget.dragging {
+      cursor: grabbing;
+    }
+
+    /* ======================================
+       RIPPLE EFFECT
+       ====================================== */
+    .ripple-container {
+      position: absolute;
+      inset: 0;
+      overflow: hidden;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    .ripple {
+      position: absolute;
+      width: 0;
+      height: 0;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      border-radius: 50%;
+      pointer-events: none;
+      opacity: 0;
+    }
+
+    .ripple.on {
+      animation: ripple-on 0.7s ease-out forwards;
+      background: radial-gradient(circle, rgba(255,255,255,0.20) 0%, transparent 70%);
+    }
+
+    .ripple.off {
+      animation: ripple-off 0.6s ease-out forwards;
+      background: radial-gradient(circle, rgba(0,0,0,0.15) 0%, transparent 70%);
+    }
+
+    @keyframes ripple-on {
+      0%   { width: 0; height: 0; opacity: 0.5; }
+      60%  { opacity: 0.4; }
+      100% { width: 300%; height: 300%; opacity: 0; }
+    }
+
+    @keyframes ripple-off {
+      0%   { width: 0; height: 0; opacity: 0.5; }
+      50%  { opacity: 0.3; }
+      100% { width: 250%; height: 250%; opacity: 0; }
+    }
+
+    /* ======================================
+       BREATHING GLOW
+       ====================================== */
+    .glow-ring {
+      position: absolute;
+      width: 70px;
+      height: 70px;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      border-radius: 50%;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.6s ease;
+      z-index: 0;
+    }
+
+    .glow-ring.visible {
+      opacity: 1;
+      animation: glow-breathe 2.5s ease-in-out infinite;
+    }
+
+    @keyframes glow-breathe {
+      0%, 100% { box-shadow: 0 0 12px 4px rgba(255,255,255,0.08); transform: translate(-50%, -50%) scale(1); }
+      50%      { box-shadow: 0 0 28px 10px rgba(255,255,255,0.18); transform: translate(-50%, -50%) scale(1.12); }
+    }
+
+    /* ======================================
+       HEADER
+       ====================================== */
+    #widget-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 6px 12px;
+      background: rgba(0, 0, 0, 0.30);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      flex-shrink: 0;
+      min-height: 32px;
+      position: relative;
+      z-index: 1;
+    }
+
+    #widget-header .header-left {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      color: rgba(255, 255, 255, 0.85);
+    }
+
+    #widget-header .header-left .dots {
+      font-size: 10px;
+      opacity: 0.7;
+    }
+
+    #close-btn {
+      width: 22px;
+      height: 22px;
+      border: none;
+      background: rgba(0, 0, 0, 0.35);
+      color: rgba(255, 255, 255, 0.7);
+      font-size: 11px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      flex-shrink: 0;
+      -webkit-app-region: no-drag;
+    }
+
+    #close-btn:hover {
+      background: rgba(239, 68, 68, 0.8);
+      color: white;
+    }
+
+    /* ======================================
+       WIDGET BODY
+       ====================================== */
+    #widget-body {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 12px;
+      text-align: center;
+      position: relative;
+      overflow: hidden;
+      z-index: 1;
+    }
+
+    #widget-body.active::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(circle at center, rgba(255,255,255,0.10) 0%, transparent 70%);
+      animation: pulse-aura 2s ease-in-out infinite;
+      pointer-events: none;
+    }
+
+    @keyframes pulse-aura {
+      0%, 100% { opacity: 0.3; transform: scale(1); }
+      50% { opacity: 0.7; transform: scale(1.15); }
+    }
+
+    /* ======================================
+       VU METER — Circular Ring Around Mic Icon
+       ====================================== */
+    .vu-ring-container {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, calc(-50% - 20px)); /* shift up for timer */
+      width: 70px;
+      height: 70px;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    .vu-ring-track {
+      fill: none;
+      stroke: rgba(255,255,255,0.08);
+      stroke-width: 4;
+    }
+
+    .vu-ring-fill {
+      fill: none;
+      stroke-width: 4;
+      stroke-linecap: round;
+      transform: rotate(-90deg);
+      transform-origin: center;
+      transition: stroke-dashoffset 0.08s ease-out;
+    }
+
+    .vu-ring-fill.low { stroke: #34d399; }      /* green */
+    .vu-ring-fill.mid { stroke: #fbbf24; }      /* yellow */
+    .vu-ring-fill.high { stroke: #ef4444; }     /* red */
+
+    /* ======================================
+       VU METER — Horizontal Bars
+       ====================================== */
+    #vu-bars {
+      display: flex;
+      align-items: flex-end;
+      justify-content: center;
+      gap: 3px;
+      height: 18px;
+      margin: 2px 0 1px;
+      position: relative;
+      z-index: 1;
+      pointer-events: none;
+    }
+
+    .vu-bar {
+      width: 6px;
+      height: 14px;
+      background: rgba(255,255,255,0.06);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .vu-bar-fill {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 0%;
+      transition: height 0.08s ease-out, background-color 0.15s ease;
+    }
+
+    .vu-bar-fill.lit-1 { background: #34d399; }  /* green */
+    .vu-bar-fill.lit-2 { background: #34d399; }
+    .vu-bar-fill.lit-3 { background: #10b981; }
+    .vu-bar-fill.lit-4 { background: #10b981; }
+    .vu-bar-fill.lit-5 { background: #fbbf24; }  /* yellow */
+    .vu-bar-fill.lit-6 { background: #f59e0b; }
+    .vu-bar-fill.lit-7 { background: #ef4444; }  /* red */
+    .vu-bar-fill.lit-8 { background: #dc2626; }
+
+    /* ======================================
+       MIC ICON
+       ====================================== */
+    #mic-icon {
+      font-size: 38px;
+      margin-bottom: 4px;
+      line-height: 1;
+      filter: drop-shadow(0 2px 8px rgba(0,0,0,0.3));
+      transition: transform var(--transition-bounce),
+                  filter var(--transition-smooth);
+      position: relative;
+      z-index: 1;
+      pointer-events: none;
+    }
+
+    #mic-icon.bounce {
+      animation: icon-bounce 1.2s ease-in-out infinite;
+    }
+
+    #mic-icon.flip {
+      animation: icon-flip 0.45s ease-out;
+    }
+
+    @keyframes icon-flip {
+      0%   { transform: scale(1) rotateY(0deg); }
+      35%  { transform: scale(1.3) rotateY(80deg); }
+      70%  { transform: scale(1.15) rotateY(0deg); }
+      100% { transform: scale(1) rotateY(0deg); }
+    }
+
+    @keyframes icon-bounce {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-6px); }
+    }
+
+    /* ======================================
+       TIMER
+       ====================================== */
+    #timer {
+      font-size: 22px;
+      font-weight: 800;
+      font-family: var(--font-mono);
+      color: white;
+      text-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+      letter-spacing: 1.5px;
+      line-height: 1.2;
+      height: 26px;
+      margin: 2px 0;
+      transition: text-shadow var(--transition-smooth);
+      pointer-events: none;
+    }
+
+    #timer.active {
+      animation: timer-glow 1.5s ease-in-out infinite;
+    }
+
+    @keyframes timer-glow {
+      0%, 100% { text-shadow: 0 2px 8px rgba(0,0,0,0.4); }
+      50% { text-shadow: 0 0 16px rgba(255,255,255,0.3), 0 2px 8px rgba(0,0,0,0.4); }
+    }
+
+    .timer-enter {
+      animation: timer-enter 0.4s ease-out;
+    }
+
+    @keyframes timer-enter {
+      0%   { opacity: 0; transform: translateY(8px) scale(0.9); }
+      100% { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    /* ======================================
+       APP NAME
+       ====================================== */
+    #app-name {
+      font-size: 11px;
+      font-weight: 600;
+      color: rgba(255, 255, 255, 0.85);
+      max-width: 90%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      text-shadow: 0 1px 4px rgba(0,0,0,0.3);
+      margin: 2px 0;
+      position: relative;
+      z-index: 1;
+      pointer-events: none;
+    }
+
+    .app-name-enter {
+      animation: app-name-enter 0.35s ease-out;
+    }
+
+    @keyframes app-name-enter {
+      0%   { opacity: 0; transform: translateY(4px); }
+      100% { opacity: 1; transform: translateY(0); }
+    }
+
+    /* ======================================
+       STATUS PILL
+       ====================================== */
+    #status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 10px;
+      background: rgba(0, 0, 0, 0.30);
+      border: 1px solid rgba(255, 255, 255, 0.10);
+      font-size: 8px;
+      font-weight: 700;
+      color: rgba(255, 255, 255, 0.85);
+      letter-spacing: 0.5px;
+      margin-top: 4px;
+      text-transform: uppercase;
+      position: relative;
+      z-index: 1;
+      pointer-events: none;
+      transition: border-color var(--transition-smooth),
+                  background var(--transition-smooth);
+    }
+
+    .pill-enter {
+      animation: pill-enter 0.35s ease-out;
+    }
+
+    @keyframes pill-enter {
+      0%   { opacity: 0; transform: translateY(6px) scale(0.92); }
+      100% { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    #status-dot {
+      width: 7px;
+      height: 7px;
+      background: #64748b;
+      flex-shrink: 0;
+    }
+
+    #status-dot.active {
+      background: #34d399;
+      animation: dot-ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;
+    }
+
+    @keyframes dot-ping {
+      0%   { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.5); }
+      70%  { box-shadow: 0 0 0 6px rgba(52, 211, 153, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0); }
+    }
+
+    /* ======================================
+       RESIZE HANDLE — Góc phải dưới
+       ====================================== */
+    #resize-handle {
+      position: absolute;
+      bottom: 0;
+      right: 0;
+      width: 24px;
+      height: 24px;
+      cursor: nwse-resize;
+      z-index: 10;
+      pointer-events: auto;
+      display: flex;
+      align-items: flex-end;
+      justify-content: flex-end;
+      padding: 2px;
+      opacity: 0.5;
+      transition: opacity 0.2s ease;
+      -webkit-app-region: no-drag;
+      touch-action: none;
+    }
+
+    #resize-handle:hover {
+      opacity: 1;
+    }
+
+    #widget.dragging #resize-handle {
+      opacity: 0.3;
+    }
+
+    #resize-handle svg {
+      width: 16px;
+      height: 16px;
+    }
+
+    #resize-handle .grip-line {
+      stroke: rgba(255, 255, 255, 0.6);
+      stroke-width: 1.5;
+      stroke-linecap: round;
+      transition: stroke 0.2s ease;
+    }
+
+    #resize-handle:hover .grip-line {
+      stroke: rgba(255, 255, 255, 0.95);
+    }
+
+    /* ======================================
+       TOOLTIP
+       ====================================== */
+    #tooltip {
+      position: absolute;
+      bottom: 4px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 7px;
+      color: rgba(255, 255, 255, 0.30);
+      white-space: nowrap;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.3s ease;
+    }
+
+    #widget:hover #tooltip {
+      opacity: 1;
+    }
+
+    #widget.dragging #tooltip {
+      opacity: 0;
+    }
+
+    /* ======================================
+       CONTEXT MENU — Premium Design
+       ====================================== */
+    #context-menu {
+      position: fixed;
+      z-index: 9999;
+      min-width: 220px;
+      padding: 6px 0;
+      background: #0f172a;
+      -webkit-app-region: no-drag;
+      border: 1px solid rgba(52, 211, 153, 0.15);
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(52, 211, 153, 0.05);
+      font-size: 11px;
+      font-weight: 500;
+      color: #e2e8f0;
+      display: none;
+      opacity: 0;
+      transition: opacity 0.15s ease;
+    }
+
+    #context-menu.show {
+      display: block;
+      opacity: 1;
+    }
+
+    #context-menu .menu-header {
+      padding: 5px 14px 4px;
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: 1.2px;
+      text-transform: uppercase;
+      margin: 0 0 2px;
+      background: linear-gradient(135deg, #10b981 0%, #06b6d4 50%, #8b5cf6 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      border-bottom: 1px solid rgba(52, 211, 153, 0.1);
+      animation: header-gradient-shift 3s ease-in-out infinite alternate;
+      background-size: 200% 200%;
+    }
+
+    @keyframes header-gradient-shift {
+      0%   { background-position: 0% 50%; }
+      100% { background-position: 100% 50%; }
+    }
+
+    #context-menu .menu-header .header-icon {
+      -webkit-text-fill-color: initial;
+      color: inherit;
+      margin-right: 4px;
+    }
+
+    #context-menu button {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      padding: 7px 14px;
+      text-align: left;
+      background: none;
+      border: none;
+      border-left: 2px solid transparent;
+      color: #cbd5e1;
+      font-size: 11px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.12s ease;
+      font-family: var(--font-mono);
+    }
+
+    #context-menu button:hover {
+      background: linear-gradient(90deg, rgba(52, 211, 153, 0.12) 0%, transparent 100%);
+      color: #34d399;
+      border-left-color: #34d399;
+      padding-left: 16px;
+    }
+
+    #context-menu button:active {
+      transform: scale(0.98);
+    }
+
+    #context-menu button .btn-icon {
+      flex-shrink: 0;
+      width: 16px;
+      text-align: center;
+      font-size: 12px;
+    }
+
+    #context-menu button .btn-text {
+      flex: 1;
+    }
+
+    #context-menu .menu-divider {
+      height: 1px;
+      background: linear-gradient(90deg, rgba(52, 211, 153, 0.2) 0%, transparent 100%);
+      margin: 3px 14px;
+    }
+
+    #context-menu button.danger:hover {
+      background: linear-gradient(90deg, rgba(239, 68, 68, 0.12) 0%, transparent 100%);
+      color: #ef4444;
+      border-left-color: #ef4444;
+    }
+
+    /* ======================================
+       COLOR PICKER IN CONTEXT MENU
+       ====================================== */
+    .color-section {
+      padding: 2px 12px 6px;
+    }
+
+    .color-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 10px;
+      font-weight: 600;
+      color: #cbd5e1;
+      padding: 4px 0 3px;
+    }
+
+    .color-label .color-preview {
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      flex-shrink: 0;
+      margin-left: 6px;
+      border: 1px solid rgba(255,255,255,0.15);
+    }
+
+    .color-swatches {
+      display: flex;
+      gap: 4px;
+      flex-wrap: wrap;
+    }
+
+    .color-swatch {
+      width: 18px;
+      height: 18px;
+      border: 2px solid transparent;
+      cursor: pointer;
+      transition: all 0.12s ease;
+      position: relative;
+    }
+
+    .color-swatch:hover {
+      transform: scale(1.25);
+      z-index: 2;
+    }
+
+    .color-swatch.active {
+      border-color: white;
+      box-shadow: 0 0 6px rgba(255,255,255,0.3);
+    }
+
+    .color-swatch.custom-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(255,255,255,0.08);
+      font-size: 10px;
+      color: #94a3b8;
+    }
+
+    .color-swatch.custom-btn:hover {
+      background: rgba(255,255,255,0.15);
+      color: #e2e8f0;
+    }
+
+    /* Native color input hidden — triggered by custom-btn click */
+    .color-input-hidden {
+      position: absolute;
+      width: 0;
+      height: 0;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    /* ======================================
+       MISC
+       ====================================== */
+    #widget.loading #widget-body {
+      opacity: 0.5;
+    }
+
+    @media (max-width: 200px) {
+      #mic-icon { font-size: 28px; }
+      #timer { font-size: 16px; height: 20px; }
+      #app-name { font-size: 9px; }
+    }
+  </style>
+</head>
+<!--
+  WHY: KHÔNG dùng data-tauri-drag-region trên body.
+  Thay vào đó dùng JS drag với pointer events bên dưới.
+  data-tauri-no-drag vẫn an toàn trên các nút để JS drag skip chúng.
+-->
+<body>
+  <div id="widget" class="loading">
+    <!-- Ripple container -->
+    <div class="ripple-container" id="ripple-container"></div>
+
+    <!-- Breathing glow ring -->
+    <div class="glow-ring" id="glow-ring"></div>
+
+    <!-- Header -->
+    <div id="widget-header">
+      <div class="header-left">
+        <span class="dots">⠿</span>
+        <span>Mic Monitor</span>
+      </div>
+      <button id="close-btn" data-tauri-no-drag title="Đóng widget">✕</button>
+    </div>
+
+    <!-- Body -->
+    <div id="widget-body">
+      <!-- VU Circular Ring around mic icon area -->
+      <div class="vu-ring-container" id="vu-ring-container">
+        <svg viewBox="0 0 70 70" width="70" height="70">
+          <circle class="vu-ring-track" cx="35" cy="35" r="29" />
+          <circle class="vu-ring-fill" id="vu-ring-fill" cx="35" cy="35" r="29"
+                  stroke-dasharray="182.21" stroke-dashoffset="182.21" />
+        </svg>
+      </div>
+
+      <div id="mic-icon">🎤</div>
+      <div id="timer">--:--</div>
+
+      <!-- VU Horizontal Bars -->
+      <div id="vu-bars">
+        <div class="vu-bar"><div class="vu-bar-fill" data-th="1"></div></div>
+        <div class="vu-bar"><div class="vu-bar-fill" data-th="2"></div></div>
+        <div class="vu-bar"><div class="vu-bar-fill" data-th="3"></div></div>
+        <div class="vu-bar"><div class="vu-bar-fill" data-th="4"></div></div>
+        <div class="vu-bar"><div class="vu-bar-fill" data-th="5"></div></div>
+        <div class="vu-bar"><div class="vu-bar-fill" data-th="6"></div></div>
+        <div class="vu-bar"><div class="vu-bar-fill" data-th="7"></div></div>
+        <div class="vu-bar"><div class="vu-bar-fill" data-th="8"></div></div>
+      </div>
+
+      <div id="app-name">Đang kết nối...</div>
+      <div id="status-pill">
+        <span id="status-dot"></span>
+        <span id="status-text">ĐANG TẢI</span>
+      </div>
+    </div>
+
+    <!-- Resize handle (góc phải dưới) -->
+    <div id="resize-handle" data-tauri-no-drag title="Kéo để thay đổi kích thước">
+      <svg viewBox="0 0 14 14" fill="none">
+        <line class="grip-line" x1="10" y1="14" x2="14" y2="10" />
+        <line class="grip-line" x1="6" y1="14" x2="14" y2="6" />
+        <line class="grip-line" x1="2" y1="14" x2="14" y2="2" />
+      </svg>
+    </div>
+
+    <!-- Bottom hint -->
+    <div id="tooltip">Kéo để di chuyển • Kéo góc để đổi kích thước</div>
+
+    <!-- Context Menu → Premium Redesign -->
+    <div id="context-menu" data-tauri-no-drag>
+      <div class="menu-header"><span class="header-icon">⚡</span> Điều Khiển</div>
+      <button id="menu-open-studio"><span class="btn-icon">📱</span><span class="btn-text">Mở ứng dụng Studio</span></button>
+      <button id="menu-close"><span class="btn-icon">✕</span><span class="btn-text">Đóng Widget</span></button>
+      <div class="menu-divider"></div>
+
+      <div class="menu-header"><span class="header-icon">🎨</span> Màu Nền — Mic Bật</div>
+      <div class="color-section" id="color-section-on">
+        <div class="color-label">
+          <span>Chọn màu</span>
+          <span class="color-preview" id="color-preview-on"></span>
+        </div>
+        <div class="color-swatches" data-target="color_mic_on">
+          <input type="color" class="color-input-hidden" id="color-input-on" />
+        </div>
+      </div>
+
+      <div class="menu-header"><span class="header-icon">🎨</span> Màu Nền — Mic Tắt</div>
+      <div class="color-section" id="color-section-off">
+        <div class="color-label">
+          <span>Chọn màu</span>
+          <span class="color-preview" id="color-preview-off"></span>
+        </div>
+        <div class="color-swatches" data-target="color_mic_off">
+          <input type="color" class="color-input-hidden" id="color-input-off" />
+        </div>
+      </div>
+
+      <div class="menu-divider"></div>
+      <div class="menu-header"><span class="header-icon">🎯</span> Kiểu Icon</div>
+      <button data-theme="1"><span class="btn-icon">🎤</span><span class="btn-text">Classic</span></button>
+      <button data-theme="2"><span class="btn-icon">📻</span><span class="btn-text">Radio</span></button>
+      <button data-theme="3"><span class="btn-icon">📡</span><span class="btn-text">Radar</span></button>
+      <button data-theme="4"><span class="btn-icon">🌊</span><span class="btn-text">Wave</span></button>
+    </div>
+  </div>
+
+  <script type="module">
+    // ============================================================
+    // Audio Widget — Standalone Secondary Window
+    // ============================================================
+
+    const BACKEND_URL = 'http://127.0.0.1:5050';
+
+    // WHY: widgetLog — đẩy log từ widget (webview riêng) sang backend /api/log để
+    // xuất hiện ở Log tab trong app chính (backend ghi vào debug.log). Fire-and-forget:
+    // fetch thất bại không ảnh hưởng luồng chính (drag/resize phải nhẹ).
+    function widgetLog(msg) {
+      try {
+        fetch(`${BACKEND_URL}/api/log`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ msg }),
+        }).catch(() => {});
+      } catch {}
+    }
+
+    // --- DOM refs ---
+    const widget = document.getElementById('widget');
+    const widgetBody = document.getElementById('widget-body');
+    const micIcon = document.getElementById('mic-icon');
+    const timerEl = document.getElementById('timer');
+    const appName = document.getElementById('app-name');
+    const statusDot = document.getElementById('status-dot');
+    const statusPill = document.getElementById('status-pill');
+    const statusText = document.getElementById('status-text');
+    const closeBtn = document.getElementById('close-btn');
+    const contextMenu = document.getElementById('context-menu');
+    const rippleContainer = document.getElementById('ripple-container');
+    const glowRing = document.getElementById('glow-ring');
+    const vuRingFill = document.getElementById('vu-ring-fill');
+    const vuBarFills = document.querySelectorAll('.vu-bar-fill');
+    const VU_CIRCUMFERENCE = 182.21;
+
+    // --- State ---
+    let micActive = false;
+    let sessionSeconds = 0;
+    let prevActive = false;
+    let timerInterval = null;
+    let posSaveTimeout = null;
+    let animTimeout = null;
+
+    // WHY: currentWinPos luôn đồng bộ với vị trí window thực tế.
+    // Cập nhật sau mỗi setPosition / outerPosition / position poll,
+    // giúp JS drag lấy vị trí sync (không cần await mỗi lần).
+    let currentWinPos = { x: 100, y: 100 };
+
+    // WHY: currentWinSize luôn đồng bộ với kích thước window thực tế.
+    // Cập nhật sau mỗi setSize / resize drag / settings fetch.
+    let currentWinSize = { w: 200, h: 200 };
+
+    let settings = {
+      color_mic_on: '#008000',
+      color_mic_off: '#c3063c',
+      widget_opacity: 1.0,
+      widget_width: 200,
+      widget_height: 200,
+      icon_theme: '1',
+      pos_x: 100,
+      pos_y: 100,
+    };
+
+    // --- Tauri window handle ---
+    let tauriWin = null;
+
+    async function getWin() {
+      if (tauriWin) return tauriWin;
+      try {
+        const { getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+        tauriWin = getCurrentWebviewWindow();
+        return tauriWin;
+      } catch {
+        return null;
+      }
+    }
+
+    // --- DPI helpers: mọi tọa độ trong widget dùng LOGICAL px (CSS px) ---
+
+    // WHY: getDpi — cache tham chiếu LogicalPosition/LogicalSize từ @tauri-apps/api/dpi.
+    // setPosition/setSize với plain {x,y}/{width,height} bị serialize mơ hồ
+    // (Physical/Logical do Rust quyết định) → lệch vị trí khi Windows scale ≠ 100%.
+    // Truyền instance rõ ràng (Logical = CSS px, khớp WindowOptions + clientX/Y).
+    let dpiMod = null;
+    async function getDpi() {
+      if (!dpiMod) {
+        try { dpiMod = await import('@tauri-apps/api/dpi'); } catch { dpiMod = {}; }
+      }
+      return dpiMod;
+    }
+
+    // WHY: lp — bọc tọa độ logical vào LogicalPosition.
+    // WHY: await getDpi() TRƯỚC KHI dùng — đảm bảo module @tauri-apps/api/dpi đã load.
+    // Trước đây getDpi() gọi fire-and-forget ở init → applyWinSize chạy trước khi import
+    // xong → fallback plain object {x,y} → Tauri set_position reject
+    // "unknown variant 'undefined', expected 'Physical' or 'Logical'".
+    async function lp(x, y) {
+      await getDpi();
+      const C = dpiMod && dpiMod.LogicalPosition;
+      return C ? new C(x, y) : { x, y };
+    }
+
+    // WHY: ls — bọc kích thước logical vào LogicalSize. Xem lý do await getDpi() ở lp().
+    async function ls(w, h) {
+      await getDpi();
+      const C = dpiMod && dpiMod.LogicalSize;
+      return C ? new C(w, h) : { width: w, height: h };
+    }
+
+    // WHY: winPosToLogical — outerPosition() trả về PHYSICAL pixels, còn CSS px,
+    // WindowOptions x/y và LogicalPosition đều là LOGICAL → chia devicePixelRatio.
+    function winPosToLogical(p) {
+      const dpr = window.devicePixelRatio || 1;
+      return { x: Math.round(p.x / dpr), y: Math.round(p.y / dpr) };
+    }
+
+    // WHY: applyWinSize — setSize(Logical) rồi verify bằng innerSize() (physical→logical).
+    // Windows decorations:false có thể nuốt setSize đầu tiên (tauri#11975) — retry
+    // với PhysicalSize nếu kích thước thực tế không khớp (belt-and-braces).
+    async function applyWinSize(win, w, h) {
+      try {
+        await win.setSize(await ls(w, h));
+        const inner = await win.innerSize();
+        const dpr = window.devicePixelRatio || 1;
+        const ok = Math.abs(inner.width / dpr - w) < 2 && Math.abs(inner.height / dpr - h) < 2;
+        // WHY: Log kết quả applyWinSize — phát hiện bug "setSize bị nuốt" (tauri#11975):
+        // log requested vs innerSize thực tế, retry PhysicalSize nếu lệch.
+        widgetLog(`applyWinSize ${w}x${h} -> inner ${Math.round(inner.width / dpr)}x${Math.round(inner.height / dpr)} ${ok ? 'ok' : 'MISMATCH'}`);
+        if (!ok && dpiMod && dpiMod.PhysicalSize) {
+          await win.setSize(new dpiMod.PhysicalSize(Math.round(w * dpr), Math.round(h * dpr)));
+          const inner2 = await win.innerSize();
+          widgetLog(`applyWinSize retry Physical -> inner ${Math.round(inner2.width / dpr)}x${Math.round(inner2.height / dpr)}`);
+        }
+      } catch (e) {
+        widgetLog(`applyWinSize FAIL ${w}x${h}: ${e}`);
+      }
+    }
+
+    async function closeWidget() {
+      widgetLog('close requested');
+      try {
+        // WHY: Báo cho main window (shared manager) biết widget đã đóng bằng nút ✕.
+        // destroy() KHÔNG trigger close-requested event ở main window, nên cần
+        // event tường minh để manager reset state — tránh "tắt rồi bật không hiện".
+        try {
+          const { emit } = await import('@tauri-apps/api/event');
+          await emit('audio-widget-closed', {});
+        } catch {}
+      } catch {}
+      try {
+        const win = await getWin();
+        if (win) {
+          try {
+            // WHY: Hide window TRƯỚC — ẩn ngay lập tức, không cho Chromium
+            // kịp render white frame. Sau đó mới save position rồi destroy.
+            await win.hide();
+          } catch {}
+          try {
+            // WHY: outerPosition() trả về PHYSICAL pixels; savePosition lưu theo LOGICAL
+            // (WindowOptions x/y + setPosition(Logical) dùng logical) — chia DPI cho nhất quán.
+            const pos = winPosToLogical(await win.outerPosition());
+            await savePosition(pos.x, pos.y);
+          } catch {}
+          try {
+            await win.destroy();
+            return;
+          } catch {}
+        }
+      } catch {}
+      window.close();
+    }
+
+    // --- Format duration ---
+    function fmt(seconds) {
+      const m = Math.floor(seconds / 60);
+      const s = seconds % 60;
+      return `${m}:${s.toString().padStart(2, '0')}`;
+    }
+
+    // --- Extract basename from file path ---
+    function getBasename(path) {
+      if (!path || typeof path !== 'string') return path;
+      const normalized = path.replace(/[\\/]+$/, '');
+      const parts = normalized.replace(/\\/g, '/').split('/');
+      return parts[parts.length - 1] || path;
+    }
+
+    // --- Theme icon ---
+    function getIcon(active) {
+      const theme = settings.icon_theme || '1';
+      if (active) {
+        if (theme === '2') return '📻';
+        if (theme === '3') return '📡';
+        if (theme === '4') return '🌊';
+        return '🎤';
+      } else {
+        if (theme === '2') return '🔇';
+        if (theme === '3') return '🎧';
+        if (theme === '4') return '🎙️';
+        return '🔇';
+      }
+    }
+
+    // ============================================================
+    // DRAG SYSTEM — Native (startDragging)
+    // ============================================================
+
+    /*
+      WHY: Dùng win.startDragging() (OS native) thay vì manual pointer math.
+      Manual setPosition theo rAF gây ra bug trên Windows:
+        - sau vài lần kéo, WebView2 mất sync (window di chuyển nhưng webview
+          không theo) → cảm giác widget "2 lớp" (giao diện + cửa sổ đen bọc ngoài)
+        - setPosition liên tục mỗi frame spam IPC → giật/hụt
+      startDragging để WINDOWS tự kéo cửa sổ — mượt, không lệch, không 2 lớp.
+      Vị trí final được theo dõi qua onMoved (đăng ký trong initWidget).
+    */
+
+    function startDrag(e) {
+      // Chỉ primary button (left click)
+      if (e.button !== 0) return;
+
+      // WHY: closest('[data-tauri-no-drag]') kiểm tra từ target ngược lên.
+      // Nếu target hoặc bất kỳ parent nào có data-tauri-no-drag → bỏ qua kéo.
+      if (e.target.closest('[data-tauri-no-drag]')) return;
+
+      const win = tauriWin;
+      if (!win) return;
+
+      // WHY: Ngăn text selection hoặc default browser drag behavior
+      e.preventDefault();
+
+      widgetLog(`drag start (${currentWinPos.x},${currentWinPos.y})`);
+      widget.classList.add('dragging');
+      // WHY: Native drag loop — OS chiếm con trỏ tới khi nhả chuột. Promise resolve
+      // khi kết thúc → bỏ class dragging. startDragging yêu cầu permission
+      // core:window:allow-start-dragging (đã thêm ở audio-widget.json).
+      try {
+        win.startDragging().catch(() => {}).finally(() => {
+          widget.classList.remove('dragging');
+        });
+      } catch { widget.classList.remove('dragging'); }
+    }
+
+    // --- Position drag: pointerdown trên #widget ---
+    widget.addEventListener('pointerdown', startDrag);
+
+    // ============================================================
+    // RESIZE SYSTEM — Native (startResizeDragging + onResized)
+    // ============================================================
+
+    /*
+      WHY: Dùng win.startResizeDragging('SouthEast') — Windows xử lý vòng lặp
+      resize NATIVE (kích thước window + webview luôn khớp, kéo được KHÔNG GIỚI
+      HẠN số lần). Trước đây manual setSize theo rAF: cửa sổ đổi kích thước nhưng
+      WebView2 không re-layout kịp → "nền đen bọc ngoài widget" và lần kéo thứ 2
+      không còn hoạt động (phải tắt/mở lại widget).
+      - startResizeDragging cần permission core:window:allow-start-resize-dragging.
+      - Kích thước mới theo dõi qua win.onResized (đăng ký trong initWidget),
+        khi resize kết thúc (debounce 600ms) → saveSize + widgetLog.
+    */
+
+    function startResize(e) {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+
+      const win = tauriWin;
+      if (!win) return;
+
+      widgetLog(`resize start ${currentWinSize.w}x${currentWinSize.h}`);
+      widget.classList.add('dragging');
+      try {
+        win.startResizeDragging('SouthEast').catch(() => {}).finally(() => {
+          widget.classList.remove('dragging');
+        });
+      } catch { widget.classList.remove('dragging'); }
+    }
+
+    // --- Resize drag: pointerdown trên resize-handle ---
+    const resizeHandle = document.getElementById('resize-handle');
+    resizeHandle.addEventListener('pointerdown', startResize);
+
+    // --- Save size to backend ---
+    async function saveSize(w, h) {
+      const rw = Math.round(w);
+      const rh = Math.round(h);
+      try {
+        await fetch(`${BACKEND_URL}/api/audio/settings`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ widget_width: rw, widget_height: rh }),
+        });
+        widgetLog(`saveSize ok ${rw}x${rh}`);
+      } catch (e) {
+        widgetLog(`saveSize FAIL ${rw}x${rh}: ${e}`);
+      }
+    }
+
+    // ============================================================
+    // ANIMATIONS
+    // ============================================================
+
+    function triggerRipple(active) {
+      const ripple = document.createElement('div');
+      ripple.className = `ripple ${active ? 'on' : 'off'}`;
+      rippleContainer.appendChild(ripple);
+      setTimeout(() => {
+        if (ripple.parentNode) ripple.parentNode.removeChild(ripple);
+      }, 800);
+    }
+
+    function triggerIconFlip() {
+      micIcon.classList.remove('flip');
+      void micIcon.offsetWidth;
+      micIcon.classList.add('flip');
+      setTimeout(() => micIcon.classList.remove('flip'), 500);
+    }
+
+    function triggerContentEnter() {
+      timerEl.classList.remove('timer-enter');
+      void timerEl.offsetWidth;
+      timerEl.classList.add('timer-enter');
+      setTimeout(() => timerEl.classList.remove('timer-enter'), 450);
+
+      appName.classList.remove('app-name-enter');
+      void appName.offsetWidth;
+      appName.classList.add('app-name-enter');
+      setTimeout(() => appName.classList.remove('app-name-enter'), 400);
+
+      statusPill.classList.remove('pill-enter');
+      void statusPill.offsetWidth;
+      statusPill.classList.add('pill-enter');
+      setTimeout(() => statusPill.classList.remove('pill-enter'), 400);
+    }
+
+    // ============================================================
+    // UI UPDATE
+    // ============================================================
+
+    function applySettings() {
+      const bgColor = micActive ? settings.color_mic_on : settings.color_mic_off;
+      widget.style.backgroundColor = bgColor;
+      widget.style.opacity = settings.widget_opacity ?? 1.0;
+
+      if (micActive) {
+        widget.style.boxShadow = `0 0 25px ${bgColor}80`;
+        widgetBody.classList.add('active');
+        glowRing.classList.add('visible');
+      } else {
+        widget.style.boxShadow = '0 8px 24px rgba(0,0,0,0.5)';
+        widgetBody.classList.remove('active');
+        glowRing.classList.remove('visible');
+      }
+
+      // WHY: KHÔNG set widget.style.width/height px ở đây — #widget fixed inset:0
+      // luôn phủ 100% window; kích thước thực chỉ thay đổi qua win.setSize
+      // (applyWinSize sau resize / fetchSettings).
+    }
+
+    function updateUI(data) {
+      if (!data) {
+        micIcon.textContent = '⏳';
+        timerEl.textContent = '--:--';
+        appName.textContent = 'Đang kết nối...';
+        statusDot.className = '';
+        statusText.textContent = 'ĐANG TẢI';
+        updateVUMeter(0);
+        return;
+      }
+
+      const wasActive = micActive;
+      micActive = data.active;
+      const stateChanged = (wasActive !== micActive);
+
+      if (micActive && !prevActive) {
+        sessionSeconds = 0;
+        prevActive = true;
+        startTimer();
+      } else if (!micActive && prevActive) {
+        prevActive = false;
+        stopTimer();
+      }
+
+      timerEl.textContent = micActive ? fmt(sessionSeconds) : '--:--';
+      timerEl.className = micActive ? 'active' : '';
+
+      if (stateChanged) {
+        triggerRipple(micActive);
+        micIcon.textContent = getIcon(micActive);
+        triggerIconFlip();
+        triggerContentEnter();
+      } else {
+        micIcon.textContent = getIcon(micActive);
+      }
+
+      micIcon.className = micActive ? 'bounce' : '';
+
+      const appUsing = getBasename(data.app_using_mic);
+      appName.textContent = micActive
+        ? (appUsing || 'Đang thu âm')
+        : (sessionSeconds > 0 ? `Lần trước: ${fmt(sessionSeconds)}` : 'Sẵn sàng');
+      appName.title = micActive ? (appUsing || '') : '';
+
+      if (micActive) {
+        statusDot.className = 'active';
+        statusText.textContent = 'HOẠT ĐỘNG';
+      } else {
+        statusDot.className = '';
+        statusText.textContent = 'SẴN SÀNG';
+      }
+
+      if (stateChanged) {
+        applySettings();
+      }
+
+      widget.classList.remove('loading');
+    }
+
+    // --- Timer ---
+    function startTimer() {
+      if (timerInterval) return;
+      timerInterval = setInterval(() => {
+        sessionSeconds++;
+        if (micActive) {
+          timerEl.textContent = fmt(sessionSeconds);
+        }
+      }, 1000);
+    }
+
+    function stopTimer() {
+      if (timerInterval) {
+        clearInterval(timerInterval);
+        timerInterval = null;
+      }
+    }
+
+    // --- Save position to backend + localStorage ---
+    async function savePosition(x, y) {
+      const rx = Math.round(x);
+      const ry = Math.round(y);
+      try {
+        await fetch(`${BACKEND_URL}/api/audio/settings`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pos_x: rx, pos_y: ry }),
+        });
+      } catch {}
+      try {
+        localStorage.setItem('mic_widget_pos', JSON.stringify({ x: rx, y: ry }));
+      } catch {}
+    }
+
+    // --- Fetch mic status ---
+    async function fetchMicStatus() {
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/audio/mic-status`);
+        if (res.ok) {
+          const data = await res.json();
+          updateUI(data);
+        }
+      } catch {
+        updateUI(null);
+      }
+    }
+
+    // --- Fetch settings ---
+    // WHY: Đồng bộ preview dots trong context menu với settings hiện tại.
+    // Gọi sau mỗi lần settings thay đổi (fetchSettings, chọn màu từ swatch).
+    function syncColorPreviews() {
+      document.querySelectorAll('.color-preview').forEach(el => {
+        const section = el.closest('.color-section');
+        if (!section) return;
+        const key = section.querySelector('.color-swatches')?.getAttribute('data-target');
+        if (key && settings[key]) {
+          el.style.backgroundColor = settings[key];
+          // Sync active swatch
+          const swatches = section.querySelectorAll('.color-swatch[data-color]');
+          swatches.forEach(s => s.classList.toggle('active',
+            s.dataset.color.toLowerCase() === settings[key].toLowerCase()
+          ));
+        }
+      });
+    }
+
+    async function fetchSettings() {
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/audio/settings`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.settings) {
+            Object.assign(settings, data.settings);
+const win = await getWin();
+
+      // WHY: Preload dpi module sớm — để lp()/ls() dùng LogicalPosition/LogicalSize
+      // ngay khi user drag/resize. WHY: await (không fire-and-forget) — nếu không,
+      // applyWinSize bên dưới gọi ls() trước khi import xong → fallback plain object
+      // → Tauri set_size reject "unknown variant 'undefined'".
+      await getDpi();
+            if (win) {
+              try {
+                const w = Math.max(150, Math.min(400, settings.widget_width || 200));
+                const h = Math.max(150, Math.min(400, settings.widget_height || 200));
+                await applyWinSize(win, w, h);
+              } catch {}
+            }
+            applySettings();
+            syncColorPreviews();
+          }
+        }
+      } catch {}
+    }
+
+    // ============================================================
+    // VU METER — Real-time Audio Level Display
+    // ============================================================
+
+    // WHY: updateVUMeter — cập nhật vòng tròn + 8 bars dựa trên RMS level (0.0-1.0).
+    // Chỉ animation khi mic active; khi tắt, reset về 0.
+    function updateVUMeter(level) {
+      if (!vuRingFill) return;
+
+      if (!micActive) {
+        // Mic off: dim ring + bars
+        vuRingFill.style.strokeDashoffset = VU_CIRCUMFERENCE;
+        vuRingFill.className = 'vu-ring-fill';
+        for (const bar of vuBarFills) {
+          bar.style.height = '0%';
+          bar.className = 'vu-bar-fill';
+        }
+        return;
+      }
+
+      // Clamp level
+      const clamped = Math.max(0, Math.min(1, level));
+
+      // --- Circular Ring: dashoffset = circumference * (1 - level) ---
+      const offset = VU_CIRCUMFERENCE * (1 - clamped);
+      vuRingFill.style.strokeDashoffset = String(offset);
+
+      // Ring color: green (0-50%), yellow (50-75%), red (75-100%)
+      vuRingFill.className = 'vu-ring-fill';
+      if (clamped > 0.75) {
+        vuRingFill.classList.add('high');
+      } else if (clamped > 0.50) {
+        vuRingFill.classList.add('mid');
+      } else {
+        vuRingFill.classList.add('low');
+      }
+
+      // --- 8 Horizontal Bars: LED VU style, each bar lights at threshold ---
+      // Thresholds: 0.05, 0.15, 0.25, 0.35, 0.48, 0.60, 0.75, 0.88
+      const thresholds = [0.05, 0.15, 0.25, 0.35, 0.48, 0.60, 0.75, 0.88];
+      for (let i = 0; i < vuBarFills.length; i++) {
+        const bar = vuBarFills[i];
+        const lit = clamped >= thresholds[i];
+        if (lit) {
+          // Full height for lit bars
+          bar.style.height = '100%';
+          bar.className = 'vu-bar-fill lit-' + (i + 1);
+        } else {
+          // Micro-respond to level for unlit bars (gentle wave effect)
+          const frac = i > 0 ? Math.max(0, (clamped - thresholds[i-1]) / (thresholds[i] - thresholds[i-1])) : 0;
+          bar.style.height = Math.round(frac * 100) + '%';
+          bar.className = 'vu-bar-fill';
+        }
+      }
+    }
+
+    // --- Fetch mic level (VU) ---
+    async function fetchMicLevel() {
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/audio/mic-level`);
+        if (res.ok) {
+          const data = await res.json();
+          updateVUMeter(data.level);
+        }
+      } catch {
+        updateVUMeter(0);
+      }
+    }
+
+    // ============================================================
+    // POSITION ANIMATION — Fly-in đến vị trí đã lưu
+    // ============================================================
+
+    // WHY: animatePosition — bay mượt từ vị trí hiện tại đến vị trí đã lưu.
+    // Dùng rAF + easeOutCubic (cubic-bezier 0.25, 0.1, 0.25, 1) cho cảm giác
+    // "hạ cánh" nhẹ nhàng, không giật.
+    // Nếu khoảng cách < 10px (gần như trùng), bỏ qua animation để tiết kiệm IPC.
+    async function animatePosition(fromX, fromY, toX, toY, duration = 400) {
+      const dx = toX - fromX;
+      const dy = toY - fromY;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+
+      // WHY: Nếu gần như trùng vị trí, set trực tiếp (không animation)
+      if (dist < 10) {
+        await tauriWin.setPosition(await lp(toX, toY)).catch(() => {});
+        return;
+      }
+
+      return new Promise(resolve => {
+        const startTime = performance.now();
+
+        function step(currentTime) {
+          const elapsed = currentTime - startTime;
+          const progress = Math.min(elapsed / duration, 1);
+
+          // WHY: easeOutCubic — chậm dần về cuối (giống object hạ cánh)
+          const eased = 1 - Math.pow(1 - progress, 3);
+
+          const x = Math.round(fromX + dx * eased);
+          const y = Math.round(fromY + dy * eased);
+
+          lp(x, y).then(p => tauriWin.setPosition(p).catch(() => {}));
+
+          if (progress < 1) {
+            requestAnimationFrame(step);
+          } else {
+            resolve();
+          }
+        }
+
+        requestAnimationFrame(step);
+      });
+    }
+
+    // --- Init widget ---
+    async function initWidget() {
+      // WHY: Gọi getWin() NGAY ĐẦU TIÊN để tauriWin có giá trị.
+      // Nếu để sau fetch, user có thể click drag trước khi fetch xong
+      // → tauriWin = null → drag không hoạt động.
+      const win = await getWin();
+
+      // WHY: Load dpi module NGAY — applyWinSize/animatePosition bên dưới gọi
+      // ls()/lp() (giờ async) — đảm bảo không rơi vào fallback plain object.
+      await getDpi();
+
+      // Load settings (bất đồng bộ, không block UI)
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/audio/settings`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.settings) Object.assign(settings, data.settings);
+        }
+      } catch {}
+      // Load position from localStorage
+      try {
+        const saved = localStorage.getItem('mic_widget_pos');
+        if (saved) {
+          const p = JSON.parse(saved);
+          if (typeof p.x === 'number' && typeof p.y === 'number') {
+            settings.pos_x = p.x;
+            settings.pos_y = p.y;
+          }
+        }
+      } catch {}
+
+      // WHY: Đồng bộ currentWinSize từ settings trước khi applySettings
+      // để tránh flash 200x200 mặc định khi backend có kích thước khác.
+      currentWinSize.w = settings.widget_width || 200;
+      currentWinSize.h = settings.widget_height || 200;
+      applySettings();
+
+      if (win) {
+        try {
+          // WHY: Đọc vị trí hiện tại, sau đó animate đến saved position.
+          // Nếu widget đã ở saved position (do App.tsx/AudioModule tạo đúng vị trí),
+          // dist < 10 → setPosition trực tiếp, không animation.
+          // Nếu widget ở vị trí khác (center từ tray menu) → fly-in 400ms.
+          // WHY: outerPosition() là PHYSICAL → chuyển logical cho animatePosition,
+          // khớp với setPosition(Logical) và savePosition.
+          const currentPos = winPosToLogical(await win.outerPosition());
+          const targetX = Math.round(settings.pos_x || 100);
+          const targetY = Math.round(settings.pos_y || 100);
+
+          await animatePosition(currentPos.x, currentPos.y, targetX, targetY, 600);
+
+          // WHY: Cập nhật currentWinPos để JS drag có vị trí chính xác
+          currentWinPos.x = targetX;
+          currentWinPos.y = targetY;
+
+          const w = Math.max(150, Math.min(400, settings.widget_width || 200));
+          const h = Math.max(150, Math.min(400, settings.widget_height || 200));
+          // WHY: applyWinSize — setSize + verify (Windows có thể nuốt setSize đầu tiên)
+          await applyWinSize(win, w, h);
+          currentWinSize.w = w;
+          currentWinSize.h = h;
+
+          // WHY: setMinSize/setMaxSize — giới hạn kích thước NATIVE cho resize drag.
+          // Trước đây clamp thủ công trong moveResize (150-400); với startResizeDragging
+          // OS tự resize → phải clamp bằng min/max size của window (khớp bounds cũ).
+          try {
+            await win.setMinSize(await ls(150, 150));
+            await win.setMaxSize(await ls(400, 400));
+          } catch {}
+        } catch {}
+
+        // WHY: onResized — theo dõi kích thước window khi user kéo resize handle
+        // (startResizeDragging). Cập nhật currentWinSize + saveSize debounce 600ms
+        // sau khi nhả chuột. payload là PhysicalSize → đổi logical theo dpr.
+        let resizeSaveDebounce = null;
+        try {
+          win.onResized(({ payload }) => {
+            const dpr = window.devicePixelRatio || 1;
+            const rw = Math.round(payload.width / dpr);
+            const rh = Math.round(payload.height / dpr);
+            currentWinSize.w = rw;
+            currentWinSize.h = rh;
+            if (resizeSaveDebounce) clearTimeout(resizeSaveDebounce);
+            resizeSaveDebounce = setTimeout(() => {
+              settings.widget_width = rw;
+              settings.widget_height = rh;
+              widgetLog(`resize end ${rw}x${rh} -> saveSize`);
+              saveSize(rw, rh);
+            }, 600);
+          });
+        } catch {}
+
+        // WHY: onMoved — native drag (startDragging) không gửi pointer events về
+        // webview; cập nhật currentWinPos + lưu vị trí qua debounce (thay cho
+        // endDrag cũ). payload là PhysicalPosition → đổi logical theo dpr.
+        let posSaveDebounce = null;
+        try {
+          win.onMoved(({ payload }) => {
+            const dpr = window.devicePixelRatio || 1;
+            const rx = Math.round(payload.x / dpr);
+            const ry = Math.round(payload.y / dpr);
+            currentWinPos.x = rx;
+            currentWinPos.y = ry;
+            if (posSaveDebounce) clearTimeout(posSaveDebounce);
+            posSaveDebounce = setTimeout(() => {
+              widgetLog(`drag end (${rx},${ry}) -> savePosition`);
+              savePosition(rx, ry);
+            }, 400);
+          });
+        } catch {}
+
+        // WHY: Poll position + cập nhật currentWinPos + lưu khi thay đổi.
+        // currentWinPos được JS drag dùng để tính delta (sync, không cần await).
+        // Lưu position khi thay đổi > 5px (debounce 500ms) để restore đúng vị trí sau restart.
+        let lastSavedPos = { x: Math.round(settings.pos_x || 100), y: Math.round(settings.pos_y || 100) };
+        setInterval(async () => {
+          try {
+            // WHY: outerPosition() PHYSICAL → logical (CSS px) để drag/save nhất quán.
+            const logical = winPosToLogical(await win.outerPosition());
+            const rx = logical.x;
+            const ry = logical.y;
+            currentWinPos.x = rx;
+            currentWinPos.y = ry;
+            // WHY: Lưu position nếu thay đổi >5px (tránh save liên tục khi không cần thiết)
+            if (Math.abs(rx - lastSavedPos.x) > 5 || Math.abs(ry - lastSavedPos.y) > 5) {
+              lastSavedPos = { x: rx, y: ry };
+              if (posSaveTimeout) clearTimeout(posSaveTimeout);
+              posSaveTimeout = setTimeout(() => savePosition(rx, ry), 500);
+            }
+          } catch {}
+        }, 2000);
+      }
+
+      // Start polling
+      fetchMicStatus();
+      setInterval(fetchMicStatus, 2000);
+      setInterval(fetchSettings, 30000);
+      // WHY: VU Meter poll 200ms — real-time audio level
+      fetchMicLevel();
+      setInterval(fetchMicLevel, 200);
+    }
+
+    // --- Show main window ---
+    async function openMainWindow() {
+      try {
+        const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+        const existing = await WebviewWindow.getByLabel('main');
+        if (existing) {
+          await existing.show();
+          await existing.setFocus();
+        }
+      } catch {}
+    }
+
+    // ============================================================
+    // Event Listeners
+    // ============================================================
+
+    closeBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      closeWidget();
+    });
+
+    widget.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      contextMenu.style.left = Math.min(e.clientX, window.innerWidth - 180) + 'px';
+      contextMenu.style.top = e.clientY + 'px';
+      contextMenu.classList.add('show');
+    });
+
+    document.addEventListener('click', (e) => {
+      if (!contextMenu.contains(e.target)) {
+        contextMenu.classList.remove('show');
+      }
+    });
+
+    document.getElementById('menu-open-studio').addEventListener('click', () => {
+      contextMenu.classList.remove('show');
+      openMainWindow();
+    });
+
+    document.getElementById('menu-close').addEventListener('click', () => {
+      contextMenu.classList.remove('show');
+      closeWidget();
+    });
+
+    document.querySelectorAll('[data-theme]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const theme = btn.getAttribute('data-theme');
+        settings.icon_theme = theme;
+        micIcon.textContent = getIcon(micActive);
+        contextMenu.classList.remove('show');
+        try {
+          await fetch(`${BACKEND_URL}/api/audio/settings`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ icon_theme: theme }),
+          });
+        } catch {}
+      });
+    });
+
+    // ============================================================
+    // COLOR PICKER SYSTEM
+    // ============================================================
+
+    // WHY: Preset colors cho mic_on và mic_off.
+    // User click vào swatch để chọn nhanh, hoặc dùng color input để chọn custom.
+    const PRESET_COLORS_ON = ['#008000', '#10b981', '#34d399', '#059669', '#047857', '#065f46', '#16a34a', '#22c55e'];
+    const PRESET_COLORS_OFF = ['#c3063c', '#dc2626', '#ef4444', '#b91c1c', '#991b1b', '#7f1d1d', '#e11d48', '#f43f5e'];
+
+    function buildColorSwatches(containerId, inputId, previewId, presets, settingsKey) {
+      const container = document.getElementById(containerId);
+      const input = document.getElementById(inputId);
+      const preview = document.getElementById(previewId);
+      const swatchesDiv = container?.querySelector('.color-swatches');
+      if (!swatchesDiv || !input || !preview) return;
+
+      // WHY: Thêm các preset swatches
+      presets.forEach(color => {
+        const swatch = document.createElement('div');
+        swatch.className = 'color-swatch';
+        swatch.style.backgroundColor = color;
+        swatch.dataset.color = color;
+        swatch.title = color;
+        swatchesDiv.appendChild(swatch);
+      });
+
+      // WHY: Thêm nút custom (mở native color picker)
+      const customBtn = document.createElement('div');
+      customBtn.className = 'color-swatch custom-btn';
+      customBtn.textContent = '✎';
+      customBtn.title = 'Chọn màu tùy chỉnh...';
+      swatchesDiv.appendChild(customBtn);
+
+      // WHY: Cập nhật preview dot + active state
+      function updatePreview(color) {
+        preview.style.backgroundColor = color;
+        settings[settingsKey] = color;
+        // Mark active swatch
+        swatchesDiv.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('active'));
+        swatchesDiv.querySelectorAll('.color-swatch').forEach(s => {
+          if (s.dataset.color?.toLowerCase() === color.toLowerCase()) {
+            s.classList.add('active');
+          }
+        });
+        applySettings();
+      }
+
+      // WHY: Xử lý click swatch
+      swatchesDiv.addEventListener('click', (e) => {
+        const swatch = e.target.closest('.color-swatch');
+        if (!swatch) return;
+
+        if (swatch.classList.contains('custom-btn')) {
+          // Open native color picker
+          input.click();
+          return;
+        }
+
+        const color = swatch.dataset.color;
+        if (!color) return;
+
+        updatePreview(color);
+        saveColor(settingsKey, color);
+      });
+
+      // WHY: Xử lý native color picker change
+      input.addEventListener('input', (e) => {
+        updatePreview(e.target.value);
+      });
+      input.addEventListener('change', (e) => {
+        saveColor(settingsKey, e.target.value);
+      });
+
+      // WHY: Cập nhật preview từ settings hiện tại
+      updatePreview(settings[settingsKey]);
+    }
+
+    async function saveColor(key, color) {
+      try {
+        await fetch(`${BACKEND_URL}/api/audio/settings`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ [key]: color }),
+        });
+      } catch {}
+    }
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') contextMenu.classList.remove('show');
+    });
+
+    widget.addEventListener('dblclick', () => {
+      openMainWindow();
+    });
+
+    // ============================================================
+    // Init
+    // ============================================================
+    
+    // WHY: Đợi initWidget hoàn tất (settings loaded từ backend) rồi mới build swatches.
+    // Tránh race condition: buildColorSwatches đọc settings.color_mic_on/off
+    // trước khi fetch trong initWidget resolve.
+    initWidget().then(() => {
+      widgetLog(`widget loaded ${currentWinSize.w}x${currentWinSize.h} at (${currentWinPos.x},${currentWinPos.y})`);
+      buildColorSwatches('color-section-on', 'color-input-on', 'color-preview-on', PRESET_COLORS_ON, 'color_mic_on');
+      buildColorSwatches('color-section-off', 'color-input-off', 'color-preview-off', PRESET_COLORS_OFF, 'color_mic_off');
+    });
+  </script>
+</body>
+</html>

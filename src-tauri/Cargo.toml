@@ -9,6 +9,20 @@ edition = "2021"
 name = "server_dashboard_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
 
+# WHY: Tối ưu kích thước binary cho production build.
+# LTO (fat) giúp trình biên dịch tối ưu xuyên module, giảm ~20-35% size.
+# opt-level "z" tối ưu cho kích thước thay vì tốc độ (có thể chậm hơn 5-10%).
+# strip = true loại bỏ debug symbols khỏi binary (~5-15MB).
+# codegen-units = 1 tăng cơ hội tối ưu cho LLVM.
+[profile.release]
+lto = true
+opt-level = "z"
+strip = true
+codegen-units = 1
+
+[profile.release.package.tauri]
+opt-level = 3
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

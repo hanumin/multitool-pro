@@ -57,6 +57,14 @@ export default function LogModule({ theme, setStatusText, inactive, backgroundPo
           lastLogRef.current = newLog
           setLines(newLog.split('\n').filter((l: string) => l.trim()))
         }
+      } else {
+        // WHY: Backend trả lỗi (5xx, ...) — HIỆN LỖI thay vì trắng im lặng.
+        // Trước đây res không ok thì bỏ qua → tab Log trắng không 1 dòng, không
+        // thông báo gì → user tưởng app hỏng. Giờ báo rõ để debug nhanh.
+        const errData = await res.json().catch(() => null)
+        connectionErrorRef.current = true
+        setConnectionError(true)
+        addToast({ type: 'error', title: '📄 Lỗi tải log', message: (errData as any)?.error || `Backend trả lỗi ${res.status}` })
       }
     } catch (e) {
       // WHY: Chỉ set internal error state — KHÔNG ảnh hưởng global statusText.
@@ -136,27 +144,70 @@ export default function LogModule({ theme, setStatusText, inactive, backgroundPo
     finally { setClearing(false) }
   }
 
-  // WHY: Copy log ra clipboard — format gọn gàng
+  // WHY: Copy log ra clipboard — format gọn gàng, kèm toast xác nhận + số dòng
+  // để user biết copy thành công (trước đây chỉ setStatusText dễ bị bỏ sót).
   const copyLog = () => {
+    const count = filteredLines.length
     const text = filteredLines.join('\n')
     navigator.clipboard.writeText(text).then(() => {
-      setStatusText(`📋 Đã copy ${filteredLines.length} dòng log`)
-    }).catch(() => {})
+      setStatusText(`📋 Đã copy ${count} dòng log`)
+      addToast({ type: 'success', title: '📋 Đã copy log', message: `Đã copy ${count} dòng log vào clipboard` })
+    }).catch(() => {
+      setStatusText('❌ Copy log thất bại')
+      addToast({ type: 'error', title: '📋 Copy log thất bại', message: 'Không thể copy log vào clipboard' })
+    })
   }
 
-  // WHY: Export log thành file .txt
-  const exportLog = () => {
+  // WHY: Export log thành file .txt.
+  // Trong Tauri: anchor download (a.click() + blob URL) BỊ CHẶN bởi WebView2 →
+  // dùng native save dialog (@tauri-apps/plugin-dialog) lấy đường dẫn, rồi nhờ
+  // backend ghi file (có BOM để Notepad đọc UTF-8 đúng). Browser dev: fallback anchor.
+  const exportLog = async () => {
+    const count = filteredLines.length
     const text = filteredLines.join('\n')
-    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `debug-log-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.txt`
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
-    URL.revokeObjectURL(url)
-    setStatusText(`📥 Exported ${filteredLines.length} dòng log`)
+    const defaultName = `debug-log-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.txt`
+    let targetPath: string | null = null
+    try {
+      const { save } = await import('@tauri-apps/plugin-dialog')
+      targetPath = await save({
+        defaultPath: defaultName,
+        title: 'Export log',
+        filters: [{ name: 'Text', extensions: ['txt', 'log'] }],
+      })
+    } catch {
+      // WHY: Không chạy trong Tauri (browser dev mode) → giữ anchor download cũ.
+      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = defaultName
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+      setStatusText(`📥 Exported ${count} dòng log`)
+      return
+    }
+    if (!targetPath) return // user huỷ save dialog — không toast
+
+    try {
+      const res = await fetchWithRetry(`${API}/api/debug-log/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: targetPath, content: text }),
+      })
+      if (res.ok) {
+        setStatusText(`📥 Exported ${count} dòng log`)
+        addToast({ type: 'success', title: '📥 Export log', message: `Đã lưu ${count} dòng log: ${targetPath}` })
+      } else {
+        const errData = await res.json().catch(() => ({ error: 'Lỗi không xác định' }))
+        setStatusText('❌ Export log thất bại')
+        addToast({ type: 'error', title: '📥 Export log thất bại', message: errData.error })
+      }
+    } catch {
+      setStatusText('❌ Export log thất bại')
+      addToast({ type: 'error', title: '🔌 Mất kết nối', message: 'Không thể kết nối tới backend để ghi file' })
+    }
   }
 
   // WHY: Dùng getLineStyle chung từ utils/logStyles thay vì local copy
@@ -412,8 +463,8 @@ export default function LogModule({ theme, setStatusText, inactive, backgroundPo
             {filteredLines.map((line, i) => {
               const style = getLineStyle(line, i, logColors)
               return (
-                <div key={i} className="flex items-start gap-2 px-2 py-0.5 rounded transition-colors hover:bg-white/[0.04] group"
-                  style={{ backgroundColor: style.backgroundColor }}>
+                <div key={i} className="flex items-start gap-2 px-2 py-0.5 rounded transition-colors hover:bg-white/[0.04] group animate-log-enter"
+                  style={{ animationDelay: `${Math.min(i * 0.015, 0.5)}s`, backgroundColor: style.backgroundColor }}>
                   {/* Line number */}
                   <span className="text-right select-none shrink-0 font-mono"
                     style={{ color: 'var(--fg-muted)', width: `${String(filteredLines.length).length}ch`, fontSize: `${fontSize - 2}px`, lineHeight: '1.5rem' }}>

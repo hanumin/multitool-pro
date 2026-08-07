@@ -35,7 +35,7 @@ export interface Printer {
 }
 
 export interface AudioDevice {
-  id: number
+  id: string
   name: string
   is_input: boolean
   is_default: boolean

@@ -76,9 +76,9 @@ export default function DataTable({
               ))}
             </tr>
           </thead>
-          <tbody>
+          <tbody key={page}>
             {rows.map((row: any, ri: number) => (
-              <tr key={ri} className="border-t hover:brightness-110" style={{ borderColor: 'var(--border)' }}>
+              <tr key={ri} className="border-t hover:brightness-110 animate-row-enter" style={{ borderColor: 'var(--border)', animationDelay: `${ri * 0.03}s` }}>
                 <td className="px-2 py-1 text-[10px]" style={{ color: 'var(--fg-dim)' }}>{(page - 1) * 100 + ri + 1}</td>
                 {columns.map((col: any, ci: number) => (
                   <td key={ci} className="px-2 py-1 truncate max-w-[200px]" style={{ color: 'var(--fg-secondary)' }}>

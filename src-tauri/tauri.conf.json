@@ -1,6 +1,6 @@
 {
   "productName": "MultiTool Pro",
-  "version": "1.11.2",
+  "version": "1.11.3",
   "identifier": "com.multitoolpro.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -18,7 +18,8 @@
         "minHeight": 720,
         "resizable": true,
         "fullscreen": false,
-        "center": true
+        "center": true,
+        "decorations": false
       }
     ],
     "security": {
@@ -28,14 +29,23 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "wix": {
+        "language": ["en-US"]
+      },
+      "nsis": {
+        "compression": "lzma",
+        "installMode": "currentUser"
+      }
+    }
   },
   "plugins": {
     "updater": {

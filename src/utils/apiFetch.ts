@@ -5,7 +5,7 @@
  * Thay vì mỗi module tự xử lý retry, dùng fetchWithRetry() với exponential backoff.
  *
  * Retry pattern:
- *   - Network errors (fetch throws): retry after 300ms → 1s → 2.5s
+ *   - Network errors (fetch throws): retry after 1s → 3s → 7s
  *   - 5xx server errors: retry with same backoff
  *   - 4xx client errors: KHÔNG retry (lỗi do request, không phải server)
  *   - GET requests: retry tối đa 3 lần
@@ -14,7 +14,7 @@
 
 export const API = 'http://127.0.0.1:5050'
 
-const RETRY_DELAYS = [300, 1000, 2500]
+const RETRY_DELAYS = [1000, 3000, 7000]
 
 /**
  * Fetch với auto-retry trên transient errors.
@@ -46,6 +46,10 @@ export async function fetchWithRetry(
       }
       return res // Lần cuối, trả về dù 5xx
     } catch (err) {
+      // WHY: Nếu request bị abort (AbortController), throw ngay không retry
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw err
+      }
       // WHY: Network error (fetch throw) — retry
       if (attempt < retries) {
         await sleep(RETRY_DELAYS[Math.min(attempt, RETRY_DELAYS.length - 1)])
@@ -57,6 +61,8 @@ export async function fetchWithRetry(
   throw new Error('fetchWithRetry: unreachable')
 }
 
+// WHY: Promise sleep giữa các lần retry — dùng RETRY_DELAYS lũy tiến (100ms,
+// 300ms, 1s...) để không spam backend khi nó vừa mới hồi phục.
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }

@@ -3,6 +3,7 @@ import { AudioDevice, MicStatus, type PreloadedData } from '../../types'
 
 import { API, fetchWithRetry } from '../../utils/apiFetch'
 import { useToast } from '../../components/ToastManager'
+import { openAudioWidget, toggleAudioWidget, isAudioWidgetOpen, subscribeAudioWidget } from '../../utils/audioWidget'
 
 
 interface AudioSession {
@@ -21,6 +22,10 @@ interface AudioSettings {
   show_widget_on_mic: boolean
   always_on_top: boolean
   widget_opacity: number
+  widget_width?: number
+  widget_height?: number
+  pos_x?: number
+  pos_y?: number
 }
 
 interface AudioModuleProps {
@@ -32,18 +37,18 @@ interface AudioModuleProps {
   preloadedData?: PreloadedData
 }
 
-// WHY: Module quan ly am thanh — mic status, devices, timer, widget.
-// Polling: fetchAll 5s, fetchMicStatus 1s.
-// Widget mode: overlay nho hien thi mic status + timer.
+// WHY: Module quản lý âm thanh — mic status, devices, timer, widget.
+// Polling: fetchAll 30s, fetchMicStatus 5s.
+// Widget: cửa sổ Tauri thứ 2 (audio-widget) độc lập với main window, tồn tại khi app thu nhỏ.
 export default function AudioModule({ theme, setStatusText, inactive, backgroundPolling, onBackgroundPollingChange, preloadedData }: AudioModuleProps) {
   const { addToast } = useToast()
+  const pollAbortRef = useRef<AbortController | null>(null)
   const [micStatus, setMicStatus] = useState<MicStatus | null>(null)
   // WHY: Dùng preloaded data để skip loading flash.
-  // audioDevices chứa devices list từ LoadingScreen.
   const preloadedDevices = preloadedData?.audioDevices?.devices
   const preloadedAudioSettings = preloadedData?.audioSettings
   const [devices, setDevices] = useState<AudioDevice[]>(preloadedDevices || [])
-  const [selectedDevice, setSelectedDevice] = useState<number | null>(null)
+  const [selectedDevice, setSelectedDevice] = useState<string | null>(null)
   const [volume, setVolume] = useState(0)
   const [muted, setMuted] = useState(false)
   
@@ -55,15 +60,17 @@ export default function AudioModule({ theme, setStatusText, inactive, background
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const audioSettingsRef = useRef<AudioSettings>({
     sound_enabled: true, selected_sound: null, icon_theme: '1',
-    color_mic_on: '#3498DB', color_mic_off: '#E74C3C',
-    show_widget_on_mic: false, always_on_top: false, widget_opacity: 1.0
+    color_mic_on: '#008000', color_mic_off: '#c3063c',
+    show_widget_on_mic: false, always_on_top: true, widget_opacity: 1.0,
+    widget_width: 220, widget_height: 220
   })
   
   // Settings & customization
   const [audioSettings, setAudioSettings] = useState<AudioSettings>({
     sound_enabled: true, selected_sound: null, icon_theme: '1',
-    color_mic_on: '#3498DB', color_mic_off: '#E74C3C',
-    show_widget_on_mic: false, always_on_top: false, widget_opacity: 1.0,
+    color_mic_on: '#008000', color_mic_off: '#c3063c',
+    show_widget_on_mic: false, always_on_top: true, widget_opacity: 1.0,
+    widget_width: 220, widget_height: 220,
     ...((preloadedAudioSettings as Partial<AudioSettings>) || {}),
   })
   const [soundFiles, setSoundFiles] = useState<string[]>([])
@@ -71,22 +78,56 @@ export default function AudioModule({ theme, setStatusText, inactive, background
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
   
-  // Widget mode
-  const [widgetMode, setWidgetMode] = useState(false)
-  const widgetModeRef = useRef(false)
-  const [widgetPos, setWidgetPos] = useState({ x: 100, y: 100 })
-  const dragging = useRef(false)
-  const dragOffset = useRef({ x: 0, y: 0 })
+  // Widget mode: sử dụng Tauri WebviewWindow (cửa sổ phụ) thay vì fixed div trong app
+  const [widgetOpen, setWidgetOpen] = useState(false)
+  const widgetOpenRef = useRef(false)
+
+  // WHY: Tạo/mở cửa sổ widget âm thanh độc lập — DELEGATE cho shared manager.
+  // QUAN TRỌNG: Không tự getByLabel + show() ở đây. Manager (src/utils/audioWidget.ts)
+  // là single source of truth, xử lý stale handle sau close() (bug "tắt rồi bật không hiện")
+  // và đồng bộ trạng thái với App.tsx (tray menu).
+  const openWidgetWindow = useCallback(async () => {
+    await openAudioWidget({
+      width: Math.max(150, Math.min(400, audioSettings.widget_width || 200)),
+      height: Math.max(150, Math.min(400, audioSettings.widget_height || 200)),
+    })
+  }, [audioSettings.widget_width, audioSettings.widget_height])
+
+  // WHY: Đóng cửa sổ widget — delegate cho shared manager.
+  // WHY: Toggle widget window — delegate cho shared manager (state authoritative).
+  const toggleWidget = useCallback(async () => {
+    try {
+      await toggleAudioWidget({
+        width: Math.max(150, Math.min(400, audioSettings.widget_width || 200)),
+        height: Math.max(150, Math.min(400, audioSettings.widget_height || 200)),
+      })
+    } catch {
+      setStatusText('Không thể thao tác widget')
+    }
+  }, [audioSettings.widget_width, audioSettings.widget_height, setStatusText])
+
+  // WHY: Đồng bộ widgetOpen với shared manager — cả tray menu (App.tsx) lẫn nút module
+  // đều cập nhật qua manager, nên UI luôn khớp trạng thái thực tế của cửa sổ.
+  // isAudioWidgetOpen() là boolean sync (manager state authoritative).
+  useEffect(() => {
+    setWidgetOpen(isAudioWidgetOpen())
+    const unsubscribe = subscribeAudioWidget((open) => {
+      setWidgetOpen(open)
+      widgetOpenRef.current = open
+    })
+    return unsubscribe
+  }, [])
 
   // WHY: Fetch song song devices + settings + sound files + history
   // Dùng Promise.all để giảm thời gian loading (4 API cùng lúc).
   const fetchAll = useCallback(async () => {
     try {
+      const signalOpts = { signal: pollAbortRef.current?.signal }
       const [devicesRes, settingsRes, soundRes, historyRes] = await Promise.all([
-        fetchWithRetry(`${API}/api/audio/devices`),
-        fetchWithRetry(`${API}/api/audio/settings`),
-        fetchWithRetry(`${API}/api/audio/sound-files`),
-        fetchWithRetry(`${API}/api/audio/session-history`),
+        fetchWithRetry(`${API}/api/audio/devices`, signalOpts),
+        fetchWithRetry(`${API}/api/audio/settings`, signalOpts),
+        fetchWithRetry(`${API}/api/audio/sound-files`, signalOpts),
+        fetchWithRetry(`${API}/api/audio/session-history`, signalOpts),
       ])
       if (devicesRes.ok) {
         const data = await devicesRes.json()
@@ -106,26 +147,52 @@ export default function AudioModule({ theme, setStatusText, inactive, background
         setSessionHistory(data.sessions || [])
       }
     } catch {
-      setStatusText('Đang kết nối lại...')
+      setStatusText('Đang tải dữ liệu...')
       addToast({ type: 'warning', title: '🔌 Mất kết nối âm thanh', message: 'Không thể kết nối tới backend' })
     }
   }, [setStatusText, addToast])
 
-  // WHY: Dùng refs để fetchMicStatus (chạy mỗi 1s) không cần re-create.
+  // WHY: Dùng refs để fetchMicStatus (chạy mỗi 5s) không cần re-create.
   // Nếu dùng state trực tiếp, useCallback phải rebuild mỗi khi state thay đổi → interval bị clear/reset.
   useEffect(() => {
     audioSettingsRef.current = audioSettings
   }, [audioSettings])
   useEffect(() => {
-    widgetModeRef.current = widgetMode
-  }, [widgetMode])
+    widgetOpenRef.current = widgetOpen
+  }, [widgetOpen])
 
-  // WHY: Polling mic status mỗi 1s — cần phản hồi real-time khi mic bật/tắt.
+  // WHY: Mic level real-time (RMS 0-1) + peak hold — dữ liệu thật cho VU meter.
+  // Lưu ở state để UI re-render mượt (poll 200ms, không cần ref).
+  const [micLevel, setMicLevel] = useState(0)
+  const [peakLevel, setPeakLevel] = useState(0)
+  const peakLevelRef = useRef(0)
+
+  // Poll mức âm thanh micro real-time (RMS 0.0-1.0) mỗi 200ms.
+  // Dùng fetch thường (KHÔNG fetchWithRetry) — endpoint poll 200ms cần nhẹ,
+  // retry + backoff sẽ chồng request khi backend tạm lỗi.
+  // Backend dùng sounddevice.InputStream + idle auto-stop (5s không poll là tự tắt)
+  // nên không lo pythonw.exe giữ mic vĩnh viễn.
+  // WHY: Peak hold giữ giá trị đỉnh rồi decay dần để hiển thị vạch peak.
+  const fetchMicLevel = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/api/audio/mic-level`, { signal: pollAbortRef.current?.signal })
+      if (res.ok) {
+        const data = await res.json()
+        const lvl = Math.max(0, Math.min(1, Number(data.level) || 0))
+        setMicLevel(lvl)
+        // WHY: Peak hold — giữ đỉnh, decay 6%/poll (~1s đầy đủ) để vạch peak tụt từ từ
+        peakLevelRef.current = Math.max(lvl, peakLevelRef.current - 0.06)
+        setPeakLevel(peakLevelRef.current)
+      }
+    } catch {}
+  }, [])
+
+  // WHY: Polling mic status mỗi 5s — cần phản hồi khi mic bật/tắt.
   // Dùng refs (không phải state) để callback ổn định, tránh re-create interval.
   // previousWasActiveRef: phát hiện transition active→inactive để log session.
   const fetchMicStatus = useCallback(async () => {
     try {
-      const res = await fetchWithRetry(`${API}/api/audio/mic-status`)
+      const res = await fetchWithRetry(`${API}/api/audio/mic-status`, { signal: pollAbortRef.current?.signal })
       if (res.ok) {
         const data: MicStatus = await res.json()
         setMicStatus(data)
@@ -152,18 +219,19 @@ export default function AudioModule({ theme, setStatusText, inactive, background
               oscillator.stop(audioCtx.currentTime + 0.15)
             } catch {}
           }
-          // Auto-show widget if enabled
-          if (settings.show_widget_on_mic && !widgetModeRef.current) {
-            setWidgetMode(true)
+          // Auto-show widget (Tauri window) if enabled
+          if (settings.show_widget_on_mic && !widgetOpenRef.current) {
+            openWidgetWindow()
           }
         } else if (!data.active && previousWasActiveRef.current) {
           // Mic just turned off - save session
           previousWasActiveRef.current = false
           setLastSessionDuration(sessionTimerRef.current)
           addToast({ type: 'info', title: '🎤 Mic đã tắt', message: `Phiên mic kéo dài ${Math.floor(sessionTimerRef.current / 60)} phút` })
-          // Auto-hide widget if enabled
-          if (settings.show_widget_on_mic && widgetModeRef.current) {
-            setWidgetMode(false)
+          // Auto-hide widget if enabled (widget tự động đóng)
+          if (settings.show_widget_on_mic && widgetOpenRef.current) {
+            // Widget tự quản lý, không tự động close — user có thể muốn giữ widget để xem thông tin
+            // Chỉ close nếu user muốn
           }
           if (sessionTimerRef.current > 2) {
             fetchWithRetry(`${API}/api/audio/session-log`, {
@@ -178,7 +246,7 @@ export default function AudioModule({ theme, setStatusText, inactive, background
         }
       }
     } catch {}
-  }, []) // Empty deps - stable callback using refs
+  }, [openWidgetWindow]) // openWidgetWindow ổn định (useCallback)
 
   // WHY: Timer chỉ chạy khi mic đang active (microphone đang được dùng).
   // Tự động clear khi mic tắt — không tốn tài nguyên nền.
@@ -205,15 +273,26 @@ export default function AudioModule({ theme, setStatusText, inactive, background
   }, [micStatus?.active])
 
   // WHY: Polling audio — chỉ chạy khi module active. Khi inactive: clear intervals.
-  // fetchMicStatus 1s là interval nặng nhất (gọi API mỗi giây).
+  // Stagger 500ms để tránh request burst khi nhiều module cùng mount.
   useEffect(() => {
     if (inactive && !backgroundPolling) return
-    fetchAll()
-    fetchMicStatus()
-    const i1 = setInterval(fetchAll, 5000)
-    const i2 = setInterval(fetchMicStatus, 1000)
-    return () => { clearInterval(i1); clearInterval(i2) }
-  }, [fetchAll, fetchMicStatus, inactive, backgroundPolling])
+    // Abort any in-flight requests from previous poll cycle
+    if (pollAbortRef.current) pollAbortRef.current.abort()
+    pollAbortRef.current = new AbortController()
+    const initialTimer = setTimeout(() => {
+      fetchAll()
+      fetchMicStatus()
+      fetchMicLevel()
+    }, 500)
+    const i1 = setInterval(fetchAll, 30000)
+    const i2 = setInterval(fetchMicStatus, 5000)
+    const i3 = setInterval(fetchMicLevel, 200)
+    return () => {
+      clearTimeout(initialTimer)
+      pollAbortRef.current?.abort()
+      clearInterval(i1); clearInterval(i2); clearInterval(i3)
+    }
+  }, [fetchAll, fetchMicStatus, fetchMicLevel, inactive, backgroundPolling])
 
   // Device selection
   useEffect(() => {
@@ -224,12 +303,13 @@ export default function AudioModule({ theme, setStatusText, inactive, background
   }, [selectedDevice, devices])
 
   // WHY: Toggle mute device — POST mute API + fetchAll refresh.
-  // Local state muted cap nhat ngay (optimistic UI).
-  const toggleMute = async (id: number) => {
+  // Local state muted cập nhật ngay (optimistic UI).
+  // WHY: dev.id là chuỗi GUID (audio v2) — encodeURIComponent để bỏ { } . an toàn trong URL.
+  const toggleMute = async (id: string) => {
     const dev = devices.find(d => d.id === id)
     const wasMuted = muted
     try {
-      const res = await fetchWithRetry(`${API}/api/audio/devices/${id}/mute`, { method: 'POST' })
+      const res = await fetchWithRetry(`${API}/api/audio/devices/${encodeURIComponent(id)}/mute`, { method: 'POST' })
       if (res.ok) {
         setMuted(!wasMuted)
         fetchAll()
@@ -244,10 +324,10 @@ export default function AudioModule({ theme, setStatusText, inactive, background
   }
 
   // WHY: Set volume — PUT volume API + local state.
-  // Clamp 0-100 (backend cung lam).
-  const setVolumeLevel = async (id: number, vol: number) => {
+  // Clamp 0-100 (backend cũng làm).
+  const setVolumeLevel = async (id: string, vol: number) => {
     try {
-      await fetchWithRetry(`${API}/api/audio/devices/${id}/volume`, {
+      await fetchWithRetry(`${API}/api/audio/devices/${encodeURIComponent(id)}/volume`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ volume: vol })
       })
@@ -256,13 +336,21 @@ export default function AudioModule({ theme, setStatusText, inactive, background
   }
 
   // WHY: Set default audio device — POST default API + UI feedback.
-  // Refresh devices list de thay doi default badge.
-  const setDefaultDevice = async (id: number) => {
+  // Refresh devices list để thay đổi default badge (backend v2 tính is_default từ
+  // Windows Core Audio thật, nên badge di chuyển chính xác sau khi đổi).
+  // WHY: Hiện toast LỖI khi res không ok — trước đây nuốt lỗi âm thầm (user tưởng
+  // "không đặt được" dù API có thể báo 404/500).
+  const setDefaultDevice = async (id: string) => {
+    const dev = devices.find(d => d.id === id)
     try {
-      const res = await fetchWithRetry(`${API}/api/audio/devices/${id}/default`, { method: 'POST' })
+      const res = await fetchWithRetry(`${API}/api/audio/devices/${encodeURIComponent(id)}/default`, { method: 'POST' })
       if (res.ok) {
         setStatusText('Đã đặt mặc định'); fetchAll()
         addToast({ type: 'success', title: '🔊 Thiết bị âm thanh', message: 'Đã đặt làm mặc định' })
+      } else {
+        const errData = await res.json().catch(() => ({ error: 'Không thể đặt mặc định' }))
+        setStatusText('Thất bại')
+        addToast({ type: 'error', title: '🔊 Lỗi', message: errData.error || 'Đặt thiết bị mặc định thất bại' })
       }
     } catch {
       setStatusText('Thất bại')
@@ -288,438 +376,505 @@ export default function AudioModule({ theme, setStatusText, inactive, background
     }
   }
 
-  // WHY: Dùng window-level event listeners để drag không bị giới hạn bởi kích thước component.
-  // Ref pattern (dragging, dragOffset) thay vì state để tránh re-render khi drag.
-  useEffect(() => {
-    const handleMouseMove = (e: MouseEvent) => {
-      if (!dragging.current) return
-      setWidgetPos({ x: e.clientX - dragOffset.current.x, y: e.clientY - dragOffset.current.y })
-    }
-    // WHY: Cleanup khi thả chuột — dùng window-level listener để bắt ngay cả khi chuột ra ngoài component.
-    const handleMouseUp = () => { dragging.current = false }
-    window.addEventListener('mousemove', handleMouseMove)
-    window.addEventListener('mouseup', handleMouseUp)
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove)
-      window.removeEventListener('mouseup', handleMouseUp)
-    }
-  }, [])
-  // WHY: Start widget drag — luu offset de tranh jump khi bat dau drag.
-  // Window-level move/up listeners duoc attach trong useEffect (handleMouseMove/handleMouseUp).
-  const handleMouseDown = (e: React.MouseEvent) => {
-    dragging.current = true
-    dragOffset.current = { x: e.clientX - widgetPos.x, y: e.clientY - widgetPos.y }
-  }
-
-  // WHY: Format seconds -> mm:ss (khong co hours vi timer mic thuong < 1h).
-  // Dung padStart de dam bao 2 chu so (VD: 5 -> 05).
+  // WHY: Format seconds -> mm:ss (không có hours vì timer mic thường < 1h).
+  // Dùng padStart để đảm bảo 2 chữ số (VD: 5 -> 05).
   const formatDuration = (seconds: number) => {
     const m = Math.floor(seconds / 60)
     const s = seconds % 60
     return `${m}:${s.toString().padStart(2, '0')}`
   }
 
-  const activeColor = audioSettings.color_mic_on || '#3498DB'
-  const inactiveColor = audioSettings.color_mic_off || '#E74C3C'
+  // WHY: Chỉ lấy tên file từ đường dẫn (C:\\path\\file.exe → file.exe)
+  const getBasename = (path: string | null | undefined): string | null | undefined => {
+    if (!path || typeof path !== 'string') return path
+    const normalized = path.replace(/[\\/]+$/, '')
+    const parts = normalized.replace(/\\/g, '/').split('/')
+    return parts[parts.length - 1] || path
+  }
 
-  // Widget mode overlay — ẩn khi module inactive (tránh floating widget trên tab khác)
-  if (widgetMode && !inactive) {
-    return (
-      <div className="fixed" style={{
-        left: widgetPos.x, top: widgetPos.y,
-        zIndex: 9999,
+  // WHY: Tách 2 nhóm thiết bị — Micro (đầu vào: mic/webcam/thiết bị ghi âm) và
+  // Loa/Tai nghe (đầu ra) theo convention is_input (khớp với thống kê ở header).
+  const inputDevices = devices.filter(d => d.is_input)
+  const outputDevices = devices.filter(d => !d.is_input)
+
+  // WHY: DeviceCard — thẻ thiết bị dùng chung cho cả 2 section (Micro / Loa).
+  // Click thẻ → mở rộng điều khiển: mute, slider âm lượng, đặt mặc định.
+  const DeviceCard = ({ dev }: { dev: AudioDevice }) => (
+    <div
+      className="rounded-2xl border backdrop-blur-md transition-all duration-200 overflow-hidden shadow-sm hover:border-slate-600"
+      style={{
+        backgroundColor: 'var(--bg-card)',
+        borderColor: dev.is_default ? 'rgba(52,211,153,0.35)' : 'var(--border)'
       }}>
-        <div
-          className="select-none rounded-xl border backdrop-blur-lg shadow-2xl transition-colors overflow-hidden"
-          style={{
-            width: 200, height: 200,
-            backgroundColor: micStatus?.active ? activeColor : inactiveColor,
-            borderColor: micStatus?.active ? `${activeColor}60` : '#475569',
-            opacity: audioSettings.widget_opacity ?? 1.0,
-          }}
-          onMouseDown={handleMouseDown}
-        >
-          <div className="h-full flex flex-col items-center justify-center p-3 cursor-grab active:cursor-grabbing">
-            {/* Icon */}
-            <span className="text-5xl mb-2">{micStatus?.active ? '🎤' : '🔇'}</span>
-            {/* Timer */}
-            <div className="text-white font-bold text-lg font-mono drop-shadow-lg">
-              {micStatus?.active ? formatDuration(sessionTimer) : '--:--'}
-            </div>
-            {/* App name */}
-            <div className="text-white/80 text-xs mt-1 truncate max-w-full text-center">
-              {micStatus?.app_using_mic || 'Không có ứng dụng'}
-            </div>
-            {/* Status dot */}
-            <div className="flex items-center gap-1 mt-1">
-              <span className={`w-1.5 h-1.5 rounded-full ${micStatus?.active ? 'bg-green-300 animate-pulse' : 'bg-gray-400'}`} />
-              <span className="text-white/70 text-[10px]">{micStatus?.active ? 'Hoạt động' : 'Không hoạt động'}</span>
+      <div className="flex items-center justify-between p-3.5 cursor-pointer transition-colors hover:bg-white/[0.02]"
+        onClick={() => setSelectedDevice(selectedDevice === dev.id ? null : dev.id)}>
+        <div className="flex items-center gap-3 min-w-0 flex-1">
+          <div className={`w-10 h-10 rounded-xl flex items-center justify-center text-xl shrink-0 ${
+            dev.is_input ? 'bg-amber-500/15 border border-amber-500/30 text-amber-400' : 'bg-sky-500/15 border border-sky-500/30 text-sky-400'
+          }`}>
+            {dev.is_input ? '🎤' : '🔊'}
+          </div>
+
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-sm font-bold truncate" style={{ color: 'var(--fg)' }}>{dev.name}</span>
+              {dev.is_default && (
+                <span className="text-[9px] bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 rounded-full font-bold">
+                  MẶC ĐỊNH
+                </span>
+              )}
+              {dev.muted && (
+                <span className="text-[9px] bg-red-500/15 text-red-400 border border-red-500/30 px-2 py-0.5 rounded-full font-bold">
+                  🔇 TẮT TIẾNG
+                </span>
+              )}
             </div>
           </div>
         </div>
-        {/* Minimize button */}
-        <button onClick={() => setWidgetMode(false)}
-          className="absolute -top-2 -right-2 w-5 h-5 rounded-full bg-gray-800 border border-gray-600 text-white text-[10px] flex items-center justify-center cursor-pointer hover:bg-gray-700"
-          title="Thoát chế độ thu gọn">
-          ✕
-        </button>
+
+        {/* Volume level indicator bar */}
+        <div className="flex items-center gap-3 ml-4 shrink-0">
+          <div className="w-24 h-2 rounded-full bg-slate-800 overflow-hidden border border-slate-700">
+            <div className="h-full rounded-full transition-all duration-300" style={{
+              width: `${dev.volume}%`,
+              backgroundColor: dev.volume > 70 ? '#34d399' : dev.volume > 30 ? '#fbbf24' : '#f87171'
+            }} />
+          </div>
+          <span className="text-xs font-mono font-bold w-10 text-right text-slate-300">{dev.volume}%</span>
+          <span className={`text-xs text-slate-400 transition-transform ${selectedDevice === dev.id ? 'rotate-180' : ''}`}>▼</span>
+        </div>
       </div>
-    )
-  }
+
+      {/* Expanded Device Controls */}
+      {selectedDevice === dev.id && (
+        <div className="border-t px-4 py-3.5 space-y-3.5 bg-slate-950/40 backdrop-blur-sm" style={{ borderColor: 'var(--border)' }}>
+          <div className="flex items-center gap-3">
+            <button onClick={() => toggleMute(dev.id)}
+              className="px-3.5 py-2 text-xs font-semibold rounded-xl border transition-all active:scale-95 cursor-pointer flex items-center gap-1.5 shadow-sm"
+              style={{
+                backgroundColor: dev.muted ? 'rgba(239,68,68,0.15)' : 'var(--input-bg)',
+                borderColor: dev.muted ? 'rgba(239,68,68,0.3)' : 'var(--border)',
+                color: dev.muted ? '#ef4444' : 'var(--fg-secondary)'
+              }}>
+              {dev.muted ? '🔊 Bật tiếng' : '🔇 Tắt tiếng'}
+            </button>
+
+            <div className="flex-1 flex items-center gap-2">
+              <span className="text-xs text-slate-400 font-medium">Âm lượng:</span>
+              <input id={`volume-${dev.id}`} name="volume" type="range" min={0} max={100} value={dev.volume}
+                onChange={e => setVolumeLevel(dev.id, parseInt(e.target.value))}
+                className="flex-1 accent-emerald-500 cursor-pointer h-2 bg-slate-800 rounded-lg" />
+              <span className="text-xs font-mono font-bold w-9 text-right text-emerald-400">{dev.volume}%</span>
+            </div>
+          </div>
+
+          {!dev.is_default && (
+            <button onClick={() => setDefaultDevice(dev.id)}
+              className="w-full py-2 text-xs font-bold bg-sky-500/15 hover:bg-sky-500/25 text-sky-400 border border-sky-500/30 rounded-xl transition-all active:scale-95 cursor-pointer">
+              🎯 Đặt {dev.name} làm thiết bị {dev.is_input ? 'Micro' : 'Loa'} mặc định
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  )
 
   return (
-    <div className="flex flex-col h-full p-4 gap-4" style={{ display: inactive ? 'none' : 'flex' }}>
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-sm font-semibold" style={{ color: 'var(--fg)' }}>🎤 Quản lý Âm thanh & Mic</h2>
-          <p className="text-xs" style={{ color: 'var(--fg-muted)' }}>{devices.length} thiết bị · {sessionHistory.length} phiên</p>
+    <>
+      <div className="flex flex-col h-full p-4 gap-4" style={{ display: inactive ? 'none' : 'flex' }}>
+      {/* Top Bar Header — Studio Master Control style */}
+      <div className="flex items-center justify-between border-b pb-3" style={{ borderColor: 'var(--border)' }}>
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-sky-500/20 via-indigo-500/20 to-emerald-500/20 border border-sky-500/35 flex items-center justify-center text-sky-400 font-bold text-xl shadow-lg shadow-sky-500/10">
+            🎙️
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <h2 className="text-base font-black tracking-tight" style={{ color: 'var(--fg)' }}>Trung tâm Âm thanh Studio</h2>
+              <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                MASTER DECK
+              </span>
+            </div>
+            <p className="text-xs text-slate-400 font-medium mt-0.5">
+              {devices.filter(d => d.is_input).length} Micro đầu vào · {devices.filter(d => !d.is_input).length} Loa/Tai nghe đầu ra · {sessionHistory.length} phiên thu âm
+            </p>
+          </div>
         </div>
         <div className="flex gap-2">
           {onBackgroundPollingChange && (
             <button onClick={() => onBackgroundPollingChange(!backgroundPolling)}
-              className="flex items-center gap-1 px-2 py-1.5 text-[10px] font-medium rounded-lg border transition-all active:scale-95 cursor-pointer"
-              style={{ backgroundColor: backgroundPolling ? 'rgba(52,211,153,0.1)' : 'var(--input-bg)', borderColor: 'var(--border)', color: backgroundPolling ? '#34d399' : 'var(--fg-muted)' }}>
-              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold rounded-xl border transition-all active:scale-95 cursor-pointer shadow-sm"
+              style={{ backgroundColor: backgroundPolling ? 'rgba(52,211,153,0.15)' : 'var(--input-bg)', borderColor: backgroundPolling ? 'rgba(52,211,153,0.35)' : 'var(--border)', color: backgroundPolling ? '#34d399' : 'var(--fg-muted)' }}>
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
               </svg>
-              Nền: {backgroundPolling ? 'BẬT' : 'TẮT'}
+              <span>Giám sát nền: {backgroundPolling ? 'BẬT' : 'TẮT'}</span>
             </button>
           )}
-          <button onClick={() => setWidgetMode(true)}
-            className="px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-all active:scale-95 cursor-pointer"
-            style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
-            🔲 Thu nhỏ
+          <button onClick={toggleWidget}
+            className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold rounded-xl border transition-all active:scale-95 cursor-pointer shadow-sm hover:bg-white/10"
+            style={{ backgroundColor: widgetOpen ? 'rgba(52,211,153,0.12)' : 'var(--input-bg)', borderColor: widgetOpen ? 'rgba(52,211,153,0.35)' : 'var(--border)', color: widgetOpen ? '#34d399' : 'var(--fg-secondary)' }}>
+            <span>{widgetOpen ? '🔳' : '🔲'}</span> {widgetOpen ? 'Widget độc lập' : 'Mở Widget độc lập'}
+          </button>
+          <button onClick={() => setSettingsOpen(true)}
+            className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold rounded-xl border transition-all active:scale-95 cursor-pointer shadow-sm hover:bg-emerald-500/20 text-emerald-400 border-emerald-500/40"
+            style={{ backgroundColor: 'rgba(52,211,153,0.12)' }}>
+            <span>⚙️</span> Cấu hình Widget
           </button>
         </div>
       </div>
 
-      {/* Mic Live Status + Timer Dashboard */}
-      <div className="grid grid-cols-2 gap-3">
-        {/* Mic Status */}
-        <div className="rounded-xl border backdrop-blur p-4 transition-all"
-          style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border)' }}>
-          <div className="flex items-center justify-between mb-3">
-            <h3 className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-muted)' }}>
-              🎙 Micro
-            </h3>
-            {micStatus && (
-              <span className={`flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold ${
-                micStatus.active ? 'bg-emerald-500/15 text-emerald-500 ring-1 ring-emerald-500/20' : 'bg-gray-500/10 text-gray-400 ring-1 ring-gray-500/15'
-              }`}>
-                <span className={`w-1.5 h-1.5 rounded-full ${micStatus.active ? 'bg-emerald-400 animate-pulse' : 'bg-gray-400'}`} />
-                {micStatus.active ? 'ĐANG DÙNG' : 'KHÔNG DÙNG'}
-              </span>
-            )}
-          </div>
-          {micStatus ? (
-            <div className="space-y-2 text-xs">
-              <div className="flex items-center gap-2 mb-2">
-                {/* Overall Status Badge */}
-                {micStatus.overall_status === 'active' && (
-                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 flex items-center gap-1">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" /> ĐANG DÙNG
-                  </span>
-                )}
-                {micStatus.overall_status === 'muted' && (
-                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-red-500/15 text-red-400 border border-red-500/30 flex items-center gap-1">
-                    <span className="w-1.5 h-1.5 rounded-full bg-red-400" /> 🔇 ĐÃ TẮT
-                  </span>
-                )}
-                {micStatus.overall_status === 'idle' && (
-                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-500/10 text-blue-400 border border-blue-500/20 flex items-center gap-1">
-                    <span className="w-1.5 h-1.5 rounded-full bg-blue-400" /> SẴN SÀNG
-                  </span>
-                )}
-                {micStatus.overall_status === 'no_mic' && (
-                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-gray-500/10 text-gray-400 border border-gray-500/20 flex items-center gap-1">
-                    ❌ KHÔNG CÓ MIC
-                  </span>
-                )}
-                {/* Mic count */}
-                {micStatus.mic_count > 0 && (
-                  <span className="text-[10px] px-1.5 py-0.5 rounded" style={{ backgroundColor: 'var(--input-bg)', color: 'var(--fg-dim)' }}>
-                    {micStatus.mic_count} mic
-                  </span>
-                )}
+      {/* Hero Section: Dynamic Equalizer VU Spectrum & Digital Studio Clock */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {/* Card 1: Mic Live Radar & Visualizer Spectrum */}
+        <div className="rounded-2xl border backdrop-blur-md p-4 transition-all shadow-sm relative overflow-hidden flex flex-col justify-between"
+          style={{ backgroundColor: 'var(--bg-card)', borderColor: micStatus?.active ? 'rgba(52,211,153,0.4)' : 'var(--border)' }}>
+          
+          {micStatus?.active && (
+            <div className="absolute -top-10 -right-10 w-40 h-40 bg-emerald-500/15 rounded-full blur-3xl pointer-events-none" />
+          )}
+
+          <div>
+            <div className="flex items-center justify-between mb-3 border-b pb-2.5" style={{ borderColor: 'var(--border)' }}>
+              <div className="flex items-center gap-2">
+                <span className="text-base">🎙️</span>
+                <h3 className="text-xs font-bold uppercase tracking-wider text-sky-400">
+                  Tín hiệu Micro Real-time
+                </h3>
               </div>
-              <div>
-                <span style={{ color: 'var(--fg-muted)' }}>🎤 Mic đang dùng:</span>
-                <p className="font-medium truncate mt-0.5" style={{ color: 'var(--fg)' }}>{micStatus.mic_name || 'Không rõ'}</p>
-              </div>
-              <div>
-                <span style={{ color: 'var(--fg-muted)' }}>📱 Ứng dụng:</span>
-                <p className="font-medium truncate mt-0.5" style={{ color: 'var(--fg)' }}>{micStatus.app_using_mic || 'Không có'}</p>
-              </div>
-              {micStatus.mic_muted !== null && micStatus.mic_muted !== undefined && (
-                <div>
-                  <span style={{ color: 'var(--fg-muted)' }}>🔇 Tắt tiếng:</span>
-                  <p className="font-medium mt-0.5" style={{ color: micStatus.mic_muted ? '#ef4444' : '#22c55e' }}>
-                    {micStatus.mic_muted ? 'Micro đang tắt tiếng' : 'Micro đang bật'}
-                  </p>
-                </div>
-              )}
-              <div>
-                <span style={{ color: 'var(--fg-muted)' }}>Trạng thái:</span>
-                <p className="font-medium mt-0.5" style={{ color: micStatus.active ? '#22c55e' : '#94a3b8' }}>
-                  {micStatus.active ? 'Micro đang dùng' : 'Không hoạt động'}
-                </p>
-              </div>
-              {/* Available mics list */}
-              {micStatus.available_mics && micStatus.available_mics.length > 0 && (
-                <div className="pt-2 border-t mt-2" style={{ borderColor: 'var(--border)' }}>
-                  <span className="text-xs font-semibold" style={{ color: 'var(--fg-muted)' }}>
-                    📋 Micro khả dụng ({micStatus.available_mics.length}):
-                  </span>
-                  <div className="mt-1 space-y-0.5 max-h-24 overflow-y-auto">
-                    {micStatus.available_mics.slice(0, 6).map(mic => (
-                      <div key={mic.id} className="flex items-center gap-1.5 text-[10px]">
-                        <span style={{ color: mic.default ? '#22c55e' : 'var(--fg-dim)' }}>
-                          {mic.default ? '🔵' : '○'}
-                        </span>
-                        <span className="truncate flex-1" style={{ color: mic.default ? 'var(--fg)' : 'var(--fg-dim)' }}>
-                          {mic.name}
-                        </span>
-                        <span style={{ color: 'var(--fg-dim)' }}>{mic.channels}ch</span>
-                        {mic.default && (
-                          <span className="text-[8px] bg-emerald-500/10 text-emerald-400 px-1 rounded">MĐ</span>
-                        )}
-                      </div>
-                    ))}
-                    {micStatus.available_mics.length > 6 && (
-                      <p className="text-[10px] italic" style={{ color: 'var(--fg-dim)' }}>
-                        +{micStatus.available_mics.length - 6} micro khác...
-                      </p>
-                    )}
-                  </div>
-                </div>
+              {micStatus && (
+                <span className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold shadow-sm ${
+                  micStatus.active ? 'bg-emerald-500/20 text-emerald-400 ring-1 ring-emerald-500/40' : 'bg-slate-800 text-slate-400 ring-1 ring-slate-700'
+                }`}>
+                  <span className={`w-2 h-2 rounded-full ${micStatus.active ? 'bg-emerald-400 animate-ping' : 'bg-slate-500'}`} />
+                  {micStatus.active ? 'ĐANG THU ÂM LIVE' : 'SẴN SÀNG'}
+                </span>
               )}
             </div>
-          ) : (
-            <p className="text-xs italic" style={{ color: 'var(--fg-dim)' }}>Đang kết nối...</p>
-          )}
+
+            {/* Real-time VU Meter — driven by ACTUAL RMS level from /api/audio/mic-level */}
+            <div className="px-3 py-3 my-2.5 bg-slate-950/60 rounded-xl border border-slate-800/90 shadow-inner">
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-[9px] font-mono font-bold uppercase tracking-widest text-slate-500">VU Meter</span>
+                <span className={`text-[9px] font-mono font-bold px-1.5 py-0.5 rounded transition-colors ${
+                  micLevel > 0.02 ? 'bg-emerald-500/20 text-emerald-400' : 'bg-slate-800 text-slate-500'
+                }`}>
+                  {micLevel > 0.02 ? '● LIVE' : '○ IDLE'}
+                </span>
+              </div>
+
+              {/* 28 LED segments — each lights up when real level crosses its threshold */}
+              <div className="flex items-end gap-[2px] h-10">
+                {Array.from({ length: 28 }).map((_, i) => {
+                  const threshold = (i + 1) / 28
+                  const lit = micLevel >= threshold
+                  const color = i < 15 ? '#34d399' : i < 23 ? '#fbbf24' : '#ef4444'
+                  return (
+                    <div key={i} className="flex-1 rounded-[2px] transition-all duration-100"
+                      style={{
+                        backgroundColor: lit ? color : 'rgba(51,65,85,0.35)',
+                        height: '100%',
+                        boxShadow: lit ? `0 0 6px ${color}80` : 'none',
+                        opacity: lit ? 1 : 0.5,
+                      }} />
+                  )
+                })}
+              </div>
+
+              {/* dB-ish scale labels */}
+              <div className="flex justify-between text-[8px] font-mono text-slate-600 mt-1">
+                <span>-60</span><span>-40</span><span>-20</span><span>-6</span><span>0 dB</span>
+              </div>
+
+              {/* Big readout + peak hold */}
+              <div className="flex items-end justify-between mt-2 pt-2 border-t border-slate-800/60">
+                <div>
+                  <div className="text-[9px] font-bold uppercase tracking-wider text-slate-500">Mức tín hiệu</div>
+                  <div className="font-mono font-black text-3xl leading-none tabular-nums"
+                    style={{ color: micLevel > 0.75 ? '#ef4444' : micLevel > 0.4 ? '#fbbf24' : '#34d399' }}>
+                    {Math.round(micLevel * 100)}<span className="text-base">%</span>
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="text-[9px] font-bold uppercase tracking-wider text-slate-500">Đỉnh (Peak)</div>
+                  <div className="font-mono font-bold text-lg leading-none text-amber-400 tabular-nums">
+                    {Math.round(peakLevel * 100)}%
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {micStatus ? (
+              <div className="space-y-1.5 text-xs pt-1">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] text-slate-400 font-medium">Thiết bị thu:</span>                    <span className="font-bold text-slate-200 truncate max-w-[200px] text-right">
+                    {getBasename(micStatus.mic_name) || 'Không xác định'}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] text-slate-400 font-medium">Ứng dụng chiếm dụng:</span>                    <span className="font-semibold text-emerald-400 truncate max-w-[180px] text-right">
+                    {getBasename(micStatus.app_using_mic) || 'Chưa nhận diện'}
+                  </span>
+                </div>
+              </div>
+            ) : (
+              <p className="text-xs italic text-slate-500 py-2">Đang quét tín hiệu âm thanh...</p>
+            )}
+          </div>
         </div>
 
-        {/* Timer Dashboard */}
-        <div className="rounded-xl border backdrop-blur p-4 transition-all"
+        {/* Card 2: Digital Studio Clock & Quick Actions */}
+        <div className="rounded-2xl border backdrop-blur-md p-4 transition-all shadow-sm flex flex-col justify-between"
           style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border)' }}>
-          <h3 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{ color: 'var(--fg-muted)' }}>
-            ⏱ Bộ đếm
-          </h3>
-          <div className="flex flex-col items-center">
-            <div className="text-4xl font-bold font-mono tracking-wider"
-              style={{ color: micStatus?.active ? '#22c55e' : 'var(--fg-secondary)' }}>
+          <div className="flex items-center justify-between border-b pb-2.5" style={{ borderColor: 'var(--border)' }}>
+            <div className="flex items-center gap-2">
+              <span className="text-base">⏱️</span>
+              <h3 className="text-xs font-bold uppercase tracking-wider text-emerald-400">
+                Đồng hồ Phiên Thu âm
+              </h3>
+            </div>
+            <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
+              {sessionHistory.length} phiên đã lưu
+            </span>
+          </div>
+
+          <div className="flex flex-col items-center justify-center py-2">
+            <div className={`text-4xl font-black font-mono tracking-wider transition-all ${
+              micStatus?.active ? 'text-emerald-400 drop-shadow-[0_0_18px_rgba(52,211,153,0.5)] scale-105' : 'text-slate-500'
+            }`}>
               {micStatus?.active ? formatDuration(sessionTimer) : '00:00'}
             </div>
-            <div className="text-xs mt-2 flex items-center gap-3 flex-wrap justify-center">
-              <span style={{ color: 'var(--fg-muted)' }}>
-                Gần nhất: <strong style={{ color: 'var(--fg-secondary)' }}>{formatDuration(lastSessionDuration)}</strong>
-              </span>
-              <span style={{ color: 'var(--fg-muted)' }}>
-                Phiên: <strong style={{ color: 'var(--fg-secondary)' }}>{sessionHistory.length}</strong>
-              </span>
-            </div>
-            <div className="mt-2 flex gap-1.5">
-              <button onClick={() => setHistoryOpen(true)}
-                className="px-2 py-0.5 text-[10px] rounded-lg border transition-colors cursor-pointer"
-                style={{ borderColor: 'var(--border)', color: 'var(--fg-muted)' }}>
-                📋 Lịch sử
-              </button>
-              <button onClick={() => setSettingsOpen(true)}
-                className="px-2 py-0.5 text-[10px] rounded-lg border transition-colors cursor-pointer"
-                style={{ borderColor: 'var(--border)', color: 'var(--fg-muted)' }}>
-                ⚙️ Settings
-              </button>
-            </div>
+            <p className="text-[11px] text-slate-400 mt-1 font-medium">
+              Thời lượng gần nhất: <strong className="text-sky-400 font-mono">{formatDuration(lastSessionDuration)}</strong>
+            </p>
+          </div>
+
+          <div className="flex items-center justify-center gap-2 pt-2 border-t" style={{ borderColor: 'var(--border)' }}>
+            <button onClick={() => setHistoryOpen(true)}
+              className="px-3.5 py-1.5 text-xs font-bold rounded-xl border transition-all active:scale-95 cursor-pointer hover:bg-white/10 shadow-sm"
+              style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+              📋 Lịch sử thu âm
+            </button>
+            <button onClick={() => setSettingsOpen(true)}
+              className="px-3.5 py-1.5 text-xs font-bold rounded-xl border transition-all active:scale-95 cursor-pointer hover:bg-white/10 shadow-sm"
+              style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+              ⚙️ Cấu hình chuông báo
+            </button>
           </div>
         </div>
       </div>
 
-      {/* Devices List */}
-      <div className="flex-1 overflow-y-auto space-y-2">
+      {/* Devices List Section — Split into Input & Output Racks */}
+      <div className="flex-1 overflow-y-auto space-y-3 pr-1">
+        <div className="flex items-center justify-between">
+          <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-2">
+            <span>🎚️ Thiết bị Âm thanh</span>
+            <span className="text-[10px] font-normal text-slate-500">({devices.length} kết nối)</span>
+          </h3>
+          <span className="text-[10px] text-slate-400">Nhấn vào thẻ thiết bị để mở điều khiển âm lượng</span>
+        </div>
+
         {devices.length === 0 && (
-          <div className="flex items-center justify-center h-32">
-            <p className="text-xs italic" style={{ color: 'var(--fg-dim)' }}>Không tìm thấy thiết bị âm thanh.</p>
+          <div className="flex flex-col items-center justify-center h-40 gap-2 text-slate-500">
+            <span className="text-3xl opacity-40">🎧</span>
+            <p className="text-xs italic">Không tìm thấy thiết bị âm thanh nào kết nối.</p>
           </div>
         )}
-        {devices.map(dev => (
-          <div key={dev.id}
-            className="rounded-xl border backdrop-blur transition-all duration-200 overflow-hidden"
-            style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border)' }}>
-            <div className="flex items-center justify-between p-3 cursor-pointer"
-              onClick={() => setSelectedDevice(selectedDevice === dev.id ? null : dev.id)}>
-              <div className="flex items-center gap-3 min-w-0 flex-1">
-                <span className="text-lg shrink-0">{dev.is_input ? '🎤' : '🔊'}</span>
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium truncate" style={{ color: 'var(--fg)' }}>{dev.name}</span>
-                    {dev.is_default && (
-                      <span className="text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded font-medium">MẶC ĐỊNH</span>
-                    )}
-                  </div>
-                  <span className="text-xs" style={{ color: 'var(--fg-dim)' }}>
-                    {dev.is_input ? 'Đầu vào' : 'Đầu ra'}
-                    {dev.muted && <span className="ml-2 text-red-400">🔇 TẮT TIẾNG</span>}
-                  </span>
-                </div>
-              </div>
-              <div className="flex items-center gap-2 ml-3">
-                <div className="w-16 h-1.5 rounded-full bg-gray-700/50 overflow-hidden">
-                  <div className="h-full rounded-full transition-all" style={{
-                    width: `${dev.volume}%`,
-                    backgroundColor: dev.volume > 70 ? '#22c55e' : dev.volume > 30 ? '#eab308' : '#ef4444'
-                  }} />
-                </div>
-                <span className="text-xs font-mono w-8 text-right" style={{ color: 'var(--fg-muted)' }}>{dev.volume}%</span>
-              </div>
-            </div>
 
-            {selectedDevice === dev.id && (
-              <div className="border-t px-4 py-3 space-y-3" style={{ borderColor: 'var(--border)' }}>
-                <div className="flex items-center gap-3">
-                  <button onClick={() => toggleMute(dev.id)}
-                    className="px-3 py-1 text-xs font-medium rounded-lg border transition-colors cursor-pointer"
-                    style={{ backgroundColor: dev.muted ? '#ef444420' : 'var(--input-bg)', borderColor: dev.muted ? '#ef444240' : 'var(--border)', color: dev.muted ? '#ef4444' : 'var(--fg-secondary)' }}>
-                    {dev.muted ? '🔇 Bật tiếng' : '🔊 Tắt tiếng'}
-                  </button>
-                  <input id={`volume-${dev.id}`} name="volume" type="range" min={0} max={100} value={volume}
-                    onChange={e => setVolumeLevel(dev.id, parseInt(e.target.value))}
-                    className="flex-1 accent-emerald-500" />
-                  <span className="text-xs font-mono w-8 text-right" style={{ color: 'var(--fg-muted)' }}>{volume}%</span>
-                </div>
-                {!dev.is_default && (
-                  <button onClick={() => setDefaultDevice(dev.id)}
-                    className="w-full px-3 py-1.5 text-xs font-medium bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 rounded-lg transition-colors cursor-pointer border-0">
-                    🎯 Đặt mặc định {dev.is_input ? 'Mic' : 'Loa'}
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
-        ))}
+        {inputDevices.length > 0 && (
+          <section className="space-y-3">
+            <div className="flex items-center justify-between px-1">
+              <h4 className="text-[11px] font-bold uppercase tracking-wider text-amber-400/90 flex items-center gap-2">
+                <span>🎤 Micro & Thiết bị ghi âm</span>
+                <span className="text-[10px] font-normal text-slate-500">({inputDevices.length})</span>
+              </h4>
+            </div>
+            {inputDevices.map(dev => <DeviceCard key={dev.id} dev={dev} />)}
+          </section>
+        )}
+
+        {outputDevices.length > 0 && (
+          <section className="space-y-3">
+            <div className="flex items-center justify-between px-1">
+              <h4 className="text-[11px] font-bold uppercase tracking-wider text-sky-400/90 flex items-center gap-2">
+                <span>🔊 Loa & Tai nghe</span>
+                <span className="text-[10px] font-normal text-slate-500">({outputDevices.length})</span>
+              </h4>
+            </div>
+            {outputDevices.map(dev => <DeviceCard key={dev.id} dev={dev} />)}
+          </section>
+        )}
       </div>
 
-      {/* Settings Modal */}
+      {/* Settings Modal — z-[10000] hiển thị đè lên mọi thứ */}
       {settingsOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
-          onClick={e => { if (e.target === e.currentTarget) setSettingsOpen(false) }}>
-          <div className="w-full max-w-sm rounded-2xl border shadow-2xl p-6 transition-colors flex flex-col"
-            style={{ backgroundColor: 'var(--bg)', borderColor: 'var(--border)', color: 'var(--fg)' }}>
-            <div className="flex items-center justify-between pb-4 border-b" style={{ borderColor: 'var(--border)' }}>
-              <h3 className="text-sm font-semibold">⚙️ Cài đặt Âm thanh</h3>
-              <button onClick={() => setSettingsOpen(false)}
-                className="p-1 rounded-lg hover:bg-black/10 dark:hover:bg-white/10 transition-colors cursor-pointer border-0"
-                style={{ color: 'var(--fg-muted)' }}>&times;</button>
-            </div>
-            <div className="mt-4 space-y-4 text-xs">
-              <label htmlFor="audio-sound-enabled" className="flex items-center gap-2 cursor-pointer">
-                <input id="audio-sound-enabled" name="soundEnabled" type="checkbox" checked={audioSettings.sound_enabled}
-                  onChange={e => setAudioSettings(prev => ({ ...prev, sound_enabled: e.target.checked }))}
-                  className="accent-emerald-500" />
-                <span style={{ color: 'var(--fg-secondary)' }}>Âm thanh báo khi mic bật</span>
-              </label>
-              <label htmlFor="audio-show-widget" className="flex items-center gap-2 cursor-pointer">
-                <input id="audio-show-widget" name="showWidget" type="checkbox" checked={audioSettings.show_widget_on_mic}
-                  onChange={e => setAudioSettings(prev => ({ ...prev, show_widget_on_mic: e.target.checked }))}
-                  className="accent-emerald-500" />
-                <span style={{ color: 'var(--fg-secondary)' }}>Hiện widget khi mic bật</span>
-              </label>
-              <div>
-                <label className="text-xs font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>
-                  Độ mờ widget: {Math.round((audioSettings.widget_opacity ?? 1.0) * 100)}%
-                </label>
-                <input id="audio-opacity" name="widgetOpacity" type="range" min={10} max={100} value={Math.round((audioSettings.widget_opacity ?? 1.0) * 100)}
-                  onChange={e => setAudioSettings(prev => ({ ...prev, widget_opacity: parseInt(e.target.value) / 100 }))}
-                  className="w-full accent-emerald-500" />
-              </div>
-              <div>
-                <label htmlFor="audio-color-on" className="text-xs font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Màu khi hoạt động</label>
+          <div className="fixed inset-0 z-[10000] flex items-center justify-center bg-black/65 backdrop-blur-md p-4 animate-modal-in"
+            onClick={e => { if (e.target === e.currentTarget) setSettingsOpen(false) }}>
+            <div className="w-full max-w-md rounded-2xl border shadow-2xl p-6 transition-all bg-slate-900 border-slate-800 text-slate-100 flex flex-col space-y-4">
+              <div className="flex items-center justify-between pb-3 border-b border-slate-800">
                 <div className="flex items-center gap-2">
-                  <input id="audio-color-on" name="colorMicOn" type="color" value={audioSettings.color_mic_on}
-                    onChange={e => setAudioSettings(prev => ({ ...prev, color_mic_on: e.target.value }))}
-                    className="w-8 h-8 rounded cursor-pointer border-0" />
-                  <span className="font-mono text-xs" style={{ color: 'var(--fg-secondary)' }}>{audioSettings.color_mic_on}</span>
+                  <span className="text-lg">⚙️</span>
+                  <h3 className="text-sm font-bold text-emerald-400">Cấu hình Âm thanh & Báo hiệu Widget</h3>
                 </div>
+                <button onClick={() => setSettingsOpen(false)} className="text-slate-400 hover:text-white border-0 bg-transparent text-lg cursor-pointer">&times;</button>
               </div>
-              <div>
-                <label htmlFor="audio-color-off" className="text-xs font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Màu khi không hoạt động</label>
-                <div className="flex items-center gap-2">
-                  <input id="audio-color-off" name="colorMicOff" type="color" value={audioSettings.color_mic_off}
-                    onChange={e => setAudioSettings(prev => ({ ...prev, color_mic_off: e.target.value }))}
-                    className="w-8 h-8 rounded cursor-pointer border-0" />
-                  <span className="font-mono text-xs" style={{ color: 'var(--fg-secondary)' }}>{audioSettings.color_mic_off}</span>
-                </div>
-              </div>
-              {soundFiles.length > 0 && (
-                <div>
-                  <label htmlFor="audio-sound-select" className="text-xs font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Âm thanh báo</label>
-                  <select id="audio-sound-select" name="selectedSound" value={audioSettings.selected_sound || ''}
-                    onChange={e => setAudioSettings(prev => ({ ...prev, selected_sound: e.target.value || null }))}
-                    className="w-full px-2 py-1.5 text-xs rounded-lg border"
-                    style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg)' }}>
-                    <option value="">Không</option>
-                    {soundFiles.map(f => (
-                      <option key={f} value={f}>{f}</option>
-                    ))}
-                  </select>
-                </div>
-              )}
-            </div>
-            <div className="mt-6 flex justify-end gap-2">
-              <button onClick={() => setSettingsOpen(false)}
-                className="px-3 py-1.5 text-xs font-medium border rounded-lg transition-colors cursor-pointer"
-                style={{ borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>Hủy</button>
-              <button onClick={saveSettings}
-                className="px-4 py-1.5 text-xs font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors cursor-pointer border-0">Lưu</button>
-            </div>
-          </div>
-        </div>
-      )}
 
-      {/* Session History Modal */}
-      {historyOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
-          onClick={e => { if (e.target === e.currentTarget) setHistoryOpen(false) }}>
-          <div className="w-full max-w-md rounded-2xl border shadow-2xl p-6 transition-colors flex flex-col max-h-[70vh]"
-            style={{ backgroundColor: 'var(--bg)', borderColor: 'var(--border)', color: 'var(--fg)' }}>
-            <div className="flex items-center justify-between pb-4 border-b" style={{ borderColor: 'var(--border)' }}>
-              <h3 className="text-sm font-semibold">📋 Lịch sử Mic</h3>
-              <button onClick={() => setHistoryOpen(false)}
-                className="p-1 rounded-lg hover:bg-black/10 dark:hover:bg-white/10 transition-colors cursor-pointer border-0"
-                style={{ color: 'var(--fg-muted)' }}>&times;</button>
-            </div>
-            <div className="mt-4 flex-1 overflow-y-auto space-y-1.5">
-              {sessionHistory.length === 0 ? (
-                <p className="text-xs italic text-center py-8" style={{ color: 'var(--fg-dim)' }}>Chưa có phiên nào</p>
-              ) : (
-                sessionHistory.slice(0, 50).map((session, idx) => (
-                  <div key={idx} className="p-2 rounded-lg text-xs"
-                    style={{ backgroundColor: 'var(--input-bg)' }}>
-                    <div className="flex items-center justify-between">
-                      <span className="font-mono" style={{ color: 'var(--fg-muted)' }}>{session.datetime}</span>
-                      <span className="font-bold font-mono" style={{ color: 'var(--fg-secondary)' }}>
-                        {Math.floor(session.duration / 60)}m {session.duration % 60}s
-                      </span>
-                    </div>
-                    <div className="mt-1 flex gap-2">
-                      <span className="truncate" style={{ color: 'var(--fg-dim)' }}>
-                        🎯 {session.app_using || 'Không rõ'}
-                      </span>
-                      <span className="truncate" style={{ color: 'var(--fg-dim)' }}>
-                        🎤 {session.mic_name || 'Không rõ'}
-                      </span>
+              <div className="space-y-3 text-xs">
+                <label htmlFor="audio-sound-enabled" className="flex items-center gap-2.5 cursor-pointer p-2 rounded-xl bg-slate-800/50 hover:bg-slate-800">
+                  <input id="audio-sound-enabled" name="soundEnabled" type="checkbox" checked={audioSettings.sound_enabled}
+                    onChange={e => setAudioSettings(prev => ({ ...prev, sound_enabled: e.target.checked }))}
+                    className="accent-emerald-500 w-4 h-4 rounded" />
+                  <span className="font-semibold">Phát âm thanh báo hiệu khi micro bắt đầu hoạt động</span>
+                </label>
+
+                <label htmlFor="audio-show-widget" className="flex items-center gap-2.5 cursor-pointer p-2 rounded-xl bg-slate-800/50 hover:bg-slate-800">
+                  <input id="audio-show-widget" name="showWidget" type="checkbox" checked={audioSettings.show_widget_on_mic}
+                    onChange={e => setAudioSettings(prev => ({ ...prev, show_widget_on_mic: e.target.checked }))}
+                    className="accent-emerald-500 w-4 h-4 rounded" />
+                  <span className="font-semibold">Tự động hiện Widget (cửa sổ độc lập) khi mic bật</span>
+                </label>
+
+                {/* Widget Dimensions */}
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="p-3 rounded-xl bg-slate-800/40 border border-slate-800">
+                    <label htmlFor="widget-width" className="text-[11px] font-semibold text-slate-300 block mb-1">Chiều rộng Widget (px)</label>
+                    <input id="widget-width" type="number" min={150} max={400} value={audioSettings.widget_width || 220}
+                      onChange={e => setAudioSettings(prev => ({ ...prev, widget_width: parseInt(e.target.value) || 220 }))}
+                      className="w-full px-2.5 py-1.5 text-xs font-mono rounded-lg border border-slate-700 bg-slate-800 text-emerald-400" />
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-800/40 border border-slate-800">
+                    <label htmlFor="widget-height" className="text-[11px] font-semibold text-slate-300 block mb-1">Chiều cao Widget (px)</label>
+                    <input id="widget-height" type="number" min={150} max={400} value={audioSettings.widget_height || 220}
+                      onChange={e => setAudioSettings(prev => ({ ...prev, widget_height: parseInt(e.target.value) || 220 }))}
+                      className="w-full px-2.5 py-1.5 text-xs font-mono rounded-lg border border-slate-700 bg-slate-800 text-emerald-400" />
+                  </div>
+                </div>
+
+                {/* Kiểu Icon Theme (Widget) */}
+                <div className="p-3 rounded-xl bg-slate-800/40 border border-slate-800 space-y-2">
+                  <label className="text-xs font-semibold text-slate-300 block">Kiểu Icon (Widget Theme)</label>
+                  <div className="grid grid-cols-4 gap-2">
+                    {[
+                      { id: '1', label: 'Classic', icon: '🎤' },
+                      { id: '2', label: 'Radio', icon: '📻' },
+                      { id: '3', label: 'Radar', icon: '📡' },
+                      { id: '4', label: 'Wave', icon: '🌊' },
+                    ].map(item => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => setAudioSettings(prev => ({ ...prev, icon_theme: item.id }))}
+                        className={`p-2 rounded-xl border text-center transition-all cursor-pointer ${
+                          audioSettings.icon_theme === item.id
+                            ? 'bg-emerald-500/20 border-emerald-500 text-emerald-400 font-bold'
+                            : 'bg-slate-800/60 border-slate-700 text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        <div className="text-lg">{item.icon}</div>
+                        <div className="text-[10px] mt-0.5">{item.label}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="p-3 rounded-xl bg-slate-800/40 border border-slate-800 space-y-2">
+                  <label className="text-xs font-semibold text-slate-300 block">
+                    Độ mờ Widget nổi: <span className="text-emerald-400 font-mono">{Math.round((audioSettings.widget_opacity ?? 1.0) * 100)}%</span>
+                  </label>
+                  <input id="audio-opacity" name="widgetOpacity" type="range" min={10} max={100} value={Math.round((audioSettings.widget_opacity ?? 1.0) * 100)}
+                    onChange={e => setAudioSettings(prev => ({ ...prev, widget_opacity: parseInt(e.target.value) / 100 }))}
+                    className="w-full accent-emerald-500 cursor-pointer" />
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="p-3 rounded-xl bg-slate-800/40 border border-slate-800">
+                    <label htmlFor="audio-color-on" className="text-[11px] font-semibold text-slate-300 block mb-1.5">Màu khi Mic Bật</label>
+                    <div className="flex items-center gap-2">
+                      <input id="audio-color-on" name="colorMicOn" type="color" value={audioSettings.color_mic_on}
+                        onChange={e => setAudioSettings(prev => ({ ...prev, color_mic_on: e.target.value }))}
+                        className="w-7 h-7 rounded-lg cursor-pointer border-0 bg-transparent" />
+                      <span className="font-mono text-xs text-emerald-400">{audioSettings.color_mic_on}</span>
                     </div>
                   </div>
-                ))
-              )}
-            </div>
-            <div className="mt-4 pt-4 border-t flex justify-end" style={{ borderColor: 'var(--border)' }}>
-              <button onClick={() => setHistoryOpen(false)}
-                className="px-3 py-1.5 text-xs font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors cursor-pointer border-0">Đóng</button>
+
+                  <div className="p-3 rounded-xl bg-slate-800/40 border border-slate-800">
+                    <label htmlFor="audio-color-off" className="text-[11px] font-semibold text-slate-300 block mb-1.5">Màu khi Mic Tắt</label>
+                    <div className="flex items-center gap-2">
+                      <input id="audio-color-off" name="colorMicOff" type="color" value={audioSettings.color_mic_off}
+                        onChange={e => setAudioSettings(prev => ({ ...prev, color_mic_off: e.target.value }))}
+                        className="w-7 h-7 rounded-lg cursor-pointer border-0 bg-transparent" />
+                      <span className="font-mono text-xs text-red-400">{audioSettings.color_mic_off}</span>
+                    </div>
+                  </div>
+                </div>
+
+                {soundFiles.length > 0 && (
+                  <div>
+                    <label htmlFor="audio-sound-select" className="text-xs font-semibold text-slate-300 block mb-1">Âm thanh chuông báo</label>
+                    <select id="audio-sound-select" name="selectedSound" value={audioSettings.selected_sound || ''}
+                      onChange={e => setAudioSettings(prev => ({ ...prev, selected_sound: e.target.value || null }))}
+                      className="w-full px-3 py-2 text-xs rounded-xl border border-slate-700 bg-slate-800 text-slate-200">
+                      <option value="">Không dùng nhạc chuông</option>
+                      {soundFiles.map(f => (
+                        <option key={f} value={f}>{f}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2 border-t border-slate-800">
+                <button onClick={() => setSettingsOpen(false)}
+                  className="px-4 py-1.5 text-xs font-semibold border border-slate-700 rounded-xl text-slate-300 hover:bg-slate-800 cursor-pointer">Hủy</button>
+                <button onClick={saveSettings}
+                  className="px-5 py-1.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl cursor-pointer border-0 shadow-sm">Lưu cài đặt</button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
-    </div>
+        )}
+
+        {/* Session History Modal */}
+        {historyOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-md p-4 animate-modal-in"
+            onClick={e => { if (e.target === e.currentTarget) setHistoryOpen(false) }}>
+            <div className="w-full max-w-lg rounded-2xl border shadow-2xl p-6 transition-all bg-slate-900 border-slate-800 text-slate-100 flex flex-col max-h-[75vh]">
+              <div className="flex items-center justify-between pb-3 border-b border-slate-800 shrink-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-lg">📋</span>
+                  <h3 className="text-sm font-bold text-emerald-400">Lịch sử dùng Micro ({sessionHistory.length})</h3>
+                </div>
+                <button onClick={() => setHistoryOpen(false)} className="text-slate-400 hover:text-white border-0 bg-transparent text-lg cursor-pointer">&times;</button>
+              </div>
+
+              <div className="mt-3 flex-1 overflow-y-auto space-y-2 pr-1">
+                {sessionHistory.length === 0 ? (
+                  <p className="text-xs italic text-center py-12 text-slate-500">Chưa có lịch sử thu âm nào được lưu.</p>
+                ) : (
+                  sessionHistory.slice(0, 50).map((session, idx) => (
+                    <div key={idx} className="p-3 rounded-xl text-xs bg-slate-800/60 border border-slate-700/60 space-y-1 hover:border-slate-600 transition-colors">
+                      <div className="flex items-center justify-between">
+                        <span className="font-mono text-slate-400">{session.datetime}</span>
+                        <span className="font-bold font-mono text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded-full">
+                          ⏱️ {Math.floor(session.duration / 60)} phút {session.duration % 60} giây
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-4 text-slate-300 pt-0.5">
+                        <span className="truncate">🎯 App: <strong className="text-sky-400">{session.app_using || 'Không xác định'}</strong></span>
+                        <span className="truncate">🎤 Device: <strong className="text-amber-400">{session.mic_name || 'Microphone'}</strong></span>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              <div className="pt-3 border-t border-slate-800 flex justify-end shrink-0">
+                <button onClick={() => setHistoryOpen(false)}
+                  className="px-5 py-1.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl cursor-pointer border-0 shadow-sm">Đóng</button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </>
   )
 }

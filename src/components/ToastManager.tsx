@@ -33,6 +33,8 @@ export default function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([])
   const nextId = useRef(0)
 
+  // WHY: Xóa toast — đánh dấu `exiting` để chạy exit animation 300ms trước khi
+  // thật sự gỡ khỏi DOM (tránh nhảy hình).
   const removeToast = useCallback((id: number) => {
     setToasts(prev => prev.map(t => t.id === id ? { ...t, exiting: true } : t))
     setTimeout(() => {
@@ -40,6 +42,8 @@ export default function ToastProvider({ children }: { children: ReactNode }) {
     }, 300)
   }, [])
 
+  // WHY: Thêm toast mới — id tăng dần qua ref (không phụ thuộc state cũ), tự
+  // dismiss sau `duration` ms (mặc định 4000).
   const addToast = useCallback((toast: Omit<Toast, 'id'>) => {
     const id = nextId.current++
     const duration = toast.duration ?? 4000

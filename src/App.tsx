@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef, lazy, Suspense } from 'react'
 import Sidebar from './components/Sidebar'
+import AboutModal from './components/AboutModal'
 import { ModuleId, MODULES, type PreloadedData } from './types'
 
 // WHY: Preload tất cả lazy-loaded components trước để tránh loading spinner khi chuyển tab.
@@ -28,6 +29,7 @@ import LoadingScreen from './components/LoadingScreen'
 import { useToast } from './components/ToastManager'
 import { type LogColors, DEFAULT_LOG_COLORS } from './utils/logStyles'
 import { API, fetchWithRetry } from './utils/apiFetch'
+import { openAudioWidget, closeAudioWidget, toggleAudioWidget } from './utils/audioWidget'
 
 type Theme = 'dark' | 'light'
 
@@ -132,8 +134,13 @@ function App() {
   const [autostart, setAutostart] = useState(false)
   const [appVersion, setAppVersion] = useState('1.9.10')
   const [changelogOpen, setChangelogOpen] = useState(false)
+  const [changelogAnim, setChangelogAnim] = useState<'enter' | 'exit'>('enter')
+  const [aboutOpen, setAboutOpen] = useState(false)
+  const [aboutAnim, setAboutAnim] = useState<'enter' | 'exit'>('enter')
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsAnim, setSettingsAnim] = useState<'enter' | 'exit'>('enter')
   const [settingsRefresh, setSettingsRefresh] = useState(0)
+  const [isMaximized, setIsMaximized] = useState(false)
   const [systemIps, setSystemIps] = useState<string[]>(['localhost', '127.0.0.1'])
   // WHY: Lưu tùy chọn màu sắc log. Merge với defaults để tránh thiếu key.
   const [logColors, setLogColors] = useState<LogColors>(() => {
@@ -169,6 +176,74 @@ function App() {
       .then(m => m.getVersion())
       .then(setAppVersion)
       .catch(() => {})
+  }, [])
+
+  // WHY: Kiểm tra trạng thái maximized khi mount để hiển thị icon maximize/restore phù hợp.
+  useEffect(() => {
+    import('@tauri-apps/api/window').then(async ({ getCurrentWindow }) => {
+      try {
+        const max = await getCurrentWindow().isMaximized()
+        setIsMaximized(max)
+      } catch {}
+    })
+  }, [])
+
+  // WHY: Kiểm tra bản cập nhật qua Tauri updater — nếu có, hỏi user rồi tải +
+  // cài + relaunch app (dynamic import để không bundle nặng khi chạy dev).
+  const checkUpdate = async () => {
+    try {
+      const { check } = await import('@tauri-apps/plugin-updater')
+      const { relaunch } = await import('@tauri-apps/plugin-process')
+      const update = await check()
+      if (update) {
+        const ok = window.confirm(`Có bản cập nhật ${update.version}. Tải về và cài đặt?`)
+        if (ok) {
+          setStatusText('Đang tải bản cập nhật...')
+          await update.downloadAndInstall()
+          await relaunch()
+        }
+      } else setStatusText('Bạn đang dùng phiên bản mới nhất')
+    } catch (e: any) { setStatusText(e?.message || 'Kiểm tra cập nhật thất bại') }
+  }
+
+  // WHY: Đăng ký các hàm toàn cục window để System Tray Context Menu gọi từ Rust/Tauri
+  useEffect(() => {
+    ;(window as any).__navigateModule = (modId: ModuleId) => {
+      setActiveModule(modId)
+    }
+    ;(window as any).__openSettings = () => {
+      setSettingsAnim('enter')
+      setSettingsOpen(true)
+    }
+    ;(window as any).__checkUpdates = () => {
+      checkUpdate()
+    }
+    ;(window as any).__openAbout = () => {
+      setAboutAnim('enter')
+      setAboutOpen(true)
+    }
+    // WHY: Delegate sang shared manager src/utils/audioWidget.ts — single source of truth.
+    // Trước đây mỗi nơi tự getByLabel + show() → window đang chết (destroy async) được
+    // show() lại âm thầm fail → widget không hiện. Manager xử lý stale handle + event bridge.
+    ;(window as any).__openAudioWidget = () => {
+      // WHY: catch() tránh unhandled rejection khi Rust eval gọi (không có try/catch ở caller)
+      openAudioWidget({ width: 200, height: 200 }).catch(() => {})
+    }
+    ;(window as any).__closeAudioWidget = () => {
+      closeAudioWidget().catch(() => {})
+    }
+    ;(window as any).__toggleAudioWidget = () => {
+      toggleAudioWidget({ width: 200, height: 200 }).catch(() => {})
+    }
+    return () => {
+      delete (window as any).__navigateModule
+      delete (window as any).__openSettings
+      delete (window as any).__checkUpdates
+      delete (window as any).__openAbout
+      delete (window as any).__openAudioWidget
+      delete (window as any).__closeAudioWidget
+      delete (window as any).__toggleAudioWidget
+    }
   }, [])
 
   // WHY: Fetch autostart + system IPs khi mount — song song (không cần await).
@@ -242,23 +317,30 @@ function App() {
     } catch {}
   }
 
-  // WHY: Dùng Tauri plugin-updater — tự động check + download + install.
-  // Dynamic import để không crash trong browser dev mode.
-  // confirm trước khi download để user kiểm soát bandwidth.
-  const checkUpdate = async () => {
+  // WHY: Window controls cho custom title bar (decorations: false).
+  const minimizeWindow = async () => {
     try {
-      const { check } = await import('@tauri-apps/plugin-updater')
-      const { relaunch } = await import('@tauri-apps/plugin-process')
-      const update = await check()
-      if (update) {
-        const ok = window.confirm(`Có bản cập nhật ${update.version}. Tải về và cài đặt?`)
-        if (ok) {
-          setStatusText('Đang tải bản cập nhật...')
-          await update.downloadAndInstall()
-          await relaunch()
-        }
-      } else setStatusText('Bạn đang dùng phiên bản mới nhất')
-    } catch (e: any) { setStatusText(e?.message || 'Kiểm tra cập nhật thất bại') }
+      const { getCurrentWindow } = await import('@tauri-apps/api/window')
+      await getCurrentWindow().minimize()
+    } catch {}
+  }
+
+  // WHY: Toggle maximize/minimize window (custom title bar decorations: false)
+  // — cập nhật icon trạng thái sau khi toggle.
+  const toggleMaximize = async () => {
+    try {
+      const { getCurrentWindow } = await import('@tauri-apps/api/window')
+      await getCurrentWindow().toggleMaximize()
+      setIsMaximized(prev => !prev)
+    } catch {}
+  }
+
+  // WHY: Nút X đóng window — app vẫn chạy ngầm ở system tray nếu enabled.
+  const closeWindow = async () => {
+    try {
+      const { getCurrentWindow } = await import('@tauri-apps/api/window')
+      await getCurrentWindow().close()
+    } catch {}
   }
 
   // WHY: POST /api/shutdown → backend kill all processes + tự tắt.
@@ -275,27 +357,36 @@ function App() {
     return `http://${ip}:${activePort}`
   })
 
-  // WHY: Theo dõi module change để trigger page transition animation.
+  // WHY: Page transition — exit → enter sequence khi chuyển module.
   // Dùng useRef để tránh animation khi lần đầu mount (initial render).
   const prevModuleRef = useRef<ModuleId | null>(null)
   const [pageAnim, setPageAnim] = useState('')
 
-  // WHY: Khi activeModule thay đổi (trừ lần đầu mount), dùng rAF để restart animation:
-  //   Phase 1 - setPageAnim('') xóa class ngay (React commit DOM)
-  //   Phase 2 - rAF callback re-apply class → animation starts fresh
-  //   Phase 3 - setTimeout tự cleanup sau 350ms
-  // rAF giữa 2 state updates đảm bảo React đã commit 'clear' trước khi re-add.
+  // WHY: Khi activeModule thay đổi (trừ lần đầu mount):
+  //   Phase 1 (0-200ms) — animate-page-exit: content fade-out + scale-down (forwards fill)
+  //   Phase 2-3 (200ms) — swap trực tiếp từ exit sang enter trong 1 state update (không clear intermediate)
+  //     Exit forwards giữ opacity:0 → Enter backwards áp dụng opacity:0.4 ngay → animate 0.4→1
+  //   Phase 4 (500ms) — cleanup, xóa class khỏi DOM
+  // CSS: page-exit 0.2s ease-out forwards, page-enter 0.25s cubic-bezier both
   useEffect(() => {
     if (prevModuleRef.current !== null && prevModuleRef.current !== activeModule) {
-      setPageAnim('')
-      const raf = requestAnimationFrame(() => {
+      // Phase 1: Exit — fade out old module content
+      setPageAnim('animate-page-exit')
+      
+      const exitTimer = setTimeout(() => {
+        // Phase 2+3: Chuyển trực tiếp từ exit sang enter trong 1 state update.
+        // KHÔNG clear intermediate — tránh flicker.
+        // Exit animation có forwards fill (giữ opacity:0), enter có both fill (bắt đầu từ opacity:0.4).
         setPageAnim('animate-page-enter')
-      })
-      const timer = setTimeout(() => setPageAnim(''), 350)
+      }, 200) // match page-exit duration (0.2s)
+      
+      // Phase 4: Cleanup — remove class after enter completes
+      const cleanupTimer = setTimeout(() => setPageAnim(''), 500)
+      
       prevModuleRef.current = activeModule
       return () => {
-        cancelAnimationFrame(raf)
-        clearTimeout(timer)
+        clearTimeout(exitTimer)
+        clearTimeout(cleanupTimer)
       }
     }
     prevModuleRef.current = activeModule
@@ -304,9 +395,8 @@ function App() {
   const moduleName = MODULES.find(m => m.id === activeModule)?.label || ''
 
   // WHY: Thông báo welcome khi app khởi động xong.
-  const { addToast } = useToast()
-
-  // WHY: Gửi Windows toast + in-app toast khi app sẵn sàng.
+  const { addToast } = useToast()  // WHY: Gửi Windows toast + in-app toast khi app sẵn sàng.
+  // KHÔNG auto-restore widget ở đây — widget chỉ hiện khi mic bật + checkbox được chọn.
   useEffect(() => {
     if (appReady) {
       addToast({ type: 'success', title: 'MultiTool Pro đã sẵn sàng', message: 'Tất cả module đã được khởi tạo' })
@@ -335,54 +425,66 @@ function App() {
         collapsed={sidebarCollapsed}
         onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
         statusText={statusText}
+        appVersion={appVersion}
       />
 
       {/* Main content area */}
       <div className="flex-1 flex flex-col min-w-0">
-        {/* Header */}
-        <header className="shrink-0 backdrop-blur-md border-b px-5 py-2.5 flex items-center justify-between"
+        {/* Custom Title Bar (decorations: false) */}
+        <div className="titlebar" onDoubleClick={toggleMaximize}>
+          <div className="titlebar-drag" data-tauri-drag-region>
+            <div className="titlebar-title flex items-center gap-2">
+              <span className="font-bold">MultiTool Pro</span>
+              <span className="text-[11px] font-normal text-slate-400 hidden sm:inline">
+                — Hệ thống Quản trị & Dịch vụ Multi-App Nội bộ
+              </span>
+            </div>
+          </div>
+          <div className="titlebar-controls">
+            <button onClick={minimizeToTray} className="titlebar-btn titlebar-btn-tray" title="Thu gọn xuống khay">
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                <rect className="tray-bar" x="1" y="9.5" width="10" height="1.5" rx="0.75" fill="currentColor" />
+                <path className="tray-arrow" d="M6 2v5m0 0L3.5 4.5M6 7l2.5-2.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+            <div className="titlebar-separator" />
+            <button onClick={minimizeWindow} className="titlebar-btn titlebar-btn-minimize" title="Thu nhỏ">
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                <rect className="minimize-line" x="1" y="5.5" width="10" height="1.5" rx="0.75" fill="currentColor" />
+              </svg>
+            </button>
+            <button onClick={toggleMaximize} className="titlebar-btn" title={isMaximized ? 'Thu nhỏ' : 'Phóng to'}>
+              <div className="titlebar-icon-group">
+                {/* Maximize icon (single square) */}
+                <svg className={`titlebar-icon ${isMaximized ? 'icon-hidden' : 'icon-visible'}`} width="12" height="12" viewBox="0 0 12 12" fill="none">
+                  <rect x="1.5" y="1.5" width="9" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.3" />
+                </svg>
+                {/* Restore icon (overlapping squares) */}
+                <svg className={`titlebar-icon ${isMaximized ? 'icon-visible' : 'icon-hidden'}`} width="12" height="12" viewBox="0 0 12 12" fill="none">
+                  <rect x="3.5" y="1" width="7.5" height="7.5" rx="1.5" stroke="currentColor" strokeWidth="1.3" />
+                  <rect x="1" y="3.5" width="7.5" height="7.5" rx="1.5" fill="var(--bg-header)" stroke="currentColor" strokeWidth="1.3" />
+                </svg>
+              </div>
+            </button>
+            <button onClick={closeWindow} className="titlebar-btn titlebar-close" title="Đóng">
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                <path className="close-x" d="M2 2l8 8M10 2l-8 8" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        {/* Module Header */}
+        <header className="shrink-0 backdrop-blur-md border-b px-5 py-2 flex items-center justify-between"
           style={{ background: 'var(--bg-header)', borderColor: 'var(--border)' }}>
           <div className="flex items-center gap-2">
             <h1 className="text-sm font-semibold tracking-tight" style={{ color: 'var(--fg)' }}>
               {moduleName}
             </h1>
-            <span className="text-xs px-1.5 py-0.5 rounded font-mono border"
+            <span className="text-xs px-2 py-0.5 rounded font-medium border"
               style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-muted)' }}>
-              {activeModule}
+              {MODULES.find(m => m.id === activeModule)?.description || activeModule}
             </span>
-          </div>
-
-          <div className="flex items-center gap-2">
-            {/* Status dots */}
-            <div className="flex -space-x-1 mr-1">
-              {MODULES.map(mod => (
-                <div key={mod.id}
-                  className={`w-2 h-2 rounded-full ring-1 ring-gray-700 ${activeModule === mod.id ? 'bg-emerald-400' : ''}`}
-                  style={{ backgroundColor: activeModule === mod.id ? undefined : 'var(--fg-dim)' }}
-                  title={mod.label} />
-              ))}
-            </div>
-
-            {/* Settings button */}
-            <button onClick={() => setSettingsOpen(true)}
-              className="p-1.5 rounded-lg transition-all active:scale-95 cursor-pointer border-0 group relative"
-              style={{ color: 'var(--fg-muted)', background: 'transparent' }}>
-              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-                <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-              </svg>
-              <span className="tooltip-text">Cài đặt</span>
-            </button>
-
-            {/* Minimize to tray */}
-            <button onClick={minimizeToTray}
-              className="p-1.5 rounded-lg transition-all active:scale-95 cursor-pointer border-0 group relative"
-              style={{ color: 'var(--fg-muted)', background: 'transparent' }}>
-              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M20 12H4" />
-              </svg>
-              <span className="tooltip-text">Thu gọn xuống khay</span>
-            </button>
           </div>
         </header>
 
@@ -401,7 +503,7 @@ function App() {
           }>
             <ServersModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'servers'} backgroundPolling={backgroundPolling.servers} logColors={logColors}
               onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, servers: enabled }))}
-              onLogColorsChange={setLogColors} preloadedData={preloadedData} />
+              onLogColorsChange={setLogColors} onOpenSettings={() => { setSettingsAnim('enter'); setSettingsOpen(true) }} preloadedData={preloadedData} />
             <PrintersModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'printers'} backgroundPolling={backgroundPolling.printers}
               onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, printers: enabled }))} preloadedData={preloadedData} />
             <AudioModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'audio'} backgroundPolling={backgroundPolling.audio}
@@ -424,31 +526,15 @@ function App() {
               style={{ color: 'var(--fg-muted)' }}>Kiểm tra cập nhật</button>
             <span style={{ color: 'var(--fg-dim)' }}>|</span>
             
-            {/* URL links */}
-            <div className="hidden lg:flex items-center gap-2 font-mono">
-              {detectedUrls.map((url, idx) => (
-                <span key={url} className="flex items-center gap-2">
-                  {idx > 0 && <span style={{ color: 'var(--fg-dim)' }}>|</span>}
-                  <button onClick={() => openBrowser(url)}
-                    className="hover:underline hover:text-emerald-400 bg-transparent border-0 cursor-pointer p-0"
-                    style={{ color: '#3b82f6', fontSize: 'inherit' }}>
-                    {url.replace('http://', '')}
-                  </button>
-                </span>
+            {/* URL dropdown — gộp cả desktop & mobile vào 1 select */}
+            <select id="url-select" name="urlSelect" onChange={e => { if (e.target.value) { openBrowser(e.target.value); e.target.value = '' } }}
+              className="px-1.5 py-0.5 text-[11px] rounded border font-mono cursor-pointer"
+              style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+              <option value="">🔗 URL...</option>
+              {detectedUrls.map(url => (
+                <option key={url} value={url}>{url.replace('http://', '')}</option>
               ))}
-            </div>
-
-            {/* Mobile URL select */}
-            <div className="flex lg:hidden">
-              <select id="mobile-url-select" name="urlSelect" onChange={e => { if (e.target.value) { openBrowser(e.target.value); e.target.value = '' } }}
-                className="px-1 py-0.5 text-xs rounded border"
-                style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
-                <option value="">URL...</option>
-                {detectedUrls.map(url => (
-                  <option key={url} value={url}>{url.replace('http://', '')}</option>
-                ))}
-              </select>
-            </div>
+            </select>
           </div>
 
           <div className="flex items-center gap-3">
@@ -458,10 +544,16 @@ function App() {
               Tự động khởi động
             </label>
             <span style={{ color: 'var(--fg-dim)' }}>|</span>
-            <button onClick={() => setChangelogOpen(true)}
+            <button onClick={() => { setChangelogAnim('enter'); setChangelogOpen(true) }}
               className="hover:underline cursor-pointer font-semibold text-emerald-500 hover:text-emerald-400 transition-colors bg-transparent border-0 group relative">
               v{appVersion}
               <span className="tooltip-text">Xem nhật ký thay đổi</span>
+            </button>
+            <span style={{ color: 'var(--fg-dim)' }}>|</span>
+            <button onClick={() => { setAboutAnim('enter'); setAboutOpen(true) }}
+              className="hover:underline cursor-pointer font-semibold text-sky-400 hover:text-sky-300 transition-colors bg-transparent border-0 group relative">
+              Giới thiệu
+              <span className="tooltip-text">Thông tin tác giả & các chức năng</span>
             </button>
           </div>
         </footer>
@@ -469,28 +561,50 @@ function App() {
 
     </div>
 
-      {/* WHY: Render modals OUTSIDE root div để position: fixed hoạt động đúng (không bị ảnh hưởng bởi ancestor transform/overflow). */}
-      {/* WHY: Suspense boundary riêng để SettingsModal (lazy-loaded) không crash khi click mở lần đầu */}
+      {/* WHY: Render modals OUTSIDE root div để position: fixed hoạt động đúng */}
       <Suspense fallback={null}>
-        <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)}
-        onChanged={() => { setSettingsRefresh(prev => prev + 1) }}
-        backgroundPolling={backgroundPolling}
-        onBackgroundPollingChange={setBackgroundPolling}
-        logColors={logColors}
-        onLogColorsChange={setLogColors}
-        theme={theme}
-        onToggleTheme={toggleTheme} />
+        <SettingsModal open={settingsOpen} animState={settingsAnim}
+          onClose={() => {
+            setSettingsAnim('exit')
+            setTimeout(() => setSettingsOpen(false), 250)
+          }}
+          onChanged={() => { setSettingsRefresh(prev => prev + 1) }}
+          backgroundPolling={backgroundPolling}
+          onBackgroundPollingChange={setBackgroundPolling}
+          logColors={logColors}
+          onLogColorsChange={setLogColors}
+          theme={theme}
+          onToggleTheme={toggleTheme} />
       </Suspense>
 
+      {/* About Modal */}
+      <AboutModal
+        open={aboutOpen}
+        animState={aboutAnim}
+        version={appVersion}
+        onClose={() => {
+          setAboutAnim('exit')
+          setTimeout(() => { setAboutOpen(false); setAboutAnim('enter') }, 250)
+        }}
+      />
+
       {/* Changelog Modal */}
-      {changelogOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
-          onClick={e => { if (e.target === e.currentTarget) setChangelogOpen(false) }}>
-          <div className="w-full max-w-md rounded-2xl border shadow-2xl p-6 transition-colors flex flex-col"
+      {(changelogOpen || changelogAnim === 'exit') && (
+        <div className={`fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm ${changelogAnim === 'enter' ? 'animate-modal-in' : 'animate-modal-out'}`}
+          onClick={e => {
+            if (e.target === e.currentTarget) {
+              setChangelogAnim('exit')
+              setTimeout(() => { setChangelogOpen(false); setChangelogAnim('enter') }, 250)
+            }
+          }}>
+          <div className={`w-full max-w-md rounded-2xl border shadow-2xl p-6 transition-colors flex flex-col ${changelogAnim === 'enter' ? 'animate-modal-content-in' : 'animate-modal-content-out'}`}
             style={{ backgroundColor: 'var(--bg)', borderColor: 'var(--border)', color: 'var(--fg)' }}>
             <div className="flex items-center justify-between pb-4 border-b" style={{ borderColor: 'var(--border)' }}>
               <h3 className="text-sm font-semibold">Nhật ký thay đổi</h3>
-              <button onClick={() => setChangelogOpen(false)}
+              <button onClick={() => {
+                setChangelogAnim('exit')
+                setTimeout(() => { setChangelogOpen(false); setChangelogAnim('enter') }, 250)
+              }}
                 className="p-1 rounded-lg hover:bg-black/10 dark:hover:bg-white/10 transition-colors cursor-pointer border-0"
                 style={{ color: 'var(--fg-muted)' }}>&times;</button>
             </div>
@@ -508,7 +622,10 @@ function App() {
               ))}
             </div>
             <div className="mt-6 flex justify-end">
-              <button onClick={() => setChangelogOpen(false)}
+              <button onClick={() => {
+                setChangelogAnim('exit')
+                setTimeout(() => { setChangelogOpen(false); setChangelogAnim('enter') }, 250)
+              }}
                 className="px-4 py-1.5 text-[12px] font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors cursor-pointer border-0">Đóng</button>
             </div>
           </div>

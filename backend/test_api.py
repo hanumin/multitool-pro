@@ -15,38 +15,48 @@ BASE = "http://127.0.0.1:5050"
 # HELPERS
 # ═══════════════════════════════════════════════════════════════
 
+# WHY: Helper GET — timeout 10s cho poll endpoints (kèm BASE url để test viết gọn).
 def get(path):
     return requests.get(f"{BASE}{path}", timeout=10)
 
+# WHY: Helper POST — timeout 15s (start/stop tốn thời gian hơn GET).
 def post(path, data=None):
     return requests.post(f"{BASE}{path}", json=data, timeout=15)
 
+# WHY: Helper PUT cho update endpoints — timeout 10s.
 def put(path, data=None):
     return requests.put(f"{BASE}{path}", json=data, timeout=10)
 
+# WHY: Helper DELETE — timeout 10s.
 def delete(path, data=None):
     return requests.delete(f"{BASE}{path}", json=data, timeout=10)
 
+# WHY: Assert HTTP 200 — kèm body trích ra để fail nhanh khi debug.
 def ok(r):
     """Assert HTTP 200"""
     assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text[:200]}"
 
+# WHY: Assert HTTP 201 (tạo resource) — fail nhanh kèm body.
 def created(r):
     """Assert HTTP 201"""
     assert r.status_code == 201, f"Expected 201, got {r.status_code}: {r.text[:200]}"
 
+# WHY: Assert HTTP 202 (accepted async) — fail nhanh kèm body.
 def accepted(r):
     """Assert HTTP 202"""
     assert r.status_code == 202, f"Expected 202, got {r.status_code}: {r.text[:200]}"
 
+# WHY: Assert HTTP 404 (không tìm thấy) — fail nhanh kèm body.
 def not_found(r):
     """Assert HTTP 404"""
     assert r.status_code == 404, f"Expected 404, got {r.status_code}: {r.text[:200]}"
 
+# WHY: Assert HTTP 409 (xung đột) — fail nhanh kèm body.
 def conflict(r):
     """Assert HTTP 409"""
     assert r.status_code == 409, f"Expected 409, got {r.status_code}: {r.text[:200]}"
 
+# WHY: Assert HTTP 500 (lỗi server) — fail nhanh kèm body.
 def server_error(r):
     """Assert HTTP 500"""
     assert r.status_code == 500, f"Expected 500, got {r.status_code}: {r.text[:200]}"

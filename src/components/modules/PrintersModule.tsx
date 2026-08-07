@@ -173,6 +173,7 @@ const statusGradients: Record<string, string> = {
 // Kiến trúc: fetchAll() gọi song song 4 API chính → xử lý settings trước → printers sau.
 export default function PrintersModule({ theme, setStatusText, inactive, backgroundPolling, onBackgroundPollingChange, preloadedData }: PrintersModuleProps) {
   const { addToast } = useToast()
+  const pollAbortRef = useRef<AbortController | null>(null)
   // WHY: Nếu có preloadedData từ LoadingScreen, dùng làm initial state để skip loading flash
   const preloadedPrinters = preloadedData?.printers?.printers
   const preloadedSettingsObj = preloadedData?.printerSettings?.settings
@@ -356,11 +357,13 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
   const autoSelectDefault = useRef(false)
   const fetchAll = useCallback(async () => {
     try {
+      const signal = pollAbortRef.current?.signal
+      const opts = signal ? { signal } : undefined
       const [printersRes, reminderRes, settingsRes, historyRes] = await Promise.all([
-        fetchWithRetry(`${API}/api/printers`),
-        fetchWithRetry(`${API}/api/printer/reminder-check`),
-        fetchWithRetry(`${API}/api/printer/settings`),
-        fetchWithRetry(`${API}/api/printer/history`),
+        fetchWithRetry(`${API}/api/printers`, opts),
+        fetchWithRetry(`${API}/api/printer/reminder-check`, opts),
+        fetchWithRetry(`${API}/api/printer/settings`, opts),
+        fetchWithRetry(`${API}/api/printer/history`, opts),
       ])
 
       let settingsData: any = null
@@ -436,7 +439,7 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
           }
         } catch {}
       }
-    } catch { setStatusText('Đang kết nối lại...') }
+    } catch { setStatusText('Đang tải dữ liệu...') }
     finally { setLoading(false) }
   }, [setStatusText])
 
@@ -444,9 +447,15 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
   // Khi active trở lại: fetch ngay lập tức + restart interval (không đợi 5s).
   useEffect(() => {
     if (inactive && !backgroundPolling) return
-    fetchAll()
-    const interval = setInterval(fetchAll, 5000)
-    return () => clearInterval(interval)
+    if (pollAbortRef.current) pollAbortRef.current.abort()
+    pollAbortRef.current = new AbortController()
+    const timer = setTimeout(() => fetchAll(), 1000)
+    const interval = setInterval(fetchAll, 10000)
+    return () => {
+      pollAbortRef.current?.abort()
+      clearTimeout(timer)
+      clearInterval(interval)
+    }
   }, [fetchAll, inactive, backgroundPolling])
 
   // WHY: Countdown timer — tính từ reminderInfo.days_left + hours_left + minutes_left.
@@ -627,26 +636,28 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
         </div>
       )}
       {/* ═══════ DASHBOARD HEADER ═══════ */}
-      <div className="shrink-0 grid grid-cols-1 lg:grid-cols-3 gap-3 p-4">
+      <div className="shrink-0 grid grid-cols-1 lg:grid-cols-3 gap-3.5 p-4">
         {/* ── Card 1: Status Dashboard ── */}
-        <div className="lg:col-span-2 rounded-xl border backdrop-blur-sm relative overflow-hidden transition-all duration-300 hover:shadow-lg"
+        <div className="lg:col-span-2 rounded-2xl border backdrop-blur-md relative overflow-hidden transition-all duration-300 shadow-sm hover:shadow-md"
           style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border)' }}>
           {/* Gradient background */}
-          <div className={`absolute inset-0 bg-gradient-to-br ${!wmiStatus ? 'from-gray-600/10' : statusGradients[wmiStatus?.status || ''] || 'from-gray-600/10'} opacity-60`} />
+          <div className={`absolute inset-0 bg-gradient-to-br ${!wmiStatus ? 'from-slate-600/10' : statusGradients[wmiStatus?.status || ''] || 'from-slate-600/10'} opacity-50`} />
 
-          <div className="relative p-4">
+          <div className="relative p-4.5">
             {/* Header */}
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="text-xs font-bold uppercase tracking-[0.15em]" style={{ color: 'var(--fg-muted)' }}>
-                <span className="mr-1.5">📊</span>Bảng điều khiển
-              </h3>
-              <div className="flex items-center gap-1.5">
+            <div className="flex items-center justify-between mb-3.5 border-b pb-2.5" style={{ borderColor: 'var(--border)' }}>
+              <div className="flex items-center gap-2">
+                <span className="text-base">🖨️</span>
+                <h3 className="text-xs font-bold uppercase tracking-wider text-emerald-400">
+                  Trung tâm máy in
+                </h3>
+              </div>
+              <div className="flex items-center gap-2">
                 {/* Status ring */}
                 {wmiStatus && (
-                  <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold"
+                  <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold shadow-sm"
                     style={{ backgroundColor: getStatusBg(wmiStatus.status || ''), color: getStatusColor(wmiStatus.status || '') }}>
-                    <span className={`w-1.5 h-1.5 rounded-full ${wmiStatus.online ? 'bg-emerald-400 animate-pulse' : ''}`}
-                      style={{ backgroundColor: !wmiStatus.online ? '#ef4444' : undefined }} />
+                    <span className={`w-2 h-2 rounded-full ${wmiStatus.online ? 'bg-emerald-400 animate-pulse' : 'bg-red-400'}`} />
                     {wmiStatus.status || 'Đang kiểm tra...'}
                   </div>
                 )}
@@ -654,12 +665,12 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
             </div>
 
             {/* Main content */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {/* Left column: WMI info */}
-              <div>
+              <div className="space-y-2">
                 {/* Error banner */}
                 {wmiStatus?.error_state && wmiStatus.error_code && wmiStatus.error_code > 2 && (
-                  <div className="mb-2 px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-2"
+                  <div className="px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-2"
                     style={{ backgroundColor: '#ef444415', color: '#f87171', border: '1px solid #ef444430' }}>
                     <span>⚠️</span>
                     <span>{wmiStatus.error_state}</span>
@@ -668,56 +679,55 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
 
                 {/* Selected printer + connectivity */}
                 <div className="space-y-2 text-xs">
-                  <div className="flex items-center justify-between group">
-                    <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>Máy in</span>
-                    <span className="font-semibold truncate max-w-[200px] text-right text-[12px]" style={{ color: 'var(--fg)' }}>
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-medium" style={{ color: 'var(--fg-dim)' }}>Máy in đã chọn:</span>
+                    <span className="font-bold truncate max-w-[200px] text-right text-xs text-sky-400">
                       {printerSettings.selected_printer || (
-                        <span className="italic text-xs" style={{ color: 'var(--fg-dim)' }}>Chưa chọn</span>
+                        <span className="italic text-slate-400">Chưa chọn máy in</span>
                       )}
                     </span>
                   </div>
 
                   <div className="flex items-center justify-between">
-                    <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>Cổng</span>
-                    <span className="font-mono text-xs" style={{ color: 'var(--fg-secondary)' }}>
+                    <span className="text-[11px] font-medium" style={{ color: 'var(--fg-dim)' }}>Cổng kết nối:</span>
+                    <span className="font-mono text-xs font-semibold" style={{ color: 'var(--fg-secondary)' }}>
                       {wmiStatus?.port_name || '...'}
                     </span>
                   </div>
 
                   <div className="flex items-center justify-between">
-                    <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>Driver</span>
+                    <span className="text-[11px] font-medium" style={{ color: 'var(--fg-dim)' }}>Driver máy in:</span>
                     <span className="font-mono text-xs truncate max-w-[180px] text-right" style={{ color: 'var(--fg-secondary)' }}>
                       {wmiStatus?.driver_name || (printers.find(p => p.name === printerSettings.selected_printer)?.driver) || '...'}
                     </span>
                   </div>
 
                   <div className="flex items-center justify-between">
-                    <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>Đang in</span>
-                    <span className="font-mono text-xs" style={{ color: activePrintCount > 0 ? '#22c55e' : 'var(--fg-dim)' }}>
+                    <span className="text-[11px] font-medium" style={{ color: 'var(--fg-dim)' }}>Tiến trình in:</span>
+                    <span className="font-mono text-xs font-bold" style={{ color: activePrintCount > 0 ? '#22c55e' : 'var(--fg-dim)' }}>
                       {activePrintCount > 0 ? (
                         <span className="flex items-center gap-1">
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                          {activePrintCount} job
+                          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                          {activePrintCount} công việc
                         </span>
-                      ) : 'Không có'}
+                      ) : 'Sẵn sàng (Rảnh)'}
                     </span>
                   </div>
 
                   <div className="flex items-center justify-between">
-                    <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>Lần in cuối</span>
-                    <span className="font-mono text-xs" style={{ color: 'var(--fg-secondary)' }}>
+                    <span className="text-[11px] font-medium" style={{ color: 'var(--fg-dim)' }}>Lần in cuối:</span>
+                    <span className="font-mono text-xs text-slate-300">
                       {printerSettings.last_print_date || (
-                        <span className="italic" style={{ color: 'var(--fg-dim)' }}>Chưa từng</span>
+                        <span className="italic text-slate-500">Chưa có dữ liệu</span>
                       )}
                     </span>
                   </div>
 
                   <div className="flex items-center justify-between">
-                    <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>
-                      {isLaser ? '🔲 Laser' : '📅 Hạn in'}
+                    <span className="text-[11px] font-medium" style={{ color: 'var(--fg-dim)' }}>
+                      {isLaser ? '🔲 Loại máy in' : '📅 Hạn in khuyến nghị'}
                     </span>
-                    <span className={`font-semibold text-xs ${reminderInfo?.should_remind && !isLaser ? 'text-red-400' : ''}`}
-                      style={{ color: !reminderInfo?.should_remind || isLaser ? 'var(--fg-secondary)' : undefined }}>
+                    <span className={`font-bold text-xs ${reminderInfo?.should_remind && !isLaser ? 'text-red-400 animate-pulse' : 'text-emerald-400'}`}>
                       {countdownText || 'Đang tính...'}
                     </span>
                   </div>
@@ -726,25 +736,24 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
 
               {/* Right column: WMI metrics grid */}
               {wmiStatus && (
-                <div className="grid grid-cols-3 gap-1.5">
+                <div className="grid grid-cols-2 gap-2">
                   {[
                     { label: 'Số job', value: wmiStatus.job_count_since_reset, unit: 'job', icon: '📋', color: '#22c55e' },
                     { label: 'Tốc độ in', value: wmiStatus.average_pages_per_minute, unit: 'tr/ph', icon: '⚡', color: '#3b82f6' },
-                    { label: 'Độ phân giải', value: wmiStatus.page_resolution || (wmiStatus.horizontal_resolution ? `${wmiStatus.horizontal_resolution}x${wmiStatus.vertical_resolution || 0}` : null), icon: '🎯', color: '#8b5cf6' },
-                    { label: 'Tổng trang', value: printerSettings.page_count?.[printerSettings.selected_printer], icon: '📄', color: '#f59e0b' },
-                    { label: 'In màu', value: wmiStatus.supports_color ? 'Có 🎨' : 'Đen trắng ⚫', icon: '🌈', color: '#ec4899' },
+                    { label: 'Độ phân giải', value: wmiStatus.page_resolution || (wmiStatus.horizontal_resolution ? `${wmiStatus.horizontal_resolution} DPI` : null), icon: '🎯', color: '#8b5cf6' },
+                    { label: 'Tổng số trang', value: printerSettings.page_count?.[printerSettings.selected_printer], icon: '📄', color: '#f59e0b' },
                   ].map((metric, i) => (
                     <div key={i}
-                      className="rounded-lg p-2 transition-all duration-200 hover:scale-[1.02]"
-                      style={{ backgroundColor: `${metric.color}08`, border: `1px solid ${metric.color}15` }}>
-                      <div className="flex items-center gap-1 mb-1">
-                        <span className="text-[10px]">{metric.icon}</span>
-                        <span className="text-[8px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>{metric.label}</span>
+                      className="rounded-xl p-2.5 border transition-all duration-200 hover:scale-[1.02] shadow-sm"
+                      style={{ backgroundColor: `${metric.color}08`, borderColor: `${metric.color}20` }}>
+                      <div className="flex items-center gap-1.5 mb-1">
+                        <span className="text-xs">{metric.icon}</span>
+                        <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">{metric.label}</span>
                       </div>
                       <div className="text-xs font-bold font-mono" style={{ color: metric.color }}>
                         {metric.value !== undefined && metric.value !== null && metric.value !== ''
                           ? `${metric.value}${metric.unit ? ` ${metric.unit}` : ''}`
-                          : (<span style={{ color: 'var(--fg-dim)' }}>...</span>)
+                          : (<span className="text-slate-500">...</span>)
                         }
                       </div>
                     </div>
@@ -753,105 +762,72 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
               )}
             </div>
 
-            {/* Capabilities badges */}
-            {wmiStatus?.capabilities && wmiStatus.capabilities.length > 0 && (
-              <div className="mt-3 pt-3 border-t border-dashed flex flex-wrap gap-1.5"
-                style={{ borderColor: 'var(--border)' }}>
-                {wmiStatus.capabilities.map((cap, i) => {
-                  const capColors: Record<string, string> = {
-                    'Copies': '#22c55e', 'Color': '#ec4899', 'Duplex': '#3b82f6', 'Collate': '#8b5cf6',
-                  }
-                  const color = capColors[cap] || '#f59e0b'
-                  return (
-                    <span key={i}
-                      className="text-[8px] font-semibold px-2 py-0.5 rounded-full transition-all duration-200 hover:scale-105"
-                      style={{ backgroundColor: `${color}15`, color, border: `1px solid ${color}25` }}>
-                      {cap}
-                    </span>
-                  )
-                })}
-              </div>
-            )}
-
-            {/* Paper sizes */}
-            {wmiStatus?.paper_sizes && wmiStatus.paper_sizes.length > 0 && (
-              <div className="mt-2 flex flex-wrap gap-1">
-                {wmiStatus.paper_sizes.slice(0, 5).map((size, i) => (
-                  <span key={i}
-                    className="text-[7px] px-1.5 py-0.5 rounded"
-                    style={{ backgroundColor: 'var(--input-bg)', color: 'var(--fg-muted)' }}>
-                    {size}
-                  </span>
-                ))}
-                {wmiStatus.paper_sizes.length > 5 && (
-                  <span className="text-[7px] italic" style={{ color: 'var(--fg-dim)' }}>
-                    +{wmiStatus.paper_sizes.length - 5}
-                  </span>
-                )}
-              </div>
-            )}
-
             {/* Stats footer */}
-            <div className="mt-3 pt-3 border-t border-dashed flex items-center justify-between"
+            <div className="mt-3.5 pt-3 border-t border-dashed flex items-center justify-between"
               style={{ borderColor: 'var(--border)' }}>
-              <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>
-                Tổng số lần in
+              <span className="text-xs font-semibold text-slate-400">
+                Thống kê tổng số lượt in:
               </span>
               <button onClick={() => setStatsOpen(true)}
-                className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-bold transition-all duration-200 hover:scale-105 active:scale-95 border-0 cursor-pointer"
-                style={{ backgroundColor: '#22c55e15', color: '#22c55e', border: '1px solid #22c55e25' }}>
-                <span className="text-base">{totalPrints}</span>
-                <span className="text-[10px] font-normal opacity-70">lần</span>
-                <span className="text-xs ml-0.5">📊</span>
+                className="flex items-center gap-2 px-3 py-1 rounded-xl text-xs font-bold transition-all duration-200 hover:scale-105 active:scale-95 border-0 cursor-pointer shadow-sm"
+                style={{ backgroundColor: 'rgba(34,197,94,0.15)', color: '#34d399', border: '1px solid rgba(34,197,94,0.3)' }}>
+                <span className="text-base font-black">{totalPrints}</span>
+                <span className="text-[10px] font-normal opacity-80">lượt</span>
+                <span className="text-xs">📊 Xem chi tiết »</span>
               </button>
             </div>
           </div>
         </div>
 
         {/* ── Card 2: Quick Actions ── */}
-        <div className="rounded-xl border backdrop-blur-sm p-4 transition-all duration-300 hover:shadow-lg flex flex-col"
+        <div className="rounded-2xl border backdrop-blur-md p-4.5 transition-all duration-300 shadow-sm hover:shadow-md flex flex-col justify-between"
           style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border)' }}>
-          <h3 className="text-xs font-bold uppercase tracking-[0.15em] mb-3" style={{ color: 'var(--fg-muted)' }}>
-            <span className="mr-1.5">⚡</span>Thao tác nhanh
-          </h3>
+          <div>
+            <div className="flex items-center gap-2 mb-3.5 border-b pb-2.5" style={{ borderColor: 'var(--border)' }}>
+              <span className="text-base">⚡</span>
+              <h3 className="text-xs font-bold uppercase tracking-wider text-emerald-400">
+                Thao tác nhanh
+              </h3>
+            </div>
 
-          <div className="grid grid-cols-2 gap-2 mb-3">
-            {[
-              { label: 'In thử', icon: '🖨', color: '#22c55e', action: () => {
-                if (!printerSettings.selected_printer) { setStatusText('Chưa chọn máy in'); return }
-                testPrint(printerSettings.selected_printer)
-              }},
-              { label: 'Đã in', icon: '✅', color: '#3b82f6', action: recordManualPrint },
-              { label: 'Lịch sử', icon: '📋', color: '#8b5cf6', action: () => setHistoryOpen(true) },
-              { label: 'Cài đặt', icon: '⚙️', color: '#f59e0b', action: () => { setImportResult(null); setSettingsOpen(true) } },
-            ].map((btn, i) => (
-              <button key={i} onClick={btn.action}
-                className="flex flex-col items-center justify-center gap-1 px-2 py-3 rounded-xl text-xs font-semibold transition-all duration-200 hover:scale-[1.03] active:scale-95 border-0 cursor-pointer"
-                style={{ backgroundColor: `${btn.color}10`, color: btn.color, border: `1px solid ${btn.color}18` }}>
-                <span className="text-lg">{btn.icon}</span>
-                <span>{btn.label}</span>
-              </button>
-            ))}
+            <div className="grid grid-cols-2 gap-2 mb-3">
+              {[
+                { label: 'In thử', icon: '🖨️', color: '#22c55e', action: () => {
+                  if (!printerSettings.selected_printer) { setStatusText('Chưa chọn máy in'); return }
+                  testPrint(printerSettings.selected_printer)
+                }},
+                { label: 'Ghi nhận in', icon: '✅', color: '#3b82f6', action: recordManualPrint },
+                { label: 'Lịch sử', icon: '📋', color: '#8b5cf6', action: () => setHistoryOpen(true) },
+                { label: 'Cài đặt', icon: '⚙️', color: '#f59e0b', action: () => { setImportResult(null); setSettingsOpen(true) } },
+              ].map((btn, i) => (
+                <button key={i} onClick={btn.action}
+                  className="flex flex-col items-center justify-center gap-1.5 px-2 py-3.5 rounded-xl text-xs font-bold transition-all duration-200 hover:scale-[1.03] active:scale-95 border-0 cursor-pointer shadow-sm"
+                  style={{ backgroundColor: `${btn.color}12`, color: btn.color, border: `1px solid ${btn.color}25` }}>
+                  <span className="text-xl">{btn.icon}</span>
+                  <span>{btn.label}</span>
+                </button>
+              ))}
+            </div>
           </div>
 
           {/* Alert area */}
           {!isLaser && reminderInfo?.should_remind && printerSettings.reminder_enabled && (
-            <div className="mt-auto p-2.5 rounded-xl border text-xs flex items-center gap-2.5 animate-pulse"
-              style={{ backgroundColor: '#ef444410', borderColor: '#ef444430', color: '#f87171' }}>
-              <span className="text-base">🔴</span>
+            <div className="mt-2 p-3 rounded-xl border text-xs flex items-center gap-3 animate-pulse shadow-sm"
+              style={{ backgroundColor: 'rgba(239,68,68,0.12)', borderColor: 'rgba(239,68,68,0.3)', color: '#f87171' }}>
+              <span className="text-xl shrink-0">🚨</span>
               <div>
-                <div className="font-semibold">Đã đến lúc in!</div>
-                <div className="text-[10px] mt-0.5 opacity-80">Lần cuối: {printerSettings.last_print_date || 'chưa từng'}</div>
+                <div className="font-bold">Đã tới hạn in chống khô đầu phun!</div>
+                <div className="text-[10px] mt-0.5 opacity-80">Lần in trước: {printerSettings.last_print_date || 'chưa ghi nhận'}</div>
               </div>
             </div>
           )}
           {isLaser && (
-            <div className="mt-auto p-2.5 rounded-xl border text-xs flex items-center gap-2.5"
-              style={{ backgroundColor: '#eab30810', borderColor: '#eab30830', color: '#eab308' }}>
-              <span className="text-base">🔲</span>
+            <div className="mt-2 p-2.5 rounded-xl border text-xs flex items-center gap-2.5"
+              style={{ backgroundColor: 'rgba(234,179,8,0.1)', borderColor: 'rgba(234,179,8,0.25)', color: '#fbbf24' }}>
+              <span className="text-base shrink-0">🔲</span>
               <div>
-                <div className="font-semibold">Máy in laser</div>
-                <div className="text-[10px] mt-0.5 opacity-80">Không cần nhắc chống khô mực</div>
+                <div className="font-bold">Máy in Laser</div>
+                <div className="text-[10px] opacity-80">Mực khô không bị tắc - Không cần nhắc nhở</div>
               </div>
             </div>
           )}
@@ -887,15 +863,16 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
                             style={{ color: '#60a5fa' }}>Cài đặt</button>
                 </div>
               )}
-              {visiblePrinters.map(pr => {
+              {visiblePrinters.map((pr, idx) => {
             const stats = statsPrinters[pr.name]
             const isSelected = selectedPrinter === pr.name
             const isTracking = printerSettings.selected_printer === pr.name
 
             return (
               <div key={pr.name}
-                className="rounded-xl border backdrop-blur-sm transition-all duration-200 overflow-hidden"
+                className="rounded-xl border backdrop-blur-sm transition-all duration-200 overflow-hidden animate-device-enter"
                 style={{
+                  animationDelay: `${idx * 0.06}s`,
                   backgroundColor: 'var(--bg-card)',
                   borderColor: isTracking ? '#22c55e40' : 'var(--border)',
                   boxShadow: isTracking ? '0 0 20px rgba(34,197,94,0.05)' : undefined,

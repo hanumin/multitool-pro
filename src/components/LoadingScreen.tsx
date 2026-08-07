@@ -85,6 +85,17 @@ const MODULE_APIS: ModuleApi[] = [
   { id: 'ready', label: 'Sẵn sàng', icon: '✨', fetch: async (): Promise<FetchResult> => ({ response: null, data: null }) },
 ]
 
+// WHY: Component nhỏ để fetch version từ Tauri API dynamic.
+function AppVersion() {
+  const [ver, setVer] = useState('')
+  useEffect(() => {
+    import('@tauri-apps/api/app')
+      .then(m => m.getVersion().then(setVer))
+      .catch(() => setVer('1.9.10'))
+  }, [])
+  return <>{ver ? `v${ver}` : ''}</>
+}
+
 // WHY: Màn hình loading chuyên nghiệp khi khởi động app.
 // Hiển thị tiến trình khởi tạo từng module với animation mượt mà.
 // Gọi API THẬT cho từng module, không phải animation giả.
@@ -112,7 +123,13 @@ export default function LoadingScreen({ onComplete }: Props) {
 
   // WHY: Collect dữ liệu preload từ các API response.
   // Dữ liệu này được truyền xuống từng module để skip initial fetch.
-  const preloadedData = useRef<PreloadedData>({})
+  // WHY: preloadedRaw lưu response THÔ của từng module (map theo id) — KHÔNG merge
+  // incrementally như trước. Trước đây mỗi promise chạy `{ ...preloadedData.current }`
+  // rồi ghi đè → race condition: 2 promise resolve đồng thời, promise sau ghi đè
+  // snapshot cũ làm MẤT dữ liệu của promise trước (e.g. audio chậm resolve sau → đè
+  // mất debugLog → tab Log trắng). Giờ build PreloadedData một lần, nguyên tử, sau khi
+  // MỌI promise settle → không còn race.
+  const preloadedRaw = useRef<Record<string, unknown>>({})
 
   // WHY: Update progress của một step mượt mà (dùng cho animation).
   // Gọi setInterval để tăng dần progress từ current → target.
@@ -149,9 +166,31 @@ export default function LoadingScreen({ onComplete }: Props) {
     })
   }
 
+  // WHY: Build PreloadedData MỘT LẦN từ các response đã collect — chạy sau khi mọi
+  // promise settle nên KHÔNG có race. Mapping giữ nguyên chuẩn cũ (extract từng field).
+  const buildPreloadedData = (): PreloadedData => {
+    const res = preloadedRaw.current
+    const flat: PreloadedData = {}
+    if (res.printers) {
+      flat.printers = (res.printers as any)?.printers
+      flat.printerSettings = (res.printers as any)?.printerSettings
+    }
+    if (res.audio) flat.audioDevices = res.audio as any
+    if (res.tunnels) flat.cloudflared = res.tunnels as any
+    if (res.database) {
+      flat.databaseConnections = ((res.database as any)?.connections) || []
+    }
+    if (res.logs) {
+      // WHY: Backend trả về { log: "..." }, transform thành { lines: [...] }
+      const logStr = (res.logs as any)?.log || ''
+      flat.debugLog = { lines: logStr.split('\n').filter((l: string) => l.trim()) }
+    }
+    if (res.servers) flat.projects = res.servers as any
+    return flat
+  }
+
   useEffect(() => {
     let cancelled = false
-
     const run = async () => {
       // WHY: Fire tất cả API calls song song ngay từ đầu.
       // Khi mỗi promise resolve, step tương ứng được đánh dấu hoàn thành.
@@ -161,34 +200,10 @@ export default function LoadingScreen({ onComplete }: Props) {
           try {
             const result = await mod.fetch()
             if (cancelled) return
-            // WHY: Flatten dữ liệu vào preloadedData với key chuẩn
+            // WHY: Chỉ collect response THÔ theo mod.id — flatten được thực hiện
+            // MỘT LẦN trong buildPreloadedData() sau khi mọi promise settle (atomic).
             if (result?.data) {
-              const flat: PreloadedData = { ...preloadedData.current }
-              if (mod.id === 'printers') {
-                flat.printers = (result.data as any).printers
-                flat.printerSettings = (result.data as any).printerSettings
-              } else if (mod.id === 'audio') {
-                flat.audioDevices = result.data
-              } else if (mod.id === 'tunnels') {
-                flat.cloudflared = result.data
-              } else if (mod.id === 'database') {
-                // WHY: Backend trả về { connections: [...] }, cần extract array
-                // để khớp với PreloadedData.databaseConnections: PreloadedDbConnection[]
-                flat.databaseConnections = ((result.data as any)?.connections) || []
-              } else if (mod.id === 'logs') {
-                // WHY: Backend trả về { log: "..." }, cần transform thành { lines: [...] }
-                // để khớp với PreloadedDebugLog interface.
-                const logStr = (result.data as any)?.log || ''
-                flat.debugLog = { lines: logStr.split('\n').filter((l: string) => l.trim()) }
-              } else              if (mod.id === 'servers') {
-                // WHY: Chỉ lấy projects từ /api/projects (servers step) để tránh race với /api/preload
-                flat.projects = result.data as any
-              } else if (mod.id === 'file-copier' || mod.id === 'connecting') {
-                // WHY: Các module không có field riêng trong PreloadedData, bỏ qua
-              } else {
-                ;(flat as any)[mod.id] = result.data
-              }
-              preloadedData.current = flat
+              preloadedRaw.current[mod.id] = result.data
             }
             setSteps(prev => {
               if (prev[idx]?.status === 'done') return prev
@@ -254,68 +269,76 @@ export default function LoadingScreen({ onComplete }: Props) {
       setFadeOut(true)
       await sleep(500)
       if (cancelled) return
-      onComplete(preloadedData.current)
+      // WHY: Build toàn bộ preloaded data một lần (atomic) — tránh race làm mất field
+      onComplete(buildPreloadedData())
     }
 
     run()
     return () => { cancelled = true }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // WHY: Promise sleep đơn giản cho delay/retry trong LoadingScreen.
   const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
   return (
     <div className={`fixed inset-0 z-[9999] flex flex-col items-center justify-center transition-opacity duration-500 ${fadeOut ? 'opacity-0' : 'opacity-100'}`}
       style={{
-        background: 'radial-gradient(ellipse at 50% 30%, #0a1628 0%, #030712 70%)',
+        background: 'radial-gradient(ellipse at 50% 30%, #0b1329 0%, #030712 80%)',
         fontFamily: "'Inter', 'Segoe UI', system-ui, sans-serif",
       }}>
-      {/* Animated background grid */}
+      {/* Animated background grid & Ambient Glow */}
       <div className="absolute inset-0 overflow-hidden pointer-events-none">
-        <div className="absolute inset-0 opacity-[0.03]" style={{
+        <div className="absolute inset-0 opacity-[0.04]" style={{
           backgroundImage: 'linear-gradient(rgba(52,211,153,0.3) 1px, transparent 1px), linear-gradient(90deg, rgba(52,211,153,0.3) 1px, transparent 1px)',
-          backgroundSize: '60px 60px',
+          backgroundSize: '50px 50px',
         }} />
         {/* Glow orbs */}
-        <div className="absolute -top-40 -left-40 w-[500px] h-[500px] rounded-full blur-[120px] opacity-20 animate-pulse" style={{ background: 'radial-gradient(circle, rgba(52,211,153,0.4), transparent 70%)' }} />
-        <div className="absolute -bottom-40 -right-40 w-[500px] h-[500px] rounded-full blur-[120px] opacity-20 animate-pulse" style={{ background: 'radial-gradient(circle, rgba(96,165,250,0.3), transparent 70%)', animationDelay: '2s' }} />
+        <div className="absolute -top-40 -left-40 w-[600px] h-[600px] rounded-full blur-[140px] opacity-25 animate-pulse" style={{ background: 'radial-gradient(circle, rgba(52,211,153,0.4), transparent 70%)' }} />
+        <div className="absolute -bottom-40 -right-40 w-[600px] h-[600px] rounded-full blur-[140px] opacity-25 animate-pulse" style={{ background: 'radial-gradient(circle, rgba(56,189,248,0.35), transparent 70%)', animationDelay: '2s' }} />
       </div>
 
-      {/* Content */}
-      <div className="relative z-10 flex flex-col items-center w-full max-w-md px-6">
-        {/* Logo area */}
-        <div className="mb-8 text-center">
-          <div className="relative inline-flex items-center justify-center w-16 h-16 mb-4">
-            <div className="absolute inset-0 rounded-2xl bg-gradient-to-br from-emerald-400/20 to-blue-500/20 animate-pulse" />
-            <div className="absolute inset-0 rounded-2xl border border-emerald-500/20" />
-            <div className="relative text-3xl">⚡</div>
+      {/* Content Container — Tăng chiều rộng lên max-w-3xl cho rộng rãi 2 bên */}
+      <div className="relative z-10 flex flex-col items-center w-full max-w-3xl px-6">
+        {/* Logo & Header */}
+        <div className="mb-6 text-center">
+          <div className="relative inline-flex items-center justify-center w-20 h-20 mb-3">
+            <div className="absolute inset-0 rounded-2xl bg-gradient-to-br from-emerald-400/25 via-sky-500/20 to-blue-600/25 animate-pulse blur-sm" />
+            <div className="absolute inset-0 rounded-2xl border border-emerald-500/35 bg-slate-950/60 backdrop-blur-md" />
+            <div className="relative text-4xl transform hover:scale-110 transition-transform">⚡</div>
           </div>
-          <h1 className="text-xl font-bold tracking-tight" style={{ color: '#f1f5f9' }}>
+          <h1 className="text-2xl font-black tracking-tight bg-gradient-to-r from-white via-slate-100 to-slate-300 bg-clip-text text-transparent">
             MultiTool Pro
           </h1>
-          <p className="text-xs mt-1" style={{ color: 'rgba(148,163,184,0.7)' }}>
-            Đang khởi tạo các module...
+          <p className="text-xs text-slate-400 mt-1 font-medium">
+            Hệ thống Quản trị & Dịch vụ Multi-App · Đang khởi tạo các module...
           </p>
         </div>
 
-        {/* Progress bar */}
-        <div className="w-full mb-6">
-          <div className="relative h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'rgba(255,255,255,0.06)' }}>
+        {/* Master Progress Bar — Tăng rộng toàn chiều ngang max-w-3xl */}
+        <div className="w-full mb-6 bg-slate-900/80 border border-slate-800/80 rounded-2xl p-3.5 backdrop-blur-md shadow-sm">
+          <div className="flex items-center justify-between text-xs mb-2">
+            <span className="font-semibold text-slate-300 flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+              Tiến trình khởi động hệ thống
+            </span>
+            <span className="font-mono font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2.5 py-0.5 rounded-full text-[11px]">
+              {overallProgress}%
+            </span>
+          </div>
+          <div className="relative h-2.5 rounded-full overflow-hidden bg-slate-950/80 border border-slate-800">
             <div className="absolute inset-0 rounded-full transition-all duration-300 ease-out"
               style={{
                 width: `${overallProgress}%`,
-                background: 'linear-gradient(90deg, #34d399, #60a5fa, #34d399)',
+                background: 'linear-gradient(90deg, #10b981, #38bdf8, #818cf8, #10b981)',
                 backgroundSize: '200% 100%',
                 animation: 'loading-bar-shimmer 2s linear infinite',
-                boxShadow: '0 0 12px rgba(52,211,153,0.4)',
+                boxShadow: '0 0 15px rgba(52,211,153,0.5)',
               }} />
           </div>
-          <span className="text-[10px] font-mono mt-1.5 block text-right" style={{ color: 'rgba(148,163,184,0.5)' }}>
-            {overallProgress}%
-          </span>
         </div>
 
-        {/* Steps */}
-        <div className="w-full space-y-1.5 mb-6">
+        {/* Modules Grid — 3 Cột rộng rãi tràn đều 2 bên */}
+        <div className="w-full grid grid-cols-1 sm:grid-cols-3 gap-3 mb-6">
           {steps.map((step, idx) => {
             const isActive = idx === currentStepIdx
             const isDone = step.status === 'done'
@@ -323,58 +346,58 @@ export default function LoadingScreen({ onComplete }: Props) {
             const isWaiting = step.status === 'waiting'
             return (
               <div key={step.id}
-                className={`flex items-center gap-3 px-3 py-2 rounded-lg transition-all duration-300 ${
-                  isActive ? 'bg-white/[0.04] border border-emerald-500/20' :
-                  isDone ? 'bg-white/[0.02] border border-transparent' :
-                  isError ? 'bg-white/[0.02] border border-amber-500/20' :
-                  'border border-transparent'
+                className={`flex items-center gap-3 px-3.5 py-2.5 rounded-xl border transition-all duration-300 backdrop-blur-md ${
+                  isActive ? 'bg-emerald-500/10 border-emerald-500/35 shadow-md shadow-emerald-500/5' :
+                  isDone ? 'bg-slate-900/60 border-slate-800/80' :
+                  isError ? 'bg-amber-500/10 border-amber-500/30' :
+                  'bg-slate-950/30 border-slate-900/60 opacity-60'
                 }`}>
                 {/* Icon */}
-                <div className={`relative w-6 h-6 flex items-center justify-center rounded-md text-xs transition-all duration-300 ${
-                  isDone ? 'scale-100' : isActive ? 'scale-110' : 'scale-90 opacity-40'
+                <div className={`relative w-7 h-7 flex items-center justify-center rounded-lg text-sm shrink-0 transition-all duration-300 ${
+                  isDone ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' :
+                  isError ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30' :
+                  isActive ? 'bg-sky-500/20 border border-sky-500/30 scale-105' :
+                  'bg-slate-800/40 text-slate-500 border border-slate-800'
                 }`}>
                   {isDone ? (
-                    <div className="absolute inset-0 rounded-md bg-emerald-500/20 flex items-center justify-center">
-                      <svg className="w-3 h-3 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
-                      </svg>
-                    </div>
+                    <svg className="w-3.5 h-3.5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                    </svg>
                   ) : isError ? (
-                    <div className="absolute inset-0 rounded-md bg-amber-500/20 flex items-center justify-center">
-                      <svg className="w-3 h-3 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                      </svg>
-                    </div>
+                    <svg className="w-3.5 h-3.5 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
                   ) : (
-                    <span className={isActive ? '' : 'opacity-40'}>{step.icon}</span>
-                  )}
-                  {isActive && !isDone && !isError && (
-                    <div className="absolute -inset-0.5 rounded-md border-2 border-emerald-500/30 animate-ping opacity-30" />
+                    <span>{step.icon}</span>
                   )}
                 </div>
+
                 {/* Label */}
-                <span className={`flex-1 text-xs font-medium transition-all duration-300 ${
-                  isDone ? 'text-emerald-400' : isError ? 'text-amber-400' : isActive ? 'text-gray-200' : 'text-gray-500'
+                <span className={`flex-1 text-xs font-semibold truncate transition-colors duration-300 ${
+                  isDone ? 'text-slate-200' : isError ? 'text-amber-400' : isActive ? 'text-emerald-400 font-bold' : 'text-slate-400'
                 }`}>
                   {step.label}
                 </span>
-                {/* Progress indicator */}
-                <div className="flex items-center gap-1.5">
+
+                {/* Progress Status Badge */}
+                <div className="shrink-0 flex items-center">
                   {isActive && step.progress < 100 && !isError && (
-                    <div className="flex gap-0.5">
-                      {[0,1,2].map(i => (
-                        <div key={i} className="w-0.5 h-2.5 rounded-full bg-emerald-400/60 animate-bounce" style={{ animationDelay: `${i * 0.15}s` }} />
-                      ))}
-                    </div>
+                    <span className="text-[10px] font-mono font-bold text-sky-400 animate-pulse">
+                      {step.progress}%
+                    </span>
                   )}
                   {isDone && (
-                    <span className="text-[10px] font-mono text-emerald-500/60">OK</span>
+                    <span className="text-[10px] font-mono font-bold text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-1.5 py-0.5 rounded">
+                      OK
+                    </span>
                   )}
                   {isError && (
-                    <span className="text-[10px] font-mono text-amber-500/60">--</span>
+                    <span className="text-[10px] font-mono font-bold text-amber-400 bg-amber-500/10 border border-amber-500/20 px-1.5 py-0.5 rounded">
+                      WAIT
+                    </span>
                   )}
                   {isWaiting && (
-                    <span className="text-[10px] font-mono text-gray-600">--</span>
+                    <span className="text-[10px] font-mono text-slate-600">--</span>
                   )}
                 </div>
               </div>
@@ -382,17 +405,20 @@ export default function LoadingScreen({ onComplete }: Props) {
           })}
         </div>
 
-        {/* Tip */}
-        {showTip && (
-          <div className="text-[11px] text-center px-4 py-2 rounded-lg transition-opacity duration-500 animate-fade-in"
-            style={{ color: 'rgba(148,163,184,0.6)', backgroundColor: 'rgba(255,255,255,0.03)' }}>
-            {showTip}
-          </div>
-        )}
+        {/* Tip Box Container — Tăng mở rộng max-w-2xl & cố định min-height 48px */}
+        <div className="w-full max-w-2xl min-h-[48px] flex items-center justify-center border border-slate-800/80 bg-slate-900/60 backdrop-blur-md rounded-2xl px-6 py-2.5 shadow-sm text-center text-xs text-slate-300 font-medium transition-all duration-300">
+          {showTip ? (
+            <span className="animate-fade-in leading-relaxed text-slate-300 font-medium">
+              {showTip}
+            </span>
+          ) : (
+            <span className="text-slate-500 italic text-[11px]">Đang tải dữ liệu cấu hình hệ thống...</span>
+          )}
+        </div>
 
-        {/* Version */}
-        <div className="mt-8 text-[10px] font-mono" style={{ color: 'rgba(148,163,184,0.25)' }}>
-          v1.10.0
+        {/* Dynamic Version */}
+        <div className="mt-6 text-[10px] font-mono text-slate-500 tracking-wider">
+          <AppVersion />
         </div>
       </div>
     </div>

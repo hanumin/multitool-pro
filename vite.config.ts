@@ -2,6 +2,7 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { visualizer } from 'rollup-plugin-visualizer'
+import { resolve } from 'path'
 
 export default defineConfig({
   plugins: [
@@ -27,6 +28,11 @@ export default defineConfig({
   },
   build: {
     rollupOptions: {
+      // WHY: Multi-page setup — widget.html là cửa sổ widget âm thanh độc lập
+      input: {
+        main: resolve(__dirname, 'index.html'),
+        widget: resolve(__dirname, 'widget.html'),
+      },
       output: {
         manualChunks: {
           // Tách React vendor riêng (react + react-dom) — chunk ổn định, ít thay đổi
@@ -39,7 +45,11 @@ export default defineConfig({
         },
       },
     },
-    // Tăng giới hạn cảnh báo từ 500kB lên 1000kB — vendor chunks hợp lý có thể >500kB
+    // WHY: Bật CSS tree-shaking và minify nâng cao
+    cssCodeSplit: false,
+    // WHY: target esnext cho modern Chromium (WebView2) — không cần transpile xuống ES5
+    target: 'esnext',
+    // WHY: Tăng giới hạn cảnh báo từ 500kB lên 1000kB — vendor chunks hợp lý có thể >500kB
     chunkSizeWarningLimit: 1000,
   },
 })
