@@ -17,6 +17,7 @@ const ansiConverter = new Convert({
 
 interface Project {
   name: string; port: number; path: string; command?: string; running: boolean
+  type?: 'node' | 'custom'; process_name?: string
 }
 
 interface TunnelState {
@@ -279,7 +280,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
 
   // WHY: Fetch port conflicts for all project ports
   const scanPortConflicts = useCallback(async () => {
-    const ports = projects.map(p => p.port)
+    const ports = projects.map(p => p.port).filter(Boolean)
     if (ports.length === 0) return
     try {
       const res = await fetchWithRetry(`${API}/api/system/port-scan`, {
@@ -302,7 +303,8 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
   // WHY: Fetch disk usage and npm scripts for each running project
   const fetchProjectExtras = useCallback(async () => {
     for (const p of projects) {
-      if (p.running) {
+      // WHY: Lệnh tùy chỉnh (type=custom) không phải project Node — bỏ qua npm scripts + disk usage.
+      if (p.running && p.type !== 'custom') {
         // Fetch scripts
         try {
           const res = await fetchWithRetry(`${API}/api/projects/${encodeURIComponent(p.name)}/scripts`)
@@ -494,7 +496,10 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
       setExpandedProjects(valid)
       if (valid.length === 0) return
     }
-    valid.forEach(name => { fetchDiagnostics(name); fetchTunnelStatus(name) })
+    valid.forEach(name => {
+      fetchDiagnostics(name)
+      if (projectsRef.current.find(p => p.name === name)?.type !== 'custom') fetchTunnelStatus(name)
+    })
     const interval = setInterval(() => {
       const stillValid = expandedProjects.filter(name => projectsRef.current.some(p => p.name === name))
       if (stillValid.length !== expandedProjects.length) {
@@ -509,7 +514,9 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
         setExpandedProjects(stillValid)
         if (stillValid.length === 0) return
       }
-      stillValid.forEach(name => fetchTunnelStatus(name))
+      stillValid
+        .filter(name => projectsRef.current.find(p => p.name === name)?.type !== 'custom')
+        .forEach(name => fetchTunnelStatus(name))
     }, 6000)
     return () => { clearInterval(interval); clearInterval(tunnelInterval) }
   }, [expandedProjects, fetchDiagnostics, fetchTunnelStatus, inactive, backgroundPolling])
@@ -618,6 +625,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
   // không chỉ project đang expanded. Dùng projectsRef để tránh stale closure.
   const fetchAllTunnelStatuses = useCallback(async () => {
     for (const p of projectsRef.current) {
+      if (p.type === 'custom') continue
       try {
         const signal = pollAbortRef.current?.signal
         const res = await fetchWithRetry(`${API}/api/projects/${encodeURIComponent(p.name)}/tunnel`, { signal })
@@ -635,7 +643,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
     setBatchTunnelLoading(true)
     let count = 0
     for (const p of projectsRef.current) {
-      if (p.running) {
+      if (p.running && p.type !== 'custom') {
         const ts = tunnelStatesRef.current[p.name]
         if (ts?.status !== 'active' && ts?.status !== 'connecting') {
           try {
@@ -660,6 +668,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
     setBatchTunnelLoading(true)
     let count = 0
     for (const p of projectsRef.current) {
+      if (p.type === 'custom') continue
       const ts = tunnelStatesRef.current[p.name]
       if (ts?.status === 'active' || ts?.status === 'connecting') {
         try {
@@ -730,7 +739,8 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
   }, [logs, activeTab])
 
   // WHY: Start/stop 1 project. POST /api/projects/<name>/start hoac stop.
-  // Refresh projects list sau khi action.
+  // Refresh projects list sau khi action. Stop cũng refresh tunnel status —
+  // backend tự dừng tunnel khi dừng project (chống flood lỗi origin-down).
   const act = async (name: string, action: 'start' | 'stop') => {
     setLoading(p => ({ ...p, [name]: true }))
     try {
@@ -748,6 +758,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
         addToast({ type: 'error', title: `❌ ${name}`, message: e.error || 'Thao tác thất bại' })
       }
       await fetchProjects()
+      if (action === 'stop') fetchAllTunnelStatuses()
     } catch {
       setStatusText('Mất kết nối')
       addToast({ type: 'error', title: '🔌 Mất kết nối', message: `Không thể ${action === 'start' ? 'khởi động' : 'dừng'} ${name}` })
@@ -1116,9 +1127,16 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                       <span className="text-xs">⚡</span>
                     </div>
                     <h2 className="text-sm font-bold tracking-tight truncate" style={{ color: 'var(--fg)' }}>{p.name}</h2>
-                    <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-slate-800/80 text-emerald-400 border border-slate-700">
-                      :{p.port}
-                    </span>
+                    {p.type === 'custom' && (
+                      <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-bold" style={{ color: '#38bdf8', backgroundColor: 'rgba(56,189,248,0.1)', border: '1px solid rgba(56,189,248,0.25)' }}>
+                        🔧 Lệnh tùy chỉnh
+                      </span>
+                    )}
+                    {!!p.port && (
+                      <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-slate-800/80 text-emerald-400 border border-slate-700">
+                        :{p.port}
+                      </span>
+                    )}
                     <span className={`status-badge ${p.running ? 'status-badge-running animate-badge-pop' : 'status-badge-stopped'}`}>
                       <span className={`status-dot ${p.running ? 'status-dot-running' : 'status-dot-stopped'}`} />
                       {p.running ? 'ĐANG CHẠY' : 'ĐÃ DỪNG'}
@@ -1187,11 +1205,13 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                               <span style={{ color: 'var(--fg-dim)' }}>⏱️ Thời gian chạy:</span>
                               <span className="font-mono text-emerald-400">{diagnostics[p.name]?.uptime || (p.running ? '...' : '-')}</span>
                             </div>
-                            <div className="flex items-center justify-between">
-                              <span style={{ color: 'var(--fg-dim)' }}>🟢 Node & npm:</span>
-                              <span className="font-mono text-[11px] text-slate-300">{diagnostics[p.name]?.env?.node || '...'} {diagnostics[p.name]?.env?.npm ? `(npm ${diagnostics[p.name].env.npm})` : ''}</span>
-                            </div>
-                            {diagnostics[p.name]?.git && (
+                            {p.type !== 'custom' && (
+                              <div className="flex items-center justify-between">
+                                <span style={{ color: 'var(--fg-dim)' }}>🟢 Node & npm:</span>
+                                <span className="font-mono text-[11px] text-slate-300">{diagnostics[p.name]?.env?.node || '...'} {diagnostics[p.name]?.env?.npm ? `(npm ${diagnostics[p.name].env.npm})` : ''}</span>
+                              </div>
+                            )}
+                            {p.type !== 'custom' && diagnostics[p.name]?.git && (
                               <div className="flex items-center justify-between border-t pt-1.5 mt-1.5" style={{ borderColor: 'var(--border)' }}>
                                 <span style={{ color: 'var(--fg-dim)' }}>🌿 Git Branch:</span>
                                 <span className="font-mono text-emerald-400 text-[11px]">
@@ -1205,7 +1225,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                     </div>
 
                     {/* Quick Browser Open */}
-                    {p.running && (
+                    {p.running && !!p.port && (
                       <button onClick={() => openBrowser(`http://localhost:${p.port}`)}
                         className="p-1 rounded-lg hover:bg-blue-500/15 text-blue-400 transition-colors border-0 cursor-pointer"
                         title="Mở trình duyệt">
@@ -1236,8 +1256,8 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                       📁
                     </button>
 
-                    {/* Quick npm Scripts */}
-                    {projectScripts[p.name] && projectScripts[p.name].length > 0 && (
+                    {/* Quick npm Scripts — chỉ cho project Node.js */}
+                    {p.type !== 'custom' && projectScripts[p.name] && projectScripts[p.name].length > 0 && (
                       <select id={`script-select-${p.name}`} name="runScript" onChange={async e => {
                         const script = e.target.value
                         if (!script) return
@@ -1283,9 +1303,11 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                         <div className="diag-item expand-stagger-item"><span className="diag-label">Bộ nhớ:</span> <span className="diag-value">{diagnostics[p.name]?.memory ? `${(diagnostics[p.name].memory / 1024 / 1024).toFixed(1)} MB` : p.running ? '...' : 'Không hoạt động'}</span></div>
                         <div className="diag-item expand-stagger-item"><span className="diag-label">CPU:</span> <span className="diag-value">{diagnostics[p.name]?.cpu !== undefined ? `${diagnostics[p.name].cpu}%` : p.running ? '...' : '-'}</span></div>
                         <div className="diag-item expand-stagger-item"><span className="diag-label">Uptime:</span> <span className="diag-value" style={{ color: diagnostics[p.name]?.uptime_seconds > 3600 ? '#22c55e' : undefined }}>{diagnostics[p.name]?.uptime || (p.running ? '...' : '-')}</span></div>
-                        <div className="diag-item expand-stagger-item"><span className="diag-label">Node:</span> <span className="diag-value">{diagnostics[p.name]?.env?.node || '...'} {diagnostics[p.name]?.env?.npm ? `(npm ${diagnostics[p.name].env.npm})` : ''}</span></div>
+                        {p.type !== 'custom' && (
+                          <div className="diag-item expand-stagger-item"><span className="diag-label">Node:</span> <span className="diag-value">{diagnostics[p.name]?.env?.node || '...'} {diagnostics[p.name]?.env?.npm ? `(npm ${diagnostics[p.name].env.npm})` : ''}</span></div>
+                        )}
                       </div>
-                    {diagnostics[p.name]?.git && (
+                    {p.type !== 'custom' && diagnostics[p.name]?.git && (
                       <div className="flex items-center gap-2 flex-wrap mt-2">
                         <span style={{ color: 'var(--fg-muted)' }}>Git:</span>
                         <span className="font-mono text-emerald-500 text-xs">{diagnostics[p.name].git.branch}</span>
@@ -1294,8 +1316,9 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                         </span>
                       </div>
                     )}
-                    {/* Quick Actions Row */}
-                    <div className="flex items-center gap-1.5 pt-1 flex-wrap">
+                    {/* Quick Actions Row — chỉ cho project Node.js */}
+                    {p.type !== 'custom' && (
+                      <div className="flex items-center gap-1.5 pt-1 flex-wrap">
                       <button onClick={() => openEnvEditor(p.name)} className="px-2 py-1 text-[10px] font-semibold rounded border transition-colors active:scale-95 cursor-pointer"
                         style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>📝 Sửa .env</button>
                       {/* Quick SSL */}
@@ -1310,8 +1333,10 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                       }}
                         className="px-2 py-1 text-[10px] font-semibold rounded border transition-colors active:scale-95 cursor-pointer"
                         style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>🔒 SSL</button>
-                    </div>
-                    {/* Cloudflare Tunnel */}
+                      </div>
+                    )}
+                    {/* Cloudflare Tunnel — chỉ cho project Node.js */}
+                    {p.type !== 'custom' && (
                     <div className="pt-2 border-t border-dashed" style={{ borderColor: 'var(--border)' }}>
                       <div className="flex items-center gap-1.5 mb-1.5 relative">
                         <span className="text-xs font-semibold" style={{ color: 'var(--fg-muted)' }}>🌐 Cloudflare Tunnel</span>
@@ -1508,6 +1533,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                         </div>
                       )}
                     </div>
+                    )}
                   </div>
                   </div>
                 </div>
@@ -1523,7 +1549,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                     </span>
                   )}
                   {/* Disk Usage Badge */}
-                  {diskSizes[p.name]?.node_modules && (
+                  {p.type !== 'custom' && diskSizes[p.name]?.node_modules && (
                     <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[8px] font-mono ${
                       diskSizes[p.name].node_modules > 500
                         ? 'bg-amber-500/15 text-amber-400 ring-1 ring-amber-500/20'
@@ -1594,17 +1620,19 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                       </>
                     )}
                   </button>
-                  <div className="relative">
-                    <select id={`clean-select-${p.name}`} name="cleanType" onChange={e => { const v = e.target.value as 'basic' | 'deep' | 'nuke'; if (v) { cleanProject(p.name, v); e.target.value = '' } }}
-                      disabled={clearing[p.name]}
-                      className="px-2 py-1 rounded-lg cursor-pointer border transition-all disabled:opacity-30 text-[11px] appearance-none"
-                      style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
-                      <option value="">🧹 Dọn dẹp</option>
-                      <option value="basic">Cache</option>
-                      <option value="deep">Build sâu</option>
-                      <option value="nuke">Xóa sạch</option>
-                    </select>
-                  </div>
+                  {p.type !== 'custom' && (
+                    <div className="relative">
+                      <select id={`clean-select-${p.name}`} name="cleanType" onChange={e => { const v = e.target.value as 'basic' | 'deep' | 'nuke'; if (v) { cleanProject(p.name, v); e.target.value = '' } }}
+                        disabled={clearing[p.name]}
+                        className="px-2 py-1 rounded-lg cursor-pointer border transition-all disabled:opacity-30 text-[11px] appearance-none"
+                        style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+                        <option value="">🧹 Dọn dẹp</option>
+                        <option value="basic">Cache</option>
+                        <option value="deep">Build sâu</option>
+                        <option value="nuke">Xóa sạch</option>
+                      </select>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>

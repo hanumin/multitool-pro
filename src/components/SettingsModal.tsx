@@ -22,6 +22,8 @@ interface Project {
   command: string
   port: number
   start_on_launch?: boolean
+  type?: 'node' | 'custom'
+  process_name?: string
   framework?: string
   confidence?: number
   detected?: boolean
@@ -117,7 +119,11 @@ export default function SettingsModal({
   // WHY: Lưu project (thêm mới POST hoặc cập nhật PUT theo editingIndex) — sau
   // khi thêm có tùy chọn start ngay; luôn refetch config + báo onChanged cho App.
   const saveProject = async () => {
-    if (!edit || !edit.name || !edit.path) {
+    if (!edit || !edit.name) {
+      setError('Cần nhập tên')
+      return
+    }
+    if (edit.type !== 'custom' && !edit.path) {
       setError('Cần nhập tên và đường dẫn')
       return
     }
@@ -474,7 +480,7 @@ export default function SettingsModal({
                           style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
                           {reloading ? '⏳ Đang tải...' : '🔄 Đọc lại từ đĩa'}
                         </button>
-                        <button onClick={() => { setEdit({ name: '', path: '', command: 'npm run dev', port: 4000, start_on_launch: false }); setEditingIndex(null); setStartAfterAdd(false) }}
+                        <button onClick={() => { setEdit({ name: '', path: '', command: 'npm run dev', port: 4000, type: 'node', start_on_launch: false }); setEditingIndex(null); setStartAfterAdd(false) }}
                           className="px-3 py-1.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl transition-all active:scale-95 cursor-pointer border-0 shadow-sm flex items-center gap-1">
                           <span>+</span> Thêm dự án
                         </button>
@@ -493,6 +499,30 @@ export default function SettingsModal({
                             className="text-slate-400 hover:text-white text-xs border-0 bg-transparent cursor-pointer">✕ Đóng</button>
                         </div>
 
+                        {/* Loại máy chủ: Node.js dev server hoặc Lệnh tùy chỉnh (buzz-fwd, tool nền...) */}
+                        <div>
+                          <label htmlFor="settings-proj-type" className="text-xs font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Loại máy chủ</label>
+                          <div className="grid grid-cols-2 gap-2">
+                            <button type="button" onClick={() => setEdit(p => p ? { ...p, type: 'node' } : p)}
+                              className={`px-3 py-2 text-xs font-semibold rounded-xl border transition-all cursor-pointer flex items-center gap-2 ${
+                                edit.type !== 'custom' ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30 shadow-sm' : 'hover:bg-white/5 text-slate-400 border-slate-700'
+                              }`}>
+                              🟢 Dự án Node.js
+                              <span className="text-[9px] font-normal text-slate-500 ml-auto text-right">npm/vite/next + tunnel + dọn dẹp</span>
+                            </button>
+                            <button type="button" onClick={() => setEdit(p => p ? { ...p, type: 'custom', detected: false } : p)}
+                              className={`px-3 py-2 text-xs font-semibold rounded-xl border transition-all cursor-pointer flex items-center gap-2 ${
+                                edit.type === 'custom' ? 'bg-sky-500/15 text-sky-400 border-sky-500/30 shadow-sm' : 'hover:bg-white/5 text-slate-400 border-slate-700'
+                              }`}>
+                              🔧 Lệnh tùy chỉnh
+                              <span className="text-[9px] font-normal text-slate-500 ml-auto text-right">chạy tool nền, port-forward...</span>
+                            </button>
+                          </div>
+                          {edit.type === 'custom' && (
+                            <p className="text-[10px] mt-1.5 text-sky-400/80">Chỉ chạy lệnh + xem log. Không cần thư mục project, node_modules, tunnel hay dọn dẹp.</p>
+                          )}
+                        </div>
+
                         <div className="grid grid-cols-2 gap-4">
                           <div>
                             <label htmlFor="settings-proj-name" className="text-xs font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Tên máy chủ *</label>
@@ -502,7 +532,7 @@ export default function SettingsModal({
                               placeholder="FrontendApp" />
                           </div>
                           <div>
-                            <label htmlFor="settings-proj-port" className="text-xs font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Cổng (Port)</label>
+                            <label htmlFor="settings-proj-port" className="text-xs font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Cổng (Port){edit.type === 'custom' ? ' — tùy chọn' : ''}</label>
                             <input id="settings-proj-port" name="projPort" type="number" value={edit.port ?? 4000} onChange={e => setEdit(p => ({ ...p, port: parseInt(e.target.value) || 0 }))}
                               className="w-full border rounded-xl px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500 transition-colors"
                               style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }} />
@@ -510,22 +540,26 @@ export default function SettingsModal({
                         </div>
 
                         <div>
-                          <label htmlFor="settings-proj-path" className="text-xs font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Đường dẫn thư mục *</label>
+                          <label htmlFor="settings-proj-path" className="text-xs font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>
+                            {edit.type === 'custom' ? 'Thư mục làm việc (tùy chọn)' : 'Đường dẫn thư mục *'}
+                          </label>
                           <div className="flex gap-2">
                             <input id="settings-proj-path" name="projPath" value={edit.path || ''} onChange={e => setEdit(p => ({ ...p, path: e.target.value }))}
                               className="flex-1 border rounded-xl px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500 transition-colors"
                               style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }}
-                              placeholder="C:\Users\...\my-project" />
+                              placeholder={edit.type === 'custom' ? 'C:\Users\...\tools (thư mục chứa lệnh)' : 'C:\Users\...\my-project'} />
                             <button onClick={browseFolder}
                               className="px-3 py-2 text-xs font-semibold border rounded-xl transition-all shrink-0 active:scale-95 cursor-pointer hover:bg-white/10"
                               style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
                               📁 Chọn thư mục...
                             </button>
-                            <button onClick={detectFromPath} disabled={detecting}
-                              className="px-3 py-2 text-xs font-semibold border rounded-xl transition-all shrink-0 active:scale-95 cursor-pointer hover:bg-white/10 disabled:opacity-50"
-                              style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
-                              {detecting ? '⏳ Đang phát hiện...' : '🔍 Tự phát hiện'}
-                            </button>
+                            {edit.type !== 'custom' && (
+                              <button onClick={detectFromPath} disabled={detecting}
+                                className="px-3 py-2 text-xs font-semibold border rounded-xl transition-all shrink-0 active:scale-95 cursor-pointer hover:bg-white/10 disabled:opacity-50"
+                                style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+                                {detecting ? '⏳ Đang phát hiện...' : '🔍 Tự phát hiện'}
+                              </button>
+                            )}
                           </div>
                           {/* WHY: Badge framework sau auto-detect — hiện confidence + lệnh/port đã điền sẵn */}
                           {edit.detected && edit.framework && (
@@ -540,29 +574,58 @@ export default function SettingsModal({
                         </div>
 
                         <div>
-                          <label htmlFor="settings-proj-command" className="text-xs font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Lệnh chạy (Start command)</label>
-                          <div className="grid grid-cols-3 gap-2">
-                            <select id="settings-proj-command-template" name="projCommandTemplate" onChange={e => {
-                              const val = e.target.value
-                              if (val) {
-                                setEdit(p => p ? { ...p, command: val } : null)
-                              }
-                            }}
-                            className="border rounded-xl px-2 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500 transition-colors"
-                            style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }}>
-                              <option value="">⚡ Chọn mẫu lệnh...</option>
-                              <option value="npm run dev">npm run dev</option>
-                              <option value="npm run dev -- -p {port}">npm run dev -- -p {'{port}'}</option>
-                              <option value="npm start">npm start</option>
-                              <option value="yarn dev">yarn dev</option>
-                              <option value="yarn dev -p {port}">yarn dev -p {'{port}'}</option>
-                            </select>
-                            <input id="settings-proj-command" name="projCommand" value={edit.command || ''} onChange={e => setEdit(p => ({ ...p, command: e.target.value }))}
-                              className="col-span-2 border rounded-xl px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500 transition-colors"
-                              style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }}
-                              placeholder="npm run dev" />
-                          </div>
+                          <label htmlFor="settings-proj-command" className="text-xs font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>Lệnh chạy (Start command) {edit.type === 'custom' ? '*' : ''}</label>
+                          {edit.type === 'custom' ? (
+                            <div className="grid grid-cols-3 gap-2">
+                              <input id="settings-proj-command" name="projCommand" value={edit.command || ''} onChange={e => setEdit(p => ({ ...p, command: e.target.value }))}
+                                className="col-span-2 border rounded-xl px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500 transition-colors"
+                                style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }}
+                                placeholder="node buzz-fwd.js  hoặc  python relay.py  hoặc  tool.exe" />
+                              <div className="flex items-center gap-1 text-[10px] px-2 py-1 rounded-lg border"
+                                style={{ backgroundColor: 'rgba(56,189,248,0.06)', borderColor: 'rgba(56,189,248,0.2)', color: 'var(--fg-secondary)' }}>
+                                <span className="shrink-0">💡</span>
+                                <span className="truncate">Dùng {'{port}'} để chèn cổng đã nhập</span>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="grid grid-cols-3 gap-2">
+                              <select id="settings-proj-command-template" name="projCommandTemplate" onChange={e => {
+                                const val = e.target.value
+                                if (val) {
+                                  setEdit(p => p ? { ...p, command: val } : null)
+                                }
+                              }}
+                              className="border rounded-xl px-2 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-emerald-500 transition-colors"
+                              style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }}>
+                                <option value="">⚡ Chọn mẫu lệnh...</option>
+                                <option value="npm run dev">npm run dev</option>
+                                <option value="npm run dev -- -p {port}">npm run dev -- -p {'{port}'}</option>
+                                <option value="npm start">npm start</option>
+                                <option value="yarn dev">yarn dev</option>
+                                <option value="yarn dev -p {port}">yarn dev -p {'{port}'}</option>
+                              </select>
+                              <input id="settings-proj-command" name="projCommand" value={edit.command || ''} onChange={e => setEdit(p => ({ ...p, command: e.target.value }))}
+                                className="col-span-2 border rounded-xl px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500 transition-colors"
+                                style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }}
+                                placeholder="npm run dev" />
+                            </div>
+                          )}
                         </div>
+
+                        {edit.type === 'custom' && (
+                          <div>
+                            <label htmlFor="settings-proj-process-name" className="text-xs font-medium mb-1 block" style={{ color: 'var(--fg-muted)' }}>
+                              Tên tiến trình (để phát hiện đang chạy) — tùy chọn
+                            </label>
+                            <input id="settings-proj-process-name" name="projProcessName" value={edit.process_name || ''} onChange={e => setEdit(p => ({ ...p, process_name: e.target.value }))}
+                              className="w-full border rounded-xl px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-sky-500 transition-colors"
+                              style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--input-border)', color: 'var(--fg)' }}
+                              placeholder="node" />
+                            <p className="text-[10px] mt-1 text-slate-400">
+                              Điền tên file tiến trình (vd <code className="font-mono">node</code>, <code className="font-mono">python</code>, <code className="font-mono">buzz-fwd</code>) để app nhận biết lệnh đang chạy khi khởi động lại — tránh chạy 2 bản.
+                            </p>
+                          </div>
+                        )}
 
                         <div className={editingIndex === null ? 'grid grid-cols-2 gap-3' : ''}>
                           <label htmlFor="settings-start-on-launch" className="flex items-center gap-2 text-xs select-none cursor-pointer text-slate-300">
@@ -606,9 +669,16 @@ export default function SettingsModal({
                           <div className="min-w-0 flex-1">
                             <div className="flex items-center gap-2 flex-wrap">
                               <span className="text-sm font-bold" style={{ color: 'var(--fg)' }}>{p.name}</span>
-                              <span className="text-xs font-mono font-bold border px-2 py-0.5 rounded-lg bg-slate-800 text-emerald-400 border-slate-700">
-                                :{p.port}
-                              </span>
+                              {p.type === 'custom' && (
+                                <span className="text-[9px] font-bold px-2 py-0.5 rounded-lg border" style={{ color: '#38bdf8', borderColor: 'rgba(56,189,248,0.3)', backgroundColor: 'rgba(56,189,248,0.08)' }}>
+                                  🔧 Lệnh tùy chỉnh
+                                </span>
+                              )}
+                              {!!p.port && (
+                                <span className="text-xs font-mono font-bold border px-2 py-0.5 rounded-lg bg-slate-800 text-emerald-400 border-slate-700">
+                                  :{p.port}
+                                </span>
+                              )}
                               {runningStatus[p.name] && (
                                 <span className="text-[10px] bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 rounded-full font-bold flex items-center gap-1">
                                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" /> ĐANG CHẠY

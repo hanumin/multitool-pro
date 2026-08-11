@@ -1,0 +1,12 @@
+{
+  "identifier": "tray-menu",
+  "description": "Capability for the tray menu window — show/hide/focus main window, send IPC events",
+  "windows": ["tray_menu"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "core:window:allow-close"
+  ]
+}

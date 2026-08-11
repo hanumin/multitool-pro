@@ -1,5 +1,4 @@
 import React, { useEffect, useState } from 'react';
-import { isAudioWidgetOpen, toggleAudioWidget, subscribeAudioWidget } from '../utils/audioWidget';
 
 interface ModuleItem {
   id: string;
@@ -14,12 +13,20 @@ export default function TrayMenu() {
   const [runningServices, setRunningServices] = useState<number>(3);
   const [totalServices, setTotalServices] = useState<number>(7);
 
+  // WHY: Trạng thái audio widget lấy từ MAIN window (single source of truth) qua event.
+  // audioWidget.ts là singleton theo JS context — mỗi webview có bản riêng, nên tray
+  // không đọc thẳng module được; main sẽ emitTo('tray_menu','audio-widget-state',{open}).
   useEffect(() => {
-    setAudioWidgetActive(isAudioWidgetOpen());
-    const unsubscribe = subscribeAudioWidget((isOpen) => {
-      setAudioWidgetActive(isOpen);
+    let unlisten: (() => void) | undefined;
+    import('@tauri-apps/api/event').then(({ listen, emitTo }) => {
+      listen('audio-widget-state', (event) => {
+        const { open } = event.payload as { open: boolean };
+        setAudioWidgetActive(open);
+      }).then((un) => { unlisten = un; });
+      // WHY: Yêu cầu main gửi trạng thái hiện tại khi tray mở (window mới mỗi lần hiện).
+      emitTo('main', 'tray-command', { type: 'get-audio-state' }).catch(() => {});
     });
-    return () => unsubscribe();
+    return () => { if (unlisten) unlisten(); };
   }, []);
 
   // WHY: Lắng nghe sự kiện blur để tự động ẩn window tray_menu khi người dùng click ra ngoài.
@@ -67,7 +74,8 @@ export default function TrayMenu() {
     return () => clearInterval(interval);
   }, []);
 
-  // WHY: Mở & focus main window, thực thi IPC action (openSettings hoặc navigateModule) trên main window qua eval, sau đó ẩn tray_menu.
+  // WHY: Mở & focus main window, gửi IPC command qua event bus (eval không tồn tại
+  // trong Tauri v2), sau đó ẩn tray_menu.
   const openDashboard = async (moduleId?: string) => {
     try {
       const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
@@ -75,12 +83,13 @@ export default function TrayMenu() {
       if (mainWindow) {
         await mainWindow.show();
         await mainWindow.setFocus();
-        if (moduleId) {
-          if (moduleId === 'settings') {
-            await (mainWindow as any).eval('window.__openSettings?.()');
-          } else {
-            await (mainWindow as any).eval(`window.__navigateModule?.('${moduleId}')`);
-          }
+      }
+      if (moduleId) {
+        const { emitTo } = await import('@tauri-apps/api/event');
+        if (moduleId === 'settings') {
+          await emitTo('main', 'tray-command', { type: 'settings' });
+        } else {
+          await emitTo('main', 'tray-command', { type: 'navigate', moduleId });
         }
       }
       const trayWindow = await WebviewWindow.getByLabel('tray_menu');
@@ -92,15 +101,13 @@ export default function TrayMenu() {
     }
   };
 
-  // WHY: Gửi lệnh start all tới main window qua eval và ẩn tray_menu window.
+  // WHY: Gửi lệnh start all tới main window qua event bus và ẩn tray_menu window.
   const handleStartAll = async () => {
     setRunningServices(totalServices);
     try {
+      const { emitTo } = await import('@tauri-apps/api/event');
+      await emitTo('main', 'tray-command', { type: 'start-all' });
       const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
-      const mainWindow = await WebviewWindow.getByLabel('main');
-      if (mainWindow) {
-        await (mainWindow as any).eval('window.__startAll?.()');
-      }
       const trayWindow = await WebviewWindow.getByLabel('tray_menu');
       if (trayWindow) {
         await trayWindow.hide();
@@ -110,15 +117,13 @@ export default function TrayMenu() {
     }
   };
 
-  // WHY: Gửi lệnh stop all tới main window qua eval và ẩn tray_menu window.
+  // WHY: Gửi lệnh stop all tới main window qua event bus và ẩn tray_menu window.
   const handleStopAll = async () => {
     setRunningServices(0);
     try {
+      const { emitTo } = await import('@tauri-apps/api/event');
+      await emitTo('main', 'tray-command', { type: 'stop-all' });
       const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
-      const mainWindow = await WebviewWindow.getByLabel('main');
-      if (mainWindow) {
-        await (mainWindow as any).eval('window.__stopAll?.()');
-      }
       const trayWindow = await WebviewWindow.getByLabel('tray_menu');
       if (trayWindow) {
         await trayWindow.hide();
@@ -128,17 +133,21 @@ export default function TrayMenu() {
     }
   };
 
-  // WHY: Bật/tắt Widget Âm thanh và tự động cập nhật state local.
+  // WHY: Bật/tắt Widget Âm thanh — route qua main window để dùng single source of truth
+  // (audioWidget.ts singleton per-context chỉ có ý nghĩa trong main). Main sẽ emitTo
+  // 'audio-widget-state' để tray cập nhật switch.
   const handleToggleAudioWidget = () => {
-    toggleAudioWidget({ width: 200, height: 200 }).catch(() => {});
-    setAudioWidgetActive((prev) => !prev);
+    import('@tauri-apps/api/event').then(({ emitTo }) => {
+      emitTo('main', 'tray-command', { type: 'toggle-audio' }).catch(() => {});
+    });
   };
 
-  // WHY: Gửi lệnh thoát ứng dụng hoàn toàn thông qua plugin-process exit(0).
+  // WHY: Thoát ứng dụng hoàn toàn qua command quit_app (app.exit(0)) — tray_menu không
+  // có plugin-process nên không dùng được exit() từ JS.
   const handleQuit = async () => {
     try {
-      const { exit } = await import('@tauri-apps/plugin-process');
-      await exit(0);
+      const { invoke } = await import('@tauri-apps/api/core');
+      await invoke('quit_app');
     } catch {
       try {
         const { getCurrentWindow } = await import('@tauri-apps/api/window');
@@ -245,7 +254,7 @@ export default function TrayMenu() {
           <div>
             <div className="flex items-center gap-1.5 leading-none">
               <span className="text-xs font-bold tracking-tight text-white">MultiTool Pro</span>
-              <span className="text-[10px] font-medium px-1 py-0.5 rounded bg-emerald-500/20 text-emerald-300">v1.11.3</span>
+              <span className="text-[10px] font-medium px-1 py-0.5 rounded bg-emerald-500/20 text-emerald-300">v1.11.4</span>
             </div>
           </div>
         </div>

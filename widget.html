@@ -1155,6 +1155,10 @@
     function applySettings() {
       const bgColor = micActive ? settings.color_mic_on : settings.color_mic_off;
       widget.style.backgroundColor = bgColor;
+      // WHY: Cập nhật body background để khớp widget — khi resize native (startResizeDragging)
+      // WebView2 có thể không paint kịp nội dung → nền cửa sổ (body) lòe ra. Set body bg
+      // cùng màu widget loại bỏ hiện tượng "màu nền hồng chạy theo nền đen".
+      document.body.style.backgroundColor = bgColor;
       widget.style.opacity = settings.widget_opacity ?? 1.0;
 
       if (micActive) {
@@ -1506,7 +1510,7 @@ const win = await getWin();
           // OS tự resize → phải clamp bằng min/max size của window (khớp bounds cũ).
           try {
             await win.setMinSize(await ls(150, 150));
-            await win.setMaxSize(await ls(400, 400));
+            await win.setMaxSize(await ls(400, 600));
           } catch {}
         } catch {}
 

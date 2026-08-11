@@ -28,8 +28,17 @@ const RETRY_DELAYS = [1000, 3000, 7000]
 export async function fetchWithRetry(
   url: string,
   options?: RequestInit,
-  retries: number = 2
+  retries?: number
 ): Promise<Response> {
+  // WHY: Nếu caller không truyền retries, dùng default theo method như docstring đã hứa:
+  // GET = 2 retries (tổng 3 attempts), POST/PUT/DELETE = 1 retry (tổng 2 attempts).
+  // Trước đây default cứng = 2 cho MỌI method → POST bị retry 2 lần → ví dụ set-default
+  // mic (backend tự retry verify tới 4.5s) bị gọi lại 3 lần → user phải bấm nhiều lần
+  // + chồng request song song gây COM contention.
+  if (retries === undefined) {
+    const method = (options?.method || 'GET').toUpperCase()
+    retries = method === 'GET' ? 2 : 1
+  }
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const res = await fetch(url, options)

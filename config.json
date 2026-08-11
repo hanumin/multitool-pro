@@ -13,6 +13,15 @@
       "path": "C:\\Users\\nguyenthanhdat_pc\\Desktop\\1_LAM_WEB_HOC_BE_MINH\\english-topics_v2_nextjs",
       "command": "npm run dev -- -p 4001 --turbopack",
       "port": 4001
+    },
+    {
+      "name": "Buzz Relay Forwarder",
+      "type": "custom",
+      "path": "C:\\Users\\nguyenthanhdat_pc\\buzz",
+      "command": "node buzz-fwd.js",
+      "port": 3000,
+      "process_name": "node",
+      "start_on_launch": true
     }
   ]
 }

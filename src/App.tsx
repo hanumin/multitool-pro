@@ -29,7 +29,8 @@ import LoadingScreen from './components/LoadingScreen'
 import { useToast } from './components/ToastManager'
 import { type LogColors, DEFAULT_LOG_COLORS } from './utils/logStyles'
 import { API, fetchWithRetry } from './utils/apiFetch'
-import { openAudioWidget, closeAudioWidget, toggleAudioWidget } from './utils/audioWidget'
+import { openAudioWidget, closeAudioWidget, toggleAudioWidget, subscribeAudioWidget } from './utils/audioWidget'
+import { invoke } from '@tauri-apps/api/core'
 
 type Theme = 'dark' | 'light'
 
@@ -141,6 +142,7 @@ function App() {
   const [settingsAnim, setSettingsAnim] = useState<'enter' | 'exit'>('enter')
   const [settingsRefresh, setSettingsRefresh] = useState(0)
   const [isMaximized, setIsMaximized] = useState(false)
+  const [shuttingDown, setShuttingDown] = useState(false)
   const [systemIps, setSystemIps] = useState<string[]>(['localhost', '127.0.0.1'])
   // WHY: Lưu tùy chọn màu sắc log. Merge với defaults để tránh thiếu key.
   const [logColors, setLogColors] = useState<LogColors>(() => {
@@ -246,6 +248,54 @@ function App() {
     }
   }, [])
 
+  // WHY: Lắng nghe lệnh từ tray_menu window qua event bus 'tray-command'.
+  // Thay cho eval() (không tồn tại trong Tauri v2) — tray emitTo('main','tray-command',...)
+  // rồi dispatch sang các global function đã đăng ký bên trên.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined
+    import('@tauri-apps/api/event').then(async ({ listen, emitTo }) => {
+      unlisten = await listen('tray-command', (event) => {
+        const { type, moduleId } = event.payload as { type: string; moduleId?: string }
+        switch (type) {
+          case 'navigate':
+            ;(window as any).__navigateModule?.(moduleId)
+            break
+          case 'settings':
+            ;(window as any).__openSettings?.()
+            break
+          case 'start-all':
+            ;(window as any).__startAll?.()
+            break
+          case 'stop-all':
+            ;(window as any).__stopAll?.()
+            break
+          case 'toggle-audio':
+            ;(window as any).__toggleAudioWidget?.()
+            break
+          case 'get-audio-state':
+            import('./utils/audioWidget').then(({ isAudioWidgetOpen }) => {
+              emitTo('tray_menu', 'audio-widget-state', { open: isAudioWidgetOpen() }).catch(() => {})
+            })
+            break
+        }
+      })
+    })
+    return () => { if (unlisten) unlisten() }
+  }, [])
+
+  // WHY: Đồng bộ trạng thái audio widget từ main window (nguồn sự thật duy nhất)
+  // về tray_menu — tray switch phải phản ánh đúng trạng thái thực của widget.
+  useEffect(() => {
+    const unsubscribe = subscribeAudioWidget((open) => {
+      import('@tauri-apps/api/event').then(({ emitTo }) => {
+        emitTo('tray_menu', 'audio-widget-state', { open }).catch(() => {})
+      })
+    })
+    return unsubscribe
+  }, [])
+
+
+
   // WHY: Fetch autostart + system IPs khi mount — song song (không cần await).
   // IPs dùng để hiển thị URLs trong bottom bar (localhost + LAN IPs).
   useEffect(() => {
@@ -343,12 +393,40 @@ function App() {
     } catch {}
   }
 
-  // WHY: POST /api/shutdown → backend kill all processes + tự tắt.
-  // innerHTML fallback hiển thị thông báo khi backend đã tắt (không còn React).
+  // WHY: Dừng toàn bộ — nút "Dừng tất cả" ở titlebar gọi hàm này.
+  // Flow: confirm → set_backend_watchdog(false) (chặn watchdog tự bật backend lại)
+  // → POST /api/shutdown (backend kill all processes + tự tắt) → hiển thị màn hình
+  // "Đã dừng" (innerHTML fallback vì backend đã tắt, không còn React hoạt động).
   const shutdown = async () => {
-    if (!window.confirm('Dừng dashboard và tất cả dự án?')) return
-    try { await fetchWithRetry(`${API}/api/shutdown`, { method: 'POST' }) } catch {}
-    document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:#030712;color:#9ca3af;font-family:sans-serif;font-size:14px">Dashboard đã dừng.</div>'
+    if (shuttingDown) return
+    if (!window.confirm('Dừng dashboard và tất cả dự án? Các dự án đang chạy sẽ bị đóng.')) return
+    setShuttingDown(true)
+    // WHY: Tắt watchdog backend TRƯỚC khi gọi /api/shutdown — nếu không, watchdog
+    // thấy backend chết → tự restart lại → user "dừng hẳn" nhưng backend tự bật lên
+    // (mâu thuẫn ý định). set_backend_watchdog(false) là Tauri command (không phụ
+    // thuộc backend), nên vẫn gọi được kể cả khi backend sắp tắt.
+    try { await invoke('set_backend_watchdog', { enabled: false }) } catch {}
+    try {
+      const res = await fetchWithRetry(`${API}/api/shutdown`, { method: 'POST' })
+      // WHY: Chỉ hiện màn hình "Đã dừng" khi backend xác nhận shutdown thành công.
+      // Nếu backend trả lỗi (4xx/5xx) mà vẫn sống → hiện toast lỗi + reset nút, tránh
+      // gây hiểu lầm "đã dừng" trong khi backend vẫn chạy (và watchdog đã bị tắt).
+      if (!res.ok) {
+        const errData = await res.json().catch(() => null)
+        setShuttingDown(false)
+        addToast({ type: 'error', title: '⏻ Dừng thất bại', message: (errData as any)?.error || `Backend trả lỗi ${res.status}` })
+        return
+      }
+    } catch {
+      // WHY: Backend đã tắt/không phản hồi → coi như shutdown thành công (backend
+      // chết là điều ta muốn). Vẫn hiện màn hình dừng.
+    }
+    document.body.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:#030712;font-family:system-ui,sans-serif;gap:16px">' +
+      '<div style="width:56px;height:56px;border-radius:50%;background:rgba(239,68,68,0.12);display:flex;align-items:center;justify-content:center;font-size:28px">⏻</div>' +
+      '<div style="font-size:18px;font-weight:600;color:#e2e8f0">Đã dừng tất cả</div>' +
+      '<div style="font-size:13px;color:#64748b;max-width:420px;text-align:center;line-height:1.6">Backend và mọi dự án đã được đóng. Đóng cửa sổ này và chạy lại MultiTool Pro để khởi động lại.</div>' +
+      '<div style="margin-top:8px;font-size:11px;color:#475569">— MultiTool Pro đã dừng —</div>' +
+      '</div>'
   }
 
   const activePort = 5050
@@ -396,6 +474,28 @@ function App() {
 
   // WHY: Thông báo welcome khi app khởi động xong.
   const { addToast } = useToast()  // WHY: Gửi Windows toast + in-app toast khi app sẵn sàng.
+
+  // WHY: Lắng nghe event 'backend-watchdog-restarted' từ Rust — watchdog tự restart
+  // backend sau khi phát hiện chết/treo. Hiện toast thông báo real-time (kèm giờ địa
+  // phương + số lần tự phục hồi) để user biết backend từng chết mà không cần mở log.
+  // Event emit từ thread watchdog (không phụ thuộc backend HTTP) nên vẫn nhận được
+  // kể cả khi backend vừa tắt.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined
+    import('@tauri-apps/api/event').then(async ({ listen }) => {
+      unlisten = await listen<{ unix_ms?: number; count?: number }>('backend-watchdog-restarted', (event) => {
+        const { unix_ms, count } = event.payload || {}
+        const time = unix_ms ? new Date(unix_ms).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' }) : ''
+        addToast({
+          type: 'warning',
+          title: '🔄 Backend đã được tự khởi động lại',
+          message: `Phát hiện backend không phản hồi, đã tự khởi động lại lúc ${time || '--:--'}${count ? ` (lần thứ ${count})` : ''}.`,
+          duration: 7000,
+        })
+      })
+    })
+    return () => { if (unlisten) unlisten() }
+  }, [addToast])
   // KHÔNG auto-restore widget ở đây — widget chỉ hiện khi mic bật + checkbox được chọn.
   useEffect(() => {
     if (appReady) {
@@ -441,6 +541,16 @@ function App() {
             </div>
           </div>
           <div className="titlebar-controls">
+            <button onClick={shutdown} disabled={shuttingDown} className="titlebar-btn titlebar-btn-shutdown" title={shuttingDown ? 'Đang dừng...' : 'Dừng tất cả dự án & backend'}>
+              {shuttingDown ? (
+                <span className="titlebar-shutdown-spinner" />
+              ) : (
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                  <path className="shutdown-power" d="M6 1.5v4M3.2 2.8a4 4 0 105.6 0" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+                </svg>
+              )}
+            </button>
+            <div className="titlebar-separator" />
             <button onClick={minimizeToTray} className="titlebar-btn titlebar-btn-tray" title="Thu gọn xuống khay">
               <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
                 <rect className="tray-bar" x="1" y="9.5" width="10" height="1.5" rx="0.75" fill="currentColor" />

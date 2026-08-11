@@ -46,8 +46,12 @@ export default defineConfig({
         },
       },
     },
-    // WHY: Bật CSS tree-shaking và minify nâng cao
-    cssCodeSplit: false,
+    // WHY: Bật CSS code-splitting — mỗi HTML entry (index/widget/tray) nhận CSS riêng.
+    // Trước đây cssCodeSplit:false gộp toàn bộ CSS của 3 window vào 1 file dùng chung
+    // → các rule toàn cục KHÔNG nằm trong @layer (vd *{margin:0;padding:0} trong
+    // src/tray/tray.css) thắng mọi utility spacing của Tailwind (nằm trong @layer utilities)
+    // trên app chính → label tab bị dính sát nhau.
+    cssCodeSplit: true,
     // WHY: target esnext cho modern Chromium (WebView2) — không cần transpile xuống ES5
     target: 'esnext',
     // WHY: Tăng giới hạn cảnh báo từ 500kB lên 1000kB — vendor chunks hợp lý có thể >500kB

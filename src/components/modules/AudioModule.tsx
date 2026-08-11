@@ -4,6 +4,7 @@ import { AudioDevice, MicStatus, type PreloadedData } from '../../types'
 import { API, fetchWithRetry } from '../../utils/apiFetch'
 import { useToast } from '../../components/ToastManager'
 import { openAudioWidget, toggleAudioWidget, isAudioWidgetOpen, subscribeAudioWidget } from '../../utils/audioWidget'
+import { invoke } from '@tauri-apps/api/core'
 
 
 interface AudioSession {
@@ -77,10 +78,37 @@ export default function AudioModule({ theme, setStatusText, inactive, background
   const [sessionHistory, setSessionHistory] = useState<AudioSession[]>([])
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
+  // WHY: Guard chống bấm nhiều lần nút set-default — request set-default có thể mất
+  // 1-5s (backend retry verify). Trước đây bấm liên tục → nhiều POST song song cùng
+  // thao tác COM trên thiết bị âm thanh → tranh chấp, treo, phải bấm lại nhiều lần.
+  const [settingDefaultId, setSettingDefaultId] = useState<string | null>(null)
+  // WHY: Ref đồng bộ với state — chặn double-click trong cùng 1 tick (React state
+  // cập nhật bất đồng bộ, 2 click rất nhanh có thể cùng đọc settingDefaultId=null).
+  const settingDefaultRef = useRef<string | null>(null)
   
   // Widget mode: sử dụng Tauri WebviewWindow (cửa sổ phụ) thay vì fixed div trong app
   const [widgetOpen, setWidgetOpen] = useState(false)
   const widgetOpenRef = useRef(false)
+
+  // WHY: Backend health status — hiển thị trong header để user biết backend có chạy không
+  const [backendStatus, setBackendStatus] = useState<'checking' | 'running' | 'stopped'>('checking')
+
+  // WHY: Kiểm tra backend health - gọi từ Tauri command
+  const checkBackendHealth = useCallback(async () => {
+    try {
+      const healthy = await invoke<boolean>('check_backend_health')
+      setBackendStatus(healthy ? 'running' : 'stopped')
+    } catch {
+      setBackendStatus('stopped')
+    }
+  }, [])
+
+  // WHY: Chạy health check khi mount và mỗi 30s
+  useEffect(() => {
+    checkBackendHealth()
+    const interval = setInterval(checkBackendHealth, 30000)
+    return () => clearInterval(interval)
+  }, [checkBackendHealth])
 
   // WHY: Tạo/mở cửa sổ widget âm thanh độc lập — DELEGATE cho shared manager.
   // QUAN TRỌNG: Không tự getByLabel + show() ở đây. Manager (src/utils/audioWidget.ts)
@@ -340,21 +368,55 @@ export default function AudioModule({ theme, setStatusText, inactive, background
   // Windows Core Audio thật, nên badge di chuyển chính xác sau khi đổi).
   // WHY: Hiện toast LỖI khi res không ok — trước đây nuốt lỗi âm thầm (user tưởng
   // "không đặt được" dù API có thể báo 404/500).
+  // WHY: Phân biệt rõ 2 loại lỗi:
+  //   - Backend trả 4xx/5xx: hiển thị đúng errData.error (backend có ghi [audio][ERROR]
+  //     vào debug.log → tab Nhật ký SẼ thấy dòng lỗi).
+  //   - Network error (fetch throw): backend không phản hồi (đang treo/khởi động lại) →
+  //     KHÔNG có log mới nào được ghi — hiện thông báo rõ ràng + gợi ý kiểm tra tab Nhật ký
+  //     / chờ watchdog tự restart, thay vì toast chung chung "Đặt thiết bị mặc định thất bại"
+  //     khiến user tưởng lỗi thiết bị.
+  // WHY: setDefaultDevice cần cổng COM riêng vì pycaw bất đồng bộ; lock ref chống
+  // double-click và verify lại sau khi set để toast chính xác.
   const setDefaultDevice = async (id: string) => {
+    // WHY: Nếu đang có request set-default khác in-flight → bỏ qua (chống double-click).
+    // Check cả state lẫn ref (ref đồng bộ ngay trong tick, không chờ React re-render).
+    if (settingDefaultRef.current !== null) return
     const dev = devices.find(d => d.id === id)
+    settingDefaultRef.current = id
+    setSettingDefaultId(id)
+    // WHY: Timeout 15s qua AbortController — set-default backend có thể mất tới ~5s
+    // (verify retry). Nếu backend kẹt (worker COM treo), fetch phải tự hủy sau 15s
+    // thay vì treo vô hạn → nút thoát khỏi trạng thái 'Đang đặt mặc định...'.
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 15000)
     try {
-      const res = await fetchWithRetry(`${API}/api/audio/devices/${encodeURIComponent(id)}/default`, { method: 'POST' })
+      // WHY: retries=0 — backend /default tự retry verify nội bộ (0.3→2.4s), retry
+      // phía frontend chỉ làm chồng request + kéo dài thời gian chờ vô ích.
+      const res = await fetchWithRetry(`${API}/api/audio/devices/${encodeURIComponent(id)}/default`, { method: 'POST', signal: controller.signal }, 0)
       if (res.ok) {
         setStatusText('Đã đặt mặc định'); fetchAll()
         addToast({ type: 'success', title: '🔊 Thiết bị âm thanh', message: 'Đã đặt làm mặc định' })
       } else {
         const errData = await res.json().catch(() => ({ error: 'Không thể đặt mặc định' }))
         setStatusText('Thất bại')
-        addToast({ type: 'error', title: '🔊 Lỗi', message: errData.error || 'Đặt thiết bị mặc định thất bại' })
+        // WHY: Lỗi từ backend — backend đã ghi [audio][ERROR] vào debug.log nên tab
+        // Nhật ký sẽ hiển thị chi tiết. Đính kèm gợi ý mở tab Nhật ký.
+        addToast({ type: 'error', title: '🔊 Lỗi', message: `${errData.error || 'Đặt thiết bị mặc định thất bại'} — xem tab Nhật ký` })
       }
-    } catch {
+    } catch (e: any) {
       setStatusText('Thất bại')
-      addToast({ type: 'error', title: '🔊 Lỗi', message: 'Đặt thiết bị mặc định thất bại' })
+      // WHY: Phân biệt timeout (abort) vs network error — nói rõ để user biết xử lý gì.
+      if (e?.name === 'AbortError') {
+        addToast({ type: 'error', title: '🔊 Lỗi', message: 'Đặt mặc định quá lâu (15s) — backend đang bận/treo. Chờ 20s rồi thử lại' })
+      } else {
+        // WHY: Network error — backend không phản hồi (đang treo/restart). Không có log
+        // mới nào được ghi. Nói rõ để user không nhầm lẫn với lỗi thiết bị.
+        addToast({ type: 'error', title: '🔊 Lỗi', message: 'Backend không phản hồi — đang treo/khởi động lại. Chờ 20s rồi thử lại' })
+      }
+    } finally {
+      clearTimeout(timer)
+      settingDefaultRef.current = null
+      setSettingDefaultId(null)
     }
   }
 
@@ -390,6 +452,17 @@ export default function AudioModule({ theme, setStatusText, inactive, background
     const normalized = path.replace(/[\\/]+$/, '')
     const parts = normalized.replace(/\\/g, '/').split('/')
     return parts[parts.length - 1] || path
+  }
+
+  // WHY: Rút gọn tên host API PortAudio cho hiển thị gọn ("Windows WASAPI" → "WASAPI",
+  // "MME" → "MME", "Windows DirectSound" → "DirectSound").
+  const monitorHostApi = (raw: string): string => {
+    if (!raw) return 'Unknown'
+    if (raw.includes('WASAPI')) return 'WASAPI'
+    if (raw.includes('DirectSound')) return 'DirectSound'
+    if (raw.includes('MME')) return 'MME'
+    if (raw.includes('WDM-KS')) return 'WDM-KS'
+    return raw
   }
 
   // WHY: Tách 2 nhóm thiết bị — Micro (đầu vào: mic/webcam/thiết bị ghi âm) và
@@ -445,10 +518,11 @@ export default function AudioModule({ theme, setStatusText, inactive, background
         </div>
       </div>
 
-      {/* Expanded Device Controls */}
+{/* Expanded Device Controls */}
       {selectedDevice === dev.id && (
-        <div className="border-t px-4 py-3.5 space-y-3.5 bg-slate-950/40 backdrop-blur-sm" style={{ borderColor: 'var(--border)' }}>
-          <div className="flex items-center gap-3">
+        <div className="border-t px-4 py-3.5 space-y-3.5 bg-slate-950/40 backdrop-blur-sm" style={{ borderColor: 'var(--border)' }}
+          onClick={e => e.stopPropagation()}>
+        <div className="flex items-center gap-3">
             <button onClick={() => toggleMute(dev.id)}
               className="px-3.5 py-2 text-xs font-semibold rounded-xl border transition-all active:scale-95 cursor-pointer flex items-center gap-1.5 shadow-sm"
               style={{
@@ -469,9 +543,15 @@ export default function AudioModule({ theme, setStatusText, inactive, background
           </div>
 
           {!dev.is_default && (
-            <button onClick={() => setDefaultDevice(dev.id)}
-              className="w-full py-2 text-xs font-bold bg-sky-500/15 hover:bg-sky-500/25 text-sky-400 border border-sky-500/30 rounded-xl transition-all active:scale-95 cursor-pointer">
-              🎯 Đặt {dev.name} làm thiết bị {dev.is_input ? 'Micro' : 'Loa'} mặc định
+            <button onClick={() => setDefaultDevice(dev.id)} disabled={settingDefaultId !== null}
+              className={`w-full py-2 text-xs font-bold rounded-xl transition-all border ${
+                settingDefaultId === dev.id
+                  ? 'bg-sky-500/25 text-sky-300 border-sky-500/40 cursor-wait animate-pulse'
+                  : 'bg-sky-500/15 hover:bg-sky-500/25 text-sky-400 border-sky-500/30 active:scale-95 cursor-pointer'
+              }`}>
+              {settingDefaultId === dev.id
+                ? '⏳ Đang đặt mặc định...'
+                : `🎯 Đặt ${dev.name} làm thiết bị ${dev.is_input ? 'Micro' : 'Loa'} mặc định`}
             </button>
           )}
         </div>
@@ -501,6 +581,16 @@ export default function AudioModule({ theme, setStatusText, inactive, background
           </div>
         </div>
         <div className="flex gap-2">
+          {/* Backend Status Indicator */}
+          <div className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-all"
+            style={{
+              backgroundColor: backendStatus === 'running' ? 'rgba(34,197,94,0.1)' : backendStatus === 'stopped' ? 'rgba(239,68,68,0.1)' : 'rgba(251,191,36,0.1)',
+              borderColor: backendStatus === 'running' ? 'rgba(34,197,94,0.3)' : backendStatus === 'stopped' ? 'rgba(239,68,68,0.3)' : 'rgba(251,191,36,0.3)',
+              color: backendStatus === 'running' ? '#22c55e' : backendStatus === 'stopped' ? '#ef4444' : '#fbbf24'
+            }}>
+            <span className={`w-1.5 h-1.5 rounded-full ${backendStatus === 'running' ? 'bg-emerald-500 animate-pulse' : backendStatus === 'stopped' ? 'bg-red-500' : 'bg-amber-500 animate-pulse'}`} />
+            <span>{backendStatus === 'running' ? 'Backend: Đang chạy' : backendStatus === 'stopped' ? 'Backend: Đã dừng' : 'Backend: Đang kiểm tra...'}</span>
+          </div>
           {onBackgroundPollingChange && (
             <button onClick={() => onBackgroundPollingChange(!backgroundPolling)}
               className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold rounded-xl border transition-all active:scale-95 cursor-pointer shadow-sm"
@@ -615,6 +705,18 @@ export default function AudioModule({ theme, setStatusText, inactive, background
                   <span className="text-[11px] text-slate-400 font-medium">Ứng dụng chiếm dụng:</span>                    <span className="font-semibold text-emerald-400 truncate max-w-[180px] text-right">
                     {getBasename(micStatus.app_using_mic) || 'Chưa nhận diện'}
                   </span>
+                </div>
+                {/* WHY: Hiển thị host API + sample rate monitor đang dùng — user biết widget
+                    VU meter đang đọc tín hiệu từ đâu (WASAPI 48000 / MME 44100...). */}
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] text-slate-400 font-medium">Kênh đo (VU):</span>
+                  {micStatus.monitor_info ? (
+                    <span className="font-semibold text-sky-400 truncate max-w-[180px] text-right">
+                      {monitorHostApi(micStatus.monitor_info.hostapi)} {micStatus.monitor_info.samplerate} Hz
+                    </span>
+                  ) : (
+                    <span className="text-slate-500 text-right italic">Chưa kích hoạt</span>
+                  )}
                 </div>
               </div>
             ) : (

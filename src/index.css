@@ -181,6 +181,45 @@
   color: white !important;
 }
 
+/* WHY: Nút "Dừng tất cả" — icon power, hover đỏ để phân biệt rõ đây là nút nguy hiểm.
+   Dùng red 500 (#ef4444) nhẹ hơn close (#e81123) — dừng app khác với đóng window. */
+.titlebar-btn-shutdown {
+  color: var(--fg-secondary);
+}
+
+.titlebar-btn-shutdown:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.14) !important;
+  color: #ef4444 !important;
+}
+
+.titlebar-btn-shutdown:hover .shutdown-power {
+  transform: rotate(90deg);
+  transition: transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.titlebar-btn-shutdown:not(:hover) .shutdown-power {
+  transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.titlebar-btn-shutdown:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* Spinner nhỏ khi đang dừng (thay icon power) */
+.titlebar-shutdown-spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid rgba(239, 68, 68, 0.3);
+  border-top-color: #ef4444;
+  animation: titlebar-spin 0.7s linear infinite;
+}
+
+@keyframes titlebar-spin {
+  to { transform: rotate(360deg); }
+}
+
 /* WHY: Title bar button icon animations — hover effects tinh tế, đồng bộ timing. */
 /* Minimize-to-tray: arrow trượt xuống + tray bar glow */
 .titlebar-btn-tray:hover .tray-arrow {
@@ -433,8 +472,13 @@ body {
   transition: background-color 0.2s, color 0.2s;
 }
 
-* {
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+/* WHY: Bọc *{font-family} trong @layer base để Tailwind font utilities (font-mono,
+   font-sans — nằm trong @layer utilities) THẮNG được rule này. Trước đây rule unlayered
+   ghi đè mọi font-mono trong app → log/code không hiển thị font mono. */
+@layer base {
+  * {
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  }
 }
 
 ::selection {

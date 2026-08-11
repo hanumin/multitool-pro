@@ -43,6 +43,13 @@ export interface AudioDevice {
   muted: boolean
 }
 
+export interface MicMonitorInfo {
+  hostapi: string
+  samplerate: number
+  device_index: number
+  device_name: string
+}
+
 export interface MicStatus {
   active: boolean
   app_using_mic: string
@@ -52,6 +59,7 @@ export interface MicStatus {
   available_mics: AvailableMic[]
   mic_count: number
   duration: number
+  monitor_info?: MicMonitorInfo | null
 }
 
 export interface AvailableMic {
@@ -71,6 +79,8 @@ export interface PreloadedProject {
   port: number
   path: string
   command?: string
+  type?: 'node' | 'custom'
+  process_name?: string
   running: boolean
 }
 

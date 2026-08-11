@@ -1,26 +1,35 @@
 @import "tailwindcss";
 
-:root {
-  font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
-  color-scheme: dark;
+@theme {
+  --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
 }
 
-* {
-  margin: 0;
-  padding: 0;
-  box-sizing: border-box;
-}
+/* WHY: Các reset toàn cục bọc trong @layer base để Tailwind utilities (nằm trong
+   @layer utilities, khai báo sau base) THẮNG được chúng. Trước đây các rule này
+   không nằm trong layer nào → unlayered CSS thắng mọi utility → pb-2.5/mb-2.5/... 
+   bị triệt tiêu → title và nút "Mở Dashboard" dính sát nhau. */
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
 
-html, body, #tray-root {
-  width: 100%;
-  height: 100%;
-  margin: 0;
-  padding: 0;
-  overflow: hidden;
-  background: transparent;
-  user-select: none;
-  -webkit-user-select: none;
-  font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  html, body, #tray-root {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background: transparent;
+    user-select: none;
+    -webkit-user-select: none;
+    font-family: var(--font-sans);
+  }
 }
 
 /* Windows 11 Fluent UI / Acrylic Glassmorphism container */

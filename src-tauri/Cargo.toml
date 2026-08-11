@@ -1,6 +1,6 @@
 [package]
 name = "multitool-pro"
-version = "1.10.0"
+version = "1.11.4"
 description = "MultiTool Pro - All-in-one utility"
 authors = ["you"]
 edition = "2021"
@@ -41,3 +41,7 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-positioner = { version = "2.0", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+# WHY: Timestamp local cho header debug.log — SystemTime (UTC) lệch giờ với backend
+# (datetime.now() local +7). chrono là transitive dep của tauri, thêm trực tiếp để dùng.
+chrono = "0.4"

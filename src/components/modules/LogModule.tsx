@@ -3,6 +3,7 @@ import { getLineStyle, type LogColors } from '../../utils/logStyles'
 import { API, fetchWithRetry } from '../../utils/apiFetch'
 import { useToast } from '../../components/ToastManager'
 import type { PreloadedData } from '../../types'
+import { invoke } from '@tauri-apps/api/core'
 
 interface LogModuleProps {
   theme: 'dark' | 'light'
@@ -37,14 +38,60 @@ export default function LogModule({ theme, setStatusText, inactive, backgroundPo
   const [clearing, setClearing] = useState(false)
   const [connectionError, setConnectionError] = useState(false)
   const connectionErrorRef = useRef(false)
+  // WHY: Xem log phiên trước (debug.log.old) — toggle giữa log hiện tại và log cũ
+  // để so sánh lỗi mà không phải mò file. Khi đang xem log cũ: tắt auto-refresh
+  // (file .old không đổi) + khóa nút Xóa tránh thao tác nhầm lên log mới.
+  const [viewingOld, setViewingOld] = useState(false)
+  const [loadingOld, setLoadingOld] = useState(false)
+  
+  // WHY: Backend health status — kiểm tra định kỳ để hiển thị trạng thái backend
+  const [backendStatus, setBackendStatus] = useState<'checking' | 'running' | 'stopped'>('checking')
+  const [restarting, setRestarting] = useState(false)
+
+  // WHY: Kiểm tra backend health - gọi từ Tauri command
+  const checkBackendHealth = useCallback(async () => {
+    try {
+      const healthy = await invoke<boolean>('check_backend_health')
+      setBackendStatus(healthy ? 'running' : 'stopped')
+    } catch {
+      setBackendStatus('stopped')
+    }
+  }, [])
+
+  // WHY: Khởi động lại backend qua Tauri command
+  const handleRestartBackend = useCallback(async () => {
+    setRestarting(true)
+    try {
+      await invoke<string>('restart_backend')
+      addToast({ type: 'success', title: '🔄 Backend', message: 'Đã khởi động lại backend thành công' })
+      // Đợi 2s rồi check lại
+      setTimeout(() => checkBackendHealth(), 2000)
+    } catch (e: any) {
+      addToast({ type: 'error', title: '🔄 Backend', message: e?.message || 'Không thể khởi động lại backend' })
+    } finally {
+      setRestarting(false)
+    }
+  }, [addToast, checkBackendHealth])
+
+  // WHY: Chạy health check khi mount và mỗi 30s
+  useEffect(() => {
+    checkBackendHealth()
+    const interval = setInterval(checkBackendHealth, 30000)
+    return () => clearInterval(interval)
+  }, [checkBackendHealth])
 
   // WHY: Dùng useRef thay vì state để so sánh log thay đổi — tránh reset interval mỗi lần re-render.
   // Khởi tạo với preloaded log content để fetchLog đầu tiên so sánh đúng, tránh re-render trùng lặp.
   // fetchLog ổn định (không phụ thuộc state), interval không bị clear/recreate liên tục.
   const lastLogRef = useRef(preloadedLogStr)
+  // WHY: Ref phản chiếu viewingOld — fetchLog là useCallback([]) (stale closure) nên không
+  // thấy state viewingOld. Khi user bấm refresh thủ công trong lúc xem log cũ, fetchLog
+  // phải lấy đúng nguồn đang xem (debug-log/old) thay vì ghi đè bằng log hiện tại.
+  const viewingOldRef = useRef(false)
   const fetchLog = useCallback(async () => {
     try {
-      const res = await fetchWithRetry(`${API}/api/debug-log`)
+      const src = viewingOldRef.current ? `${API}/api/debug-log/old` : `${API}/api/debug-log`
+      const res = await fetchWithRetry(src)
       if (res.ok) {
         const data = await res.json()
         const newLog = data.log || ''
@@ -142,6 +189,48 @@ export default function LogModule({ theme, setStatusText, inactive, backgroundPo
       addToast({ type: 'error', title: '🔌 Mất kết nối', message: 'Không thể kết nối tới backend' })
     }
     finally { setClearing(false) }
+  }
+
+  // WHY: Toggle xem log phiên trước (debug.log.old). Bấm lần 1 → tải log cũ,
+  // bấm lại → quay về log hiện tại. Khi đang xem log cũ thì tắt auto-refresh
+  // (file .old không thay đổi) để tránh fetch log mới chèn vào giữa chừng.
+  const toggleOldLog = async () => {
+    if (viewingOld) {
+      // Quay về log hiện tại
+      viewingOldRef.current = false
+      setViewingOld(false)
+      setAutoRefresh(true)
+      fetchLog()
+      setStatusText('🗂 Đang xem log hiện tại')
+      return
+    }
+    setLoadingOld(true)
+    try {
+      const res = await fetchWithRetry(`${API}/api/debug-log/old`)
+      if (res.ok) {
+        const data = await res.json()
+        if (data.exists) {
+          const oldLog = data.log || ''
+          lastLogRef.current = oldLog
+          setLines(oldLog.split('\n').filter((l: string) => l.trim()))
+          viewingOldRef.current = true
+          setViewingOld(true)
+          setAutoRefresh(false)
+          setSearchQuery('')
+          setFilterLevel('all')
+          setStatusText('🗂 Đang xem log phiên trước')
+        } else {
+          addToast({ type: 'info', title: '🗂 Log phiên trước', message: 'Chưa có log phiên trước (phiên đầu tiên)' })
+        }
+      } else {
+        const errData = await res.json().catch(() => ({ error: 'Lỗi không xác định' }))
+        addToast({ type: 'error', title: '🗂 Không tải được log cũ', message: errData.error })
+      }
+    } catch {
+      addToast({ type: 'error', title: '🔌 Mất kết nối', message: 'Không thể kết nối tới backend' })
+    } finally {
+      setLoadingOld(false)
+    }
   }
 
   // WHY: Copy log ra clipboard — format gọn gàng, kèm toast xác nhận + số dòng
@@ -404,12 +493,47 @@ export default function LogModule({ theme, setStatusText, inactive, backgroundPo
             </svg>
           </button>
 
+          {/* Xem log phiên trước (debug.log.old) */}
+          <button onClick={toggleOldLog} disabled={loadingOld}
+            className={`px-2 py-1 text-[8px] font-semibold rounded border transition-all active:scale-95 cursor-pointer disabled:opacity-50 ${
+              viewingOld ? 'ring-1 ring-amber-400/50' : 'hover:bg-amber-500/10'
+            }`}
+            style={{
+              backgroundColor: viewingOld ? 'rgba(245,158,11,0.15)' : 'var(--input-bg)',
+              borderColor: viewingOld ? 'rgba(245,158,11,0.5)' : 'rgba(245,158,11,0.3)',
+              color: viewingOld ? '#fbbf24' : '#f59e0b',
+            }}
+            title={viewingOld ? 'Quay về log hiện tại' : 'Xem log phiên trước (debug.log.old)'}>
+            {loadingOld ? '⏳' : viewingOld ? '🗂 Log hiện tại' : '🗂 Log trước'}
+          </button>
+
           {/* Clear */}
-          <button onClick={clearLog} disabled={clearing}
+          <button onClick={clearLog} disabled={clearing || viewingOld}
             className="px-2 py-1 text-[8px] font-semibold rounded border transition-all active:scale-95 cursor-pointer disabled:opacity-30 hover:bg-red-500/10"
-            style={{ backgroundColor: 'var(--input-bg)', borderColor: 'rgba(239,68,68,0.3)', color: '#ef4444' }}>
+            style={{ backgroundColor: 'var(--input-bg)', borderColor: 'rgba(239,68,68,0.3)', color: '#ef4444' }}
+            title={viewingOld ? 'Đang xem log phiên trước — không thể xóa' : 'Xóa log hiện tại'}>
             {clearing ? '...' : '🗑 Xóa'}
           </button>
+
+          {/* Backend Status & Restart */}
+          <div className="flex items-center gap-1.5">
+            <div className="flex items-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded-lg border transition-all"
+              style={{
+                backgroundColor: backendStatus === 'running' ? 'rgba(34,197,94,0.1)' : backendStatus === 'stopped' ? 'rgba(239,68,68,0.1)' : 'rgba(251,191,36,0.1)',
+                borderColor: backendStatus === 'running' ? 'rgba(34,197,94,0.3)' : backendStatus === 'stopped' ? 'rgba(239,68,68,0.3)' : 'rgba(251,191,36,0.3)',
+                color: backendStatus === 'running' ? '#22c55e' : backendStatus === 'stopped' ? '#ef4444' : '#fbbf24'
+              }}>
+              <span className={`w-1.5 h-1.5 rounded-full ${backendStatus === 'running' ? 'bg-emerald-500 animate-pulse' : backendStatus === 'stopped' ? 'bg-red-500' : 'bg-amber-500 animate-pulse'}`} />
+              <span>{backendStatus === 'running' ? 'Backend: Đang chạy' : backendStatus === 'stopped' ? 'Backend: Đã dừng' : 'Backend: Đang kiểm tra...'}</span>
+            </div>
+            {backendStatus === 'stopped' && (
+              <button onClick={handleRestartBackend} disabled={restarting}
+                className="px-2 py-1 text-[8px] font-semibold rounded border transition-all active:scale-95 cursor-pointer disabled:opacity-50 hover:bg-emerald-500/10"
+                style={{ backgroundColor: 'var(--input-bg)', borderColor: 'rgba(34,197,94,0.3)', color: '#22c55e' }}>
+                {restarting ? '⏳' : '🔄 Khởi động lại'}
+              </button>
+            )}
+          </div>
         </div>
       </div>
 
@@ -422,11 +546,21 @@ export default function LogModule({ theme, setStatusText, inactive, backgroundPo
               <div className="text-2xl" style={{ color: 'var(--fg-dim)' }}>📋</div>
               {lines.length === 0 ? (
                 <>
-                  <p className="text-[12px] font-medium" style={{ color: 'var(--fg-dim)' }}>Chưa có log nào</p>
-                  <p className="text-[10px]" style={{ color: 'var(--fg-muted)' }}>
-                    Log được ghi khi backend xử lý các tác vụ
+                  <p className="text-[12px] font-medium" style={{ color: 'var(--fg-dim)' }}>
+                    {backendStatus === 'stopped' ? 'Backend chưa chạy' : 'Chưa có log nào'}
                   </p>
-                  {!autoRefresh && (
+                  <p className="text-[10px]" style={{ color: 'var(--fg-muted)' }}>
+                    {backendStatus === 'stopped' 
+                      ? 'Khởi động backend để bắt đầu ghi log. Nhấn nút "🔄 Khởi động lại" ở góc trên bên phải.'
+                      : 'Log được ghi khi backend xử lý các tác vụ'}
+                  </p>
+                  {backendStatus === 'stopped' && (
+                    <button onClick={handleRestartBackend} disabled={restarting}
+                      className="mt-2 px-3 py-1 text-xs font-medium rounded-lg bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/25 border-0 cursor-pointer transition-all disabled:opacity-50">
+                      {restarting ? '⏳ Đang khởi động...' : '🔄 Khởi động Backend'}
+                    </button>
+                  )}
+                  {!autoRefresh && backendStatus !== 'stopped' && (
                     <button onClick={() => setAutoRefresh(true)}
                       className="mt-2 px-3 py-1 text-xs font-medium rounded-lg bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/25 border-0 cursor-pointer transition-all">
                       Bật tự động refresh

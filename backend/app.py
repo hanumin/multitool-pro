@@ -1,4 +1,4 @@
-import json, os, subprocess, sys, time, threading, signal, shutil, re
+import json, os, subprocess, sys, time, threading, signal, shutil, re, contextlib, queue, gc
 import psutil
 import pythoncom
 from pathlib import Path
@@ -305,6 +305,43 @@ def _is_port_running_for_dev(port):
     _port_listen_cache[port] = (result, now)
     return result
 
+# WHY: Kiểm tra port của 1 project đang bị chiếm bởi process phù hợp (theo loại).
+# - type="node": dùng whitelist dev server cũ (node.exe, npm.exe...).
+# - type="custom" + process_name: chỉ công nhận process có tên khớp (vd "node",
+#   "python", "buzz-fwd.exe") đang LISTEN — tránh false positive từ app khác.
+# - custom không có process_name: fallback về whitelist (buzz-fwd chạy bằng node.exe).
+# Cache 2s riêng (chỉ custom) để không đụng cache chung whitelist.
+_custom_port_listen_cache = {}  # (port, pname) -> (running: bool, timestamp)
+
+# WHY: Tách riêng kiểm tra port cho từng project — custom type dùng process_name
+# (node.exe) còn dev type dùng whitelist process dev server để tránh kill nhầm.
+def _is_project_port_busy(proj):
+    """Trả về True nếu port của project đang bị process phù hợp với loại project chiếm."""
+    port = proj.get("port")
+    if not port:
+        return False
+    pname = None
+    if proj.get("type") == "custom" and proj.get("process_name"):
+        pname = proj["process_name"].lower()
+    if not pname:
+        return _is_port_running_for_dev(port)
+    now = time.time()
+    key = (port, pname)
+    hit = _custom_port_listen_cache.get(key)
+    if hit and now - hit[1] < 2.0:
+        return hit[0]
+    result = False
+    for pid in _pids_listening_on_port(port):
+        try:
+            name = psutil.Process(pid).name().lower()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        if pname in name:
+            result = True
+            break
+    _custom_port_listen_cache[key] = (result, now)
+    return result
+
 # WHY: Kiểm tra process còn sống bằng poll() — không dùng returncode vì process có thể vừa chết.
 # Thread-safe: process sẽ chạy trong processes dict.
 # FIX: Trước đây chỉ check processes dict → server chạy ngoài app (hoặc backend restart,
@@ -318,7 +355,7 @@ def is_running(name):
     proj = get_project(name)
     if proj is not None:
         try:
-            if _is_port_running_for_dev(proj.get("port")):
+            if _is_project_port_busy(proj):
                 return True
         except Exception:
             pass
@@ -342,6 +379,8 @@ def api_projects():
             "name": p["name"],
             "port": p["port"],
             "path": p["path"],
+            "type": p.get("type", "node"),
+            "process_name": p.get("process_name"),
             "running": is_running(p["name"]),
         })
     return jsonify(results)
@@ -359,32 +398,39 @@ def _start_project(proj):
     # Chỉ dọn khi project chưa chạy (kill_process_on_port sau is_running) để không
     # vô tình giết project đang chạy (trên Windows, child node.exe bị kill nhưng
     # parent cmd.exe vẫn sống → is_running() trả về True nhưng server thực tế đã chết).
-    kill_process_on_port(proj["port"])
+    # Custom command có thể không có port (vd: tool không bind cổng nào) → bỏ qua.
+    port = proj.get("port")
+    if port:
+        kill_process_on_port(port)
     
-    # WHY: Nếu node_modules không tồn tại, KHÔNG start luôn mà báo để user chờ
-    node_modules = Path(proj["path"]) / "node_modules"
-    if not node_modules.exists():
-        # WHY: Chạy npm install đồng bộ (blocking) để tránh race condition.
-        # Mặc dù block API, nhưng đây là thao tác 1 lần duy nhất.
-        # User sẽ thấy loading trên UI và log npm install trong tab log.
-        lf = get_log_file(proj)
-        if lf.exists():
-            _safe_unlink_log(lf)
-        debug_log(f"npm install started for {name}...")
-        install_proc = subprocess.Popen(
-            ["npm", "install"],
-            cwd=proj["path"],
-            stdout=open(lf, "w", encoding="utf-8"),
-            stderr=subprocess.STDOUT,
-            shell=True,
-            startupinfo=get_startupinfo(),
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
-        install_proc.wait()  # CHỜ đến khi npm install xong
-        debug_log(f"npm install completed for {name}")
-        # Kiểm tra lại sau khi install
+    # WHY: Với type="custom" (lệnh tùy chỉnh như buzz-fwd), KHÔNG kiểm tra node_modules
+    # hay chạy npm install — không phải project Node.js. Node type giữ nguyên hành vi cũ.
+    if proj.get("type") != "custom":
+        if not Path(proj["path"]).exists():
+            return {"name": name, "status": "error", "error": "Không tìm thấy thư mục"}
+        node_modules = Path(proj["path"]) / "node_modules"
         if not node_modules.exists():
-            return {"name": name, "status": "error", "error": "npm install failed"}
+            # WHY: Chạy npm install đồng bộ (blocking) để tránh race condition.
+            # Mặc dù block API, nhưng đây là thao tác 1 lần duy nhất.
+            # User sẽ thấy loading trên UI và log npm install trong tab log.
+            lf = get_log_file(proj)
+            if lf.exists():
+                _safe_unlink_log(lf)
+            debug_log(f"npm install started for {name}...")
+            install_proc = subprocess.Popen(
+                ["npm", "install"],
+                cwd=proj["path"],
+                stdout=open(lf, "w", encoding="utf-8"),
+                stderr=subprocess.STDOUT,
+                shell=True,
+                startupinfo=get_startupinfo(),
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+            install_proc.wait()  # CHỜ đến khi npm install xong
+            debug_log(f"npm install completed for {name}")
+            # Kiểm tra lại sau khi install
+            if not node_modules.exists():
+                return {"name": name, "status": "error", "error": "npm install failed"}
     
     lf = get_log_file(proj)
     if lf.exists():
@@ -393,7 +439,7 @@ def _start_project(proj):
     log_data[name] = []
     log_positions[name] = 0
     
-    cmd_str = proj.get("command", "npm run dev").replace("{port}", str(proj["port"]))
+    cmd_str = proj.get("command", "npm run dev").replace("{port}", str(proj.get("port") or ""))
     try:
         p = subprocess.Popen(
             cmd_str, cwd=proj["path"],
@@ -408,6 +454,22 @@ def _start_project(proj):
     except Exception as e:
         return {"name": name, "status": "error", "error": str(e)}
 
+# WHY: Khi dừng project, tunnel trỏ về localhost:port của project trở nên vô dụng.
+# Tự dừng tunnel kèm project để tránh cloudflared sống đối diện origin chết —
+# nguồn gốc flood lỗi "Unable to reach the origin service" trong debug.log.
+def _stop_tunnel_for_project(name):
+    """Dừng tunnel của project (nếu có) khi project bị dừng."""
+    try:
+        with _tunnel_lock:
+            has_tunnel = (name in _tunnel_processes
+                          or name in _tunnel_urls
+                          or _tunnel_status.get(name) not in (None, "stopped"))
+        if has_tunnel:
+            debug_log(f"[tunnel] Auto-stopping tunnel for {name} (project stopped)")
+            _stop_tunnel_process(name)
+    except Exception as e:
+        debug_log(f"[tunnel] Auto-stop tunnel error for {name}: {e}")
+
 @app.route("/api/projects/start-all", methods=["POST"])
 # WHY: Gọi _start_project() cho từng project — không Promise.all vì dependencies có thể conflict.
 # Trả về danh sách kết quả để UI hiển thị chi tiết.
@@ -421,6 +483,7 @@ def api_start_all():
 @app.route("/api/projects/stop-all", methods=["POST"])
 # WHY: Dùng terminate() (graceful) trước, nếu timeout 5s mới kill (force).
 # kill_process_on_port() sau khi stop để dọn port (tránh conflict khi start lại).
+# _stop_tunnel_for_project() để tunnel không sống đối diện origin chết.
 def api_stop_all():
     """Stop tất cả dự án"""
     results = []
@@ -441,6 +504,7 @@ def api_stop_all():
                 results.append({"name": name, "status": "stopped"})
             else:
                 results.append({"name": p["name"], "status": "not_running"})
+            _stop_tunnel_for_project(p["name"])
         except Exception as e:
             results.append({"name": p["name"], "status": "error", "error": str(e)})
     return jsonify({"results": results, "count": len(results)})
@@ -464,11 +528,13 @@ def api_start(name):
 @app.route("/api/projects/<name>/stop", methods=["POST"])
 # WHY: terminate() + wait(timeout=5) + kill() fallback = 3-step graceful shutdown.
 # kill_process_on_port() để dọn port ngay cả khi process không kill được.
+# _stop_tunnel_for_project() để tunnel không sống đối diện origin chết.
 def api_stop(name):
     proj = get_project(name)
     if not proj:
         return jsonify({"error": "Không tìm thấy"}), 404
     if not is_running(name):
+        _stop_tunnel_for_project(name)
         return jsonify({"error": "Không đang chạy"}), 409
 
     with lock:
@@ -482,6 +548,7 @@ def api_stop(name):
             processes.pop(name, None)
 
     kill_process_on_port(proj["port"])
+    _stop_tunnel_for_project(name)
 
     return jsonify({"status": "stopped", "name": name})
 
@@ -700,18 +767,26 @@ def api_get_config():
     return jsonify(config)
 
 @app.route("/api/config/projects", methods=["POST"])
-# WHY: POST create. Validate name + path required. Check duplicate name trước khi save.
-# Port auto-assign nếu không được cung cấp (4000 + len(projects)).
+# WHY: POST create. Validate name required; path bắt buộc chỉ với type="node".
+# type="custom" cho phép lệnh tùy chỉnh (không cần thư mục project/node_modules).
+# Check duplicate name trước khi save.
 def api_add_project():
     data = request.get_json()
-    if not data or not data.get("name") or not data.get("path"):
-        return jsonify({"error": "Yêu cầu tên và đường dẫn"}), 400
+    if not data or not data.get("name"):
+        return jsonify({"error": "Yêu cầu tên"}), 400
     name = data["name"]
     if get_project(name):
         return jsonify({"error": "Dự án đã tồn tại"}), 409
+    ptype = data.get("type", "node")
+    if ptype not in ("node", "custom"):
+        ptype = "node"
+    if ptype == "node" and not data.get("path"):
+        return jsonify({"error": "Yêu cầu tên và đường dẫn"}), 400
     port = data.get("port", 4000 + len(config["projects"]))
-    command = data.get("command", "npm run dev")
-    new_proj = {"name": name, "path": data["path"], "command": command, "port": port}
+    command = data.get("command", "npm run dev" if ptype == "node" else "")
+    new_proj = {"name": name, "type": ptype, "path": data.get("path", ""), "command": command, "port": port}
+    if data.get("process_name"):
+        new_proj["process_name"] = data["process_name"]
     if "start_on_launch" in data:
         new_proj["start_on_launch"] = bool(data["start_on_launch"])
     config["projects"].append(new_proj)
@@ -772,11 +847,15 @@ def api_detected_projects():
             try:
                 proc = psutil.Process(conn.pid)
                 name = proc.name().lower()
+                cmdline = proc.cmdline()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
+                # WHY: Process có thể chết giữa name() và cmdline() — bỏ qua thay vì
+                # hủy cả scan (trước đây lỗi NoSuchProcess văng ra ngoài try → catch ở
+                # hàm cha → log "api_detected_projects error" và KHÔNG trả detected nào).
                 continue
             if not any(w in name for w in DEV_SERVER_WHITELIST):
                 continue
-            guess = _guess_project_from_cmdline(proc.cmdline())
+            guess = _guess_project_from_cmdline(cmdline)
             detected.append({
                 "port": port,
                 "pid": conn.pid,
@@ -808,7 +887,7 @@ def api_update_project(name):
         proj["name"] = data["name"]
         if old_name in processes:
             processes[data["name"]] = processes.pop(old_name)
-    for k in ("path", "command", "port", "start_on_launch"):
+    for k in ("path", "command", "port", "start_on_launch", "type", "process_name"):
         if k in data:
             proj[k] = data[k]
     save_config()
@@ -834,6 +913,7 @@ def api_delete_project(name):
                 processes.pop(name, None)
         # WHY: Dùng psutil để kill process an toàn trên port
         kill_process_on_port(proj["port"])
+    _stop_tunnel_for_project(name)
     config["projects"] = [p for p in config["projects"] if p["name"] != name]
     save_config()
     _bump_config_version()
@@ -1157,6 +1237,7 @@ def api_project_clean(name):
                 processes.pop(name, None)
         # WHY: Dùng psutil để kill process an toàn trên port
         kill_process_on_port(proj["port"])
+        _stop_tunnel_for_project(name)
             
     proj_path = Path(proj["path"])
     removed = []
@@ -1926,9 +2007,18 @@ def _launch_tunnel_process(project_name, port):
             _tunnel_processes[project_name] = proc
         
         def _reader(process, pname):
+            # WHY: Throttle log — cloudflared lặp lại cùng 1 dòng lỗi hàng trăm lần khi
+            # origin down ("Unable to reach the origin service"). Chỉ log dòng đầu tiên,
+            # sau đó log lại sau 60s nếu dòng giống hệt vẫn còn — tránh flood debug.log.
+            last_log = None  # (line, timestamp)
             try:
                 for line in process.stderr:
-                    debug_log(f"[tunnel-{pname}] {line.strip()[:200]}")
+                    stripped = line.strip()
+                    now = time.time()
+                    if last_log and stripped == last_log[0] and (now - last_log[1]) < 60:
+                        continue
+                    last_log = (stripped, now)
+                    debug_log(f"[tunnel-{pname}] {stripped[:200]}")
                     match = re.search(r'https://[a-zA-Z0-9_-]+\.trycloudflare\.com', line)
                     if match:
                         url = match.group(0)
@@ -1950,8 +2040,15 @@ def _launch_tunnel_process(project_name, port):
                     # trong _request_history_worker thay vì parse stderr (cloudflared 2026.7 không còn log HTTP request lines)
                     if "error" in line.lower() or "failed" in line.lower():
                         with _tunnel_lock:
-                            _tunnel_errors[pname] = line.strip()
-                            _tunnel_status[pname] = "error"
+                            # WHY: Lỗi "Unable to reach the origin service" = origin (dev server)
+                            # đang down — KHÔNG phải lỗi tunnel. Tunnel vẫn kết nối Cloudflare OK,
+                            # chỉ origin không phản hồi. KHÔNG hạ status xuống "error" (trước đây
+                            # tunnel active bị đánh dấu LỖI đỏ vĩnh viễn + nút "Thử lại" vô nghĩa
+                            # vì retry tunnel không cứu được origin đang tắt). Chỉ đánh dấu error
+                            # khi tunnel CHƯA có URL (chưa kết nối được Cloudflare).
+                            _tunnel_errors[pname] = stripped
+                            if pname not in _tunnel_urls:
+                                _tunnel_status[pname] = "error"
                 process.wait()
                 with _tunnel_lock:
                     if _tunnel_processes.get(pname) == process:
@@ -5710,7 +5807,9 @@ def _audio_default_endpoint_id(devEnum, flow_code):
     except Exception:
         return None
 
-# WHY: Helper — tìm AudioDevice pycaw theo id chuỗi, không nhập nhằng tên/index.
+# WHY: Helper — tìm AudioDevice pycaw theo id chuỗi (GUID), không nhập nhằng tên/index.
+# CHỈ GỌI TỪ dedicated COM thread (worker) — trả comtypes object, KHÔNG được đưa xuyên
+# thread ra khỏi worker (cross-apartment → crash _ctypes.pyd).
 def _find_pycaw_device(dev_id):
     """Tìm thiết bị pycaw theo id chuỗi (GUID) — nhanh, không nhập nhằng tên."""
     from pycaw.pycaw import AudioUtilities
@@ -5719,54 +5818,61 @@ def _find_pycaw_device(dev_id):
             return py_dev
     return None
 
+# WHY: Helper — chạy trên COM thread, trả về (dev_id, name, is_input, volume, muted) plain data.
+# KHÔNG trả comtypes object xuyên thread (object gắn apartment worker thread).
+def _list_devices_worker():
+    """Liệt kê thiết bị âm thanh trên COM thread — trả list dict plain (an toàn xuyên thread)."""
+    from pycaw.pycaw import AudioUtilities, IMMDeviceEnumerator
+    from pycaw.constants import AudioDeviceState, EDataFlow
+    from pycaw.utils import CLSID_MMDeviceEnumerator
+    from comtypes import CoCreateInstance, CLSCTX_INPROC_SERVER
+
+    devEnum = CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, CLSCTX_INPROC_SERVER)
+    default_capture_id = _audio_default_endpoint_id(devEnum, EDataFlow.eCapture.value)
+    default_render_id = _audio_default_endpoint_id(devEnum, EDataFlow.eRender.value)
+
+    devices = []
+    seen = set()
+    for py_dev in AudioUtilities.GetAllDevices():
+        if py_dev.state != AudioDeviceState.Active:
+            continue
+        dev_id = py_dev.id
+        if dev_id in seen:
+            continue
+        seen.add(dev_id)
+        try:
+            flow_code = AudioUtilities.GetEndpointDataFlow(dev_id, outputType=1)
+        except Exception:
+            flow_code = EDataFlow.eAll.value
+        is_input = (flow_code == EDataFlow.eCapture.value)
+        volume = 50
+        muted = False
+        try:
+            vol_obj = py_dev.EndpointVolume
+            volume = round(vol_obj.GetMasterVolumeLevelScalar() * 100)
+            muted = bool(vol_obj.GetMute())
+        except Exception:
+            pass
+        devices.append({
+            'id': dev_id,
+            'name': str(py_dev.FriendlyName or 'Không tên'),
+            'is_input': is_input,
+            'is_output': not is_input,
+            'is_default': (dev_id == default_capture_id) if is_input else (dev_id == default_render_id),
+            'volume': volume,
+            'muted': muted,
+        })
+    devices.sort(key=lambda d: (d['is_input'], d['name'].lower()))
+    return devices
+
 @app.route("/api/audio/devices")
 # WHY: Route chính audio v2 — xem block WHY lớn phía trên @app.route.
+# WHY: Toàn bộ COM chạy trên dedicated COM thread qua _com_call() — KHÔNG gọi pycaw
+# trực tiếp từ thread request (cross-apartment → crash _ctypes.pyd, xem block WHY worker).
 def api_audio_devices():
     """Liệt kê thiết bị âm thanh thực (pycaw/Core Audio) + volume/mute + default thật."""
     try:
-        pythoncom.CoInitialize()
-        from pycaw.pycaw import AudioUtilities, IMMDeviceEnumerator
-        from pycaw.constants import AudioDeviceState, EDataFlow
-        from pycaw.utils import CLSID_MMDeviceEnumerator
-        from comtypes import CoCreateInstance, CLSCTX_INPROC_SERVER
-
-        devEnum = CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, CLSCTX_INPROC_SERVER)
-        default_capture_id = _audio_default_endpoint_id(devEnum, EDataFlow.eCapture.value)
-        default_render_id = _audio_default_endpoint_id(devEnum, EDataFlow.eRender.value)
-
-        devices = []
-        seen = set()
-        for py_dev in AudioUtilities.GetAllDevices():
-            if py_dev.state != AudioDeviceState.Active:
-                continue
-            dev_id = py_dev.id
-            if dev_id in seen:
-                continue
-            seen.add(dev_id)
-            try:
-                flow_code = AudioUtilities.GetEndpointDataFlow(dev_id, outputType=1)
-            except Exception:
-                flow_code = EDataFlow.eAll.value
-            is_input = (flow_code == EDataFlow.eCapture.value)
-            volume = 50
-            muted = False
-            try:
-                vol_obj = py_dev.EndpointVolume
-                volume = round(vol_obj.GetMasterVolumeLevelScalar() * 100)
-                muted = bool(vol_obj.GetMute())
-            except Exception:
-                pass
-            devices.append({
-                'id': dev_id,
-                'name': str(py_dev.FriendlyName or 'Không tên'),
-                'is_input': is_input,
-                'is_output': not is_input,
-                'is_default': (dev_id == default_capture_id) if is_input else (dev_id == default_render_id),
-                'volume': volume,
-                'muted': muted,
-            })
-
-        devices.sort(key=lambda d: (d['is_input'], d['name'].lower()))
+        devices = _com_call(_list_devices_worker)
         debug_log(f"[audio] devices v2: {len(devices)} active endpoints")
         return jsonify({'devices': devices, 'source': 'core-audio', 'count': len(devices)})
     except ImportError:
@@ -5800,20 +5906,28 @@ def api_audio_mic_status():
         # WHY: v2 — tên mic mặc định lấy từ pycaw GetDefaultAudioEndpoint (thật, cập nhật
         # tức thì sau khi đổi default). KHÔNG dùng sd.default.device (PortAudio cache lúc
         # import — không đổi sau khi set-default → mic_name hiển thị sai thiết bị cũ).
+        # WHY: Pycaw chạy trên dedicated COM thread qua _com_call — tránh cross-apartment
+        # crash _ctypes.pyd. Worker trả (default_mic_id, mic_name, capture_id_by_name) plain.
         try:
             import sounddevice as sd
             default_mic_id = None
             try:
-                pythoncom.CoInitialize()
-                from pycaw.pycaw import AudioUtilities
-                mic_obj = AudioUtilities.GetMicrophone()
-                if mic_obj is not None:
-                    default_mic_id = mic_obj.GetId()
-                if default_mic_id:
-                    for py_dev in AudioUtilities.GetAllDevices():
-                        if py_dev.id == default_mic_id:
-                            mic_name = str(py_dev.FriendlyName or mic_name)
-                            break
+                # WHY: Read default mic phải chạy trên COM worker thread vì
+                # pycaw/comtypes không thread-safe khi gọi từ Flask request thread.
+                def _mic_default_worker():
+                    from pycaw.pycaw import AudioUtilities
+                    dmid = None
+                    mname = 'Không rõ'
+                    mic_obj = AudioUtilities.GetMicrophone()
+                    if mic_obj is not None:
+                        dmid = mic_obj.GetId()
+                    if dmid:
+                        for py_dev in AudioUtilities.GetAllDevices():
+                            if py_dev.id == dmid:
+                                mname = str(py_dev.FriendlyName or mname)
+                                break
+                    return (dmid, mname)
+                default_mic_id, mic_name = _com_call(_mic_default_worker, timeout=10)
             except Exception:
                 pass
             # Fallback: nếu không lấy được từ pycaw, dùng sd.default.device
@@ -5832,17 +5946,21 @@ def api_audio_mic_status():
             # chính xác theo thiết bị thật (không theo index PortAudio cũ).
             _capture_id_by_name = {}
             try:
-                from pycaw.pycaw import AudioUtilities
-                from pycaw.constants import EDataFlow
-                for py_dev in AudioUtilities.GetAllDevices():
-                    try:
-                        if AudioUtilities.GetEndpointDataFlow(py_dev.id, outputType=1) != EDataFlow.eCapture.value:
+                def _capture_map_worker():
+                    from pycaw.pycaw import AudioUtilities
+                    from pycaw.constants import EDataFlow
+                    cmap = {}
+                    for py_dev in AudioUtilities.GetAllDevices():
+                        try:
+                            if AudioUtilities.GetEndpointDataFlow(py_dev.id, outputType=1) != EDataFlow.eCapture.value:
+                                continue
+                        except Exception:
                             continue
-                    except Exception:
-                        continue
-                    n = str(py_dev.FriendlyName or '')
-                    if n:
-                        _capture_id_by_name.setdefault(n, []).append(py_dev.id)
+                        n = str(py_dev.FriendlyName or '')
+                        if n:
+                            cmap.setdefault(n, []).append(py_dev.id)
+                    return cmap
+                _capture_id_by_name = _com_call(_capture_map_worker, timeout=10)
             except Exception:
                 pass
             for i, dev in enumerate(sd.query_devices()):
@@ -5864,22 +5982,26 @@ def api_audio_mic_status():
         # Dùng AudioUtilities.GetMicrophone() + IAudioEndpointVolume
         # (hoạt động trên capture devices, Windows 10/11)
         try:
-            pythoncom.CoInitialize()
-            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-            from comtypes import CLSCTX_ALL, POINTER, cast
-            
-            mic = AudioUtilities.GetMicrophone()
-            if mic:
-                interface = mic.Activate(
-                    IAudioEndpointVolume._iid_, CLSCTX_ALL, None
-                )
-                volume = cast(interface, POINTER(IAudioEndpointVolume))
-                mute_val = volume.GetMute()
-                mic_muted = bool(mute_val)
-                try:
-                    volume_level = volume.GetMasterVolumeLevelScalar()
-                except:
-                    volume_level = None
+            # WHY: Mute/unmute mic qua COM worker thread để tránh crash pycaw
+            # khi gọi IAudioEndpointVolume ngoài thread đã CoInitialize.
+            def _mic_mute_worker():
+                from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+                from comtypes import CLSCTX_ALL, POINTER, cast
+                mmuted = None
+                mlevel = None
+                mic = AudioUtilities.GetMicrophone()
+                if mic:
+                    interface = mic.Activate(
+                        IAudioEndpointVolume._iid_, CLSCTX_ALL, None
+                    )
+                    volume = cast(interface, POINTER(IAudioEndpointVolume))
+                    mmuted = bool(volume.GetMute())
+                    try:
+                        mlevel = volume.GetMasterVolumeLevelScalar()
+                    except:
+                        mlevel = None
+                return (mmuted, mlevel)
+            mic_muted, volume_level = _com_call(_mic_mute_worker, timeout=10)
         except Exception:
             pass
 
@@ -5927,6 +6049,11 @@ def api_audio_mic_status():
         else:
             overall_status = 'no_mic'
 
+        # WHY: Trả thông tin monitor mic-level đang chạy (host API + sample rate) — tab
+        # Âm thanh hiển thị cho user biết widget VU meter đang đọc từ đâu. Copy dưới
+        # lock (dict nhỏ, atomic). None nếu monitor chưa start/idle.
+        with _mic_level_lock:
+            monitor_info = dict(_mic_level_monitor_info) if _mic_level_monitor_info else None
         return jsonify({
             'active': is_active,
             'app_using_mic': app_using,
@@ -5936,14 +6063,15 @@ def api_audio_mic_status():
             'overall_status': overall_status,
             'available_mics': available_mics,
             'mic_count': len(available_mics),
-            'duration': 0
+            'duration': 0,
+            'monitor_info': monitor_info
         })
     except Exception as e:
         return jsonify({
             'active': False, 'app_using_mic': 'Lỗi',
             'mic_name': 'Không rõ', 'mic_muted': None,
             'overall_status': 'error', 'available_mics': [],
-            'mic_count': 0, 'duration': 0, 'error': str(e)
+            'mic_count': 0, 'duration': 0, 'monitor_info': None, 'error': str(e)
         }), 500
 
 # ─── Mic Level Monitor (Background Thread, Idle Auto-Stop) ──────
@@ -5961,6 +6089,113 @@ _mic_level_started = False
 _mic_level_last_poll = 0.0          # time.monotonic() lúc poll gần nhất
 _mic_level_last_error = 0.0         # throttle log lỗi khởi động (tránh spam mỗi 200ms)
 MIC_LEVEL_IDLE_TIMEOUT = 5.0        # dừng stream sau 5s không có poll
+_mic_level_current_device_id = None  # device id đang được monitor
+# WHY: Thông tin monitor đang chạy (host API + sample rate + device name) — tab Âm thanh
+# hiển thị cho user biết widget VU meter đang đọc tín hiệu từ đâu. Cập nhật dưới
+# _mic_level_lock khi monitor start/stop. Plain dict, an toàn đọc xuyên thread.
+_mic_level_monitor_info = None
+# WHY: Throttle kiểm tra default mic đổi — GetMicrophone() là COM call nặng, poll 200ms
+# (widget + AudioModule = 10 req/s) mà check mỗi lần là phí phạm + dễ trục trặc COM.
+_mic_level_last_default_check = 0.0  # time.monotonic() lần check gần nhất
+MIC_LEVEL_DEFAULT_CHECK_INTERVAL = 2.0  # chỉ check default mic đổi mỗi 2s
+
+# ─── DEDICATED COM THREAD ──────────────────────────────────────
+# WHY: MỌI truy cập COM âm thanh (pycaw/Windows Core Audio) chạy trên ĐÚNG 1 thread duy
+# nhất (dedicated worker). Lý do bắt buộc:
+#   1) Flask threaded=True → mỗi request là 1 thread khác nhau (Werkzeug thread pool).
+#      Comtypes COM objects gắn với STA apartment của thread TẠO ra chúng. Nếu dùng từ
+#      thread khác → COM marshal tới apartment cũ → ACCESS VIOLATION trong _ctypes.pyd
+#      (đã xác nhận qua Windows Event Log: exception 0xc0000005, faulting module
+#      _ctypes.pyd — đúng 100% triệu chứng user: backend chết cứng không traceback,
+#      "Đặt thiết bị mặc định thất bại" + tab Nhật ký trống vì backend chết trước khi log).
+#   2) pycaw AudioUtilities._PolicyConfigClient cache module-level → dùng xuyên thread
+#      càng dễ crash (cần nhiều request trên nhiều thread → "mở lâu mới lỗi").
+#   3) Chỉ 1 apartment → không bao giờ có 2 COM call chạy song song → hết contention,
+#      không cần lock COM riêng.
+_com_task_queue = queue.Queue()
+# WHY: Cap queue — nếu worker kẹt (COM call treo vì audio service đứng), queue không
+# phình vô hạn (mic-level poll 10 req/s → hàng chục nghìn task tích lũy = memory leak).
+# _com_call đợi task trong queue; nếu queue đầy, task mới bị drop ngay (bỏ qua check
+# lần này, lần sau thử lại) thay vì treo vô hạn.
+_COM_QUEUE_MAX = 50
+_com_worker_ready = threading.Event()
+_com_worker_started = False
+_com_worker_start_lock = threading.Lock()
+
+
+# WHY: COM (pycaw/comtypes) chỉ an toàn khi gọi trên 1 thread duy nhất đã
+# CoInitialize. Worker loop nhận task từ queue và chạy tuần tự — mọi audio API
+# đều qua thread này để tránh crash _ctypes.pyd.
+def _com_worker_loop():
+    """Vòng lặp worker: nhận task (fn + args) từ queue, chạy trên thread này."""
+    pythoncom.CoInitialize()
+    _com_worker_ready.set()
+    while True:
+        task = _com_task_queue.get()
+        if task is None:  # shutdown marker
+            break
+        fn, args, kwargs, box = task
+        try:
+            result = fn(*args, **kwargs)
+            box["ok"] = True
+            box["result"] = result
+        except Exception as e:
+            box["ok"] = False
+            box["error"] = e
+        finally:
+            # WHY: gc.collect() NGAY trên COM thread SAU MỖI task. Comtypes objects
+            # (IMMDevice wrappers từ GetAllDevices/GetMicrophone) thường tạo reference
+            # cycles → không release ngay khi hàm return mà chờ GC. Nếu GC chạy trên
+            # thread request (Flask) khác → __del__ → Release() cross-apartment →
+            # ACCESS VIOLATION trong comtypes (đã xác nhận: faulthandler dump thấy
+            # "Garbage-collecting" + unknwn.py Release trong thread worker, exit code
+            # 0xC0000005). Collect trên worker thread đảm bảo mọi object được release
+            # đúng apartment của chúng.
+            try:
+                gc.collect()
+            except Exception:
+                pass
+            box["done"].set()
+
+
+# WHY: Start COM worker thread lazily (chỉ 1 lần) — tránh tốn thread boot,
+# nhưng vẫn guarantee mọi audio call chạy đúng 1 thread đã CoInitialize.
+def _ensure_com_worker():
+    """Lazy start worker thread — chỉ 1 lần (daemon, sống cùng process)."""
+    global _com_worker_started
+    if _com_worker_started:
+        return
+    with _com_worker_start_lock:
+        if _com_worker_started:
+            return
+        threading.Thread(target=_com_worker_loop, daemon=True).start()
+        ready = _com_worker_ready.wait(timeout=5)
+        if not ready:
+            # WHY: Worker không khởi động được (hiếm: CoInitialize throw) — không
+            # đánh dấu started → các lần sau retry start. Tránh "queue chết âm thầm".
+            debug_log("[audio] COM worker failed to start!")
+            return
+        _com_worker_started = True
+
+
+# WHY: Gọi 1 hàm trên COM thread và chờ kết quả (blocking, timeout an toàn).
+# KHÔNG BAO GIỜ trả comtypes object xuyên thread — chỉ trả dữ liệu nguyên thủy
+# (id/name/volume/boolean...) đã chuyển thành kiểu Python an toàn TRONG worker.
+def _com_call(fn, *args, timeout=15, **kwargs):
+    """Chạy fn trên dedicated COM thread, trả kết quả. Raise lỗi nếu fn throw.
+    Queue đầy (worker kẹt) → drop task ngay + raise QueueFull — caller bỏ qua lần này."""
+    _ensure_com_worker()
+    if not _com_worker_started:
+        raise RuntimeError("COM worker not ready")
+    if _com_task_queue.qsize() >= _COM_QUEUE_MAX:
+        raise RuntimeError("COM queue full (worker stuck) — skip")
+    box = {"ok": False, "result": None, "error": None, "done": threading.Event()}
+    _com_task_queue.put((fn, args, kwargs, box))
+    if not box["done"].wait(timeout):
+        raise TimeoutError(f"COM call timeout: {getattr(fn, '__name__', fn)}")
+    if not box["ok"]:
+        raise box["error"]
+    return box["result"]
 
 # WHY: Import numpy ở module level (trong try/except vì numpy là optional dependency).
 # sounddevice trả về numpy arrays, nhưng import callback mỗi 200ms là wasteful.
@@ -5991,7 +6226,7 @@ def _mic_level_callback(indata, frames, time_info, status):
 # trong MIC_LEVEL_IDLE_TIMEOUT giây. Giải phóng microphone tự động khi
 # widget đóng (widget ngừng poll /api/audio/mic-level).
 def _mic_level_idle_watchdog():
-    global _mic_level_stream, _mic_level_started, _current_mic_level
+    global _mic_level_stream, _mic_level_started, _current_mic_level, _mic_level_monitor_info
     while True:
         time.sleep(2)
         try:
@@ -6005,11 +6240,21 @@ def _mic_level_idle_watchdog():
                     _mic_level_stream = None
                     _mic_level_started = False
                     _current_mic_level = 0.0
+                    _mic_level_monitor_info = None
             # WHY: Gọi stream.stop() NGOÀI lock — stop() chờ callback trả về mà callback
             # cũng acquire _mic_level_lock → giữ lock khi stop() sẽ deadlock.
+            # WHY: Gọi close() SAU stop() — giải phóng PortAudio resources ngay. Trước đây
+            # chỉ stop() không close() → mỗi lần restart monitor (đổi default mic) leak 1
+            # stream → sau nhiều lần đổi + poll 200ms liên tục → PortAudio DLL crash
+            # (exit code 0xC0000005 access violation, không traceback — đúng triệu chứng
+            # "mở lâu rồi đổi mic bị lỗi, backend chết im lặng"). close() = stop + release.
             if stream_to_stop is not None:
                 try:
                     stream_to_stop.stop()
+                except Exception:
+                    pass
+                try:
+                    stream_to_stop.close()
                 except Exception:
                     pass
                 debug_log("[mic-level] Monitor stopped (idle timeout)")
@@ -6040,42 +6285,262 @@ def _is_self_mic_app(exe_path):
 threading.Thread(target=_mic_level_idle_watchdog, daemon=True).start()
 
 def _ensure_mic_level_monitor():
-    """Lazy start InputStream. Nếu stream đang chạy → return ngay (không mở lại)."""
-    global _mic_level_stream, _mic_level_started, _mic_level_last_error
+    """Lazy start InputStream. Nếu stream đang chạy → return ngay (không mở lại).
+    Nếu default mic đã đổi → stop stream cũ, start stream mới trên device mới."""
+    global _mic_level_stream, _mic_level_started, _mic_level_last_error, _mic_level_current_device_id, _mic_level_last_default_check, _mic_level_monitor_info
     # WHY: Check + start trong cùng 1 khóa lock (atomic) — tránh check-then-act race:
     # widget poll /mic-level mỗi 200ms VÀ AudioModule cũng poll /mic-level mỗi 200ms
     # → 2 request song song cùng thấy _mic_level_started=False → cùng tạo InputStream
     # → mở 2 stream trên cùng device (log "Monitor started on device #1" xuất hiện 2 lần).
+    stream_to_stop = None
+    current_default_mic_id = None
+    # WHY: BƯỚC 1 — đọc trạng thái nhanh dưới _mic_level_lock (KHÔNG COM call trong lock!).
+    # Trước đây AudioUtilities.GetMicrophone() chạy TRONG _mic_level_lock — nếu COM call
+    # block (Windows Audio bận khi set-default verify, hoặc COM apartment exhaustion sau
+    # thời gian dài) → giữ lock vô hạn → MỌI poll /mic-level (10 req/s) block trên lock
+    # → Flask threaded chồng thread → backend nghẽn toàn diện → UI báo "mất kết nối
+    # backend", tab Log trắng, set-default báo lỗi mà không có log (đúng triệu chứng user).
+    now = time.monotonic()
+    need_check = False
     with _mic_level_lock:
+        # WHY: Throttle — chỉ hỏi Windows default mic mỗi MIC_LEVEL_DEFAULT_CHECK_INTERVAL giây.
+        # Trước đây GetMicrophone() (COM enumeration toàn bộ devices) chạy mỗi 200ms poll
+        # → phí phạm + COM call đồng thời với set-default (thread khác) gây tranh chấp.
+        need_check = (_mic_level_stream is None) or (not _mic_level_started) or (now - _mic_level_last_default_check) >= MIC_LEVEL_DEFAULT_CHECK_INTERVAL
+        if need_check:
+            _mic_level_last_default_check = now
+    
+    # WHY: BƯỚC 2 — COM call (GetMicrophone) chạy trên dedicated COM thread qua _com_call,
+    # NGOÀI _mic_level_lock. Nếu COM call block thì chỉ 1 request này chậm, KHÔNG kẹt toàn
+    # bộ hệ thống poll. Worker trả về id chuỗi (plain data, an toàn xuyên thread).
+    # WHY: timeout NGẮN (0.5s) — poll 200ms không được chờ lâu. Khi set-default đang giữ
+    # worker (verify loop tới 4.5s), check này timeout ngay → bỏ qua lần này (guard
+    # current_default_mic_id is not None ở BƯỚC 3 ngăn restart sai). Lần poll sau thử lại.
+    # Nếu để timeout 3s, widget VU meter bị "đóng băng" 3s mỗi lần user đổi mic.
+    if need_check:
+        try:
+            # WHY: Đọc default mic qua COM worker để tránh pycaw gọi sai thread.
+            def _get_default_mic_worker():
+                from pycaw.pycaw import AudioUtilities
+                mic_obj = AudioUtilities.GetMicrophone()
+                return mic_obj.GetId() if mic_obj is not None else None
+            current_default_mic_id = _com_call(_get_default_mic_worker, timeout=0.5)
+        except Exception:
+            pass
+        
+    # WHY: BƯỚC 3 — quyết định restart/start dưới lock (atomic, không COM).
+    with _mic_level_lock:
+        # Nếu default mic đã đổi so với device đang monitor → reset để start lại
         if _mic_level_started and _mic_level_stream is not None:
-            return
+            # WHY: Guard current_default_mic_id is not None — nếu GetMicrophone() lỗi
+            # (COM transient), không được coi là "default đổi" → tránh restart monitor
+            # mỗi 2s (churn) khi COM cứ fail liên tục.
+            if need_check and current_default_mic_id is not None and _mic_level_current_device_id != current_default_mic_id:
+                debug_log(f"[mic-level] Default mic changed ({_mic_level_current_device_id} -> {current_default_mic_id}), restarting monitor")
+                stream_to_stop = _mic_level_stream
+                _mic_level_stream = None
+                _mic_level_started = False
+                _mic_level_current_device_id = None
+                _mic_level_monitor_info = None
+            else:
+                return
         if _mic_level_stream is not None:
             return
         _mic_level_stream = "starting"
+    # WHY: Gọi stream.stop() NGOÀI lock — BUG FIX (deadlock khi đổi mic mặc định):
+    # trước đây stop() nằm TRONG with _mic_level_lock dù comment ghi "outside".
+    # stop() chờ callback âm thanh trả về, mà _mic_level_callback lại cần acquire
+    # _mic_level_lock để cập nhật _current_mic_level → giữ lock khi stop() = deadlock:
+    # - thread Flask xử lý /mic-level kẹt vĩnh viễn (giữ lock)
+    # - MỌI poll /mic-level sau đó (widget + module, mỗi 200ms) block trên lock
+    # → thread chồng thread → backend nghẽn → UI báo "không kết nối backend",
+    # tab Log trắng, set-default phải bấm nhiều lần mới được (đúng triệu chứng user).
+    # WHY: close() sau stop() — giải phóng PortAudio resources (xem WHY ở idle watchdog).
+    if stream_to_stop is not None:
+        try:
+            stream_to_stop.stop()
+        except Exception:
+            pass
+        try:
+            stream_to_stop.close()
+        except Exception:
+            pass
     try:
         import sounddevice as sd
-        default_input = sd.default.device[0]
-        if default_input is not None:
+        # WHY: Dùng pycaw GetMicrophone() để lấy default mic THEO WINDOWS (Core Audio),
+        # KHÔNG dùng sd.default.device[0] (PortAudio cache lúc import — không đổi sau set-default).
+        # Map pycaw device id → sounddevice index để mở InputStream đúng thiết bị.
+        default_mic_id = current_default_mic_id
+        
+        candidate_indices = []
+        if default_mic_id:
+            # Map pycaw device id → sounddevice index using robust matching
+            # Strategy: build name->index map from sounddevice, prefer exact match,
+            # then longest match (to avoid truncated entries like "Microphone (PD200X Podcast Micr")
+            try:
+                # WHY: Map device id -> FriendlyName qua COM worker (pycaw không
+                # thread-safe, map này phục vụ lọc tên thiết bị bị truncate).
+                def _get_pycaw_name_worker(dev_id):
+                    from pycaw.pycaw import AudioUtilities
+                    for py_dev in AudioUtilities.GetAllDevices():
+                        if py_dev.id == dev_id:
+                            return str(py_dev.FriendlyName or '')
+                    return ''
+                py_name = _com_call(_get_pycaw_name_worker, default_mic_id, timeout=10)
+                
+                if py_name:
+                    # WHY: sounddevice liệt kê CÙNG 1 mic ở NHIỀU host API (MME, DirectSound,
+                    # WASAPI, WDM-KS). Lấy index đầu tiên theo tên sẽ trúng MME/DirectSound —
+                    # host API dễ kẹt nhất trên Windows (log thực tế: "DirectSound error -9999"
+                    # kéo dài từ 11:24, monitor không bao giờ start được).
+                    # WASAPI shared mode là host API bền nhất: không exclusive → không bao giờ
+                    # bị tranh chấp với app khác, refresh device list tốt sau set-default.
+                    # Ưu tiên: WASAPI(0) > MME(1) > DirectSound(2) > WDM-KS/khác(3).
+                    hostapi_rank = {}
+                    for _ha_i, ha in enumerate(sd.query_hostapis()):
+                        hn = ha['name']
+                        if 'WASAPI' in hn:
+                            hostapi_rank[_ha_i] = 0
+                        elif 'MME' in hn:
+                            hostapi_rank[_ha_i] = 1
+                        elif 'DirectSound' in hn:
+                            hostapi_rank[_ha_i] = 2
+                        else:
+                            hostapi_rank[_ha_i] = 3
+                    ranked = []
+                    for _i, dev in enumerate(sd.query_devices()):
+                        if dev['max_input_channels'] <= 0:
+                            continue
+                        sd_name = dev['name']
+                        # Containment 2 chiều: che cả exact match lẫn tên bị truncate
+                        # (MME cắt tên: "Microphone (PD200X Podcast Micr").
+                        if py_name == sd_name or sd_name in py_name or py_name in sd_name:
+                            # WHY: Sort theo (host_api_rank, -len(tên), index) — trong cùng
+                            # tier host API, tên DÀI nhất (đặc hiệu nhất) thắng. Tránh tên
+                            # chung chung ngắn (vd "Microphone ()" WDM-KS) match nhầm mic
+                            # khác khi nằm ở index thấp hơn.
+                            ranked.append((hostapi_rank.get(dev['hostapi'], 9), -len(sd_name), _i))
+                    ranked.sort()
+                    candidate_indices = [i for _, _, i in ranked][:8]
+            except Exception:
+                pass
+        
+        # Fallback: PortAudio default device (thêm CUỐI danh sách — ưu tiên host API bền hơn)
+        try:
+            if sd.default.device[0] is not None and sd.default.device[0] not in candidate_indices:
+                candidate_indices.append(sd.default.device[0])
+        except Exception:
+            pass
+        
+        # WHY: Mở stream theo thứ tự candidate (WASAPI trước) + thử nhiều sample rate.
+        # Trước đây hardcode samplerate=16000 → WASAPI trả "Invalid sample rate" (-9997)
+        # vì WASAPI shared mode chỉ hỗ trợ native rate của device (48000/44100) → monitor
+        # không bao giờ start trên WASAPI. Giờ thử native rate trước, rồi 48k/44.1k/32k/16k.
+        opened = None
+        last_err = None
+        for index in candidate_indices:
+            if index is None or index == -1:
+                continue
+            try:
+                dev_info = sd.query_devices(index)
+                hostapi_name = sd.query_hostapis()[dev_info['hostapi']]['name']
+                native = int(dev_info.get('default_samplerate') or 48000)
+                rates = []
+                for r in (native, 48000, 44100, 32000, 16000):
+                    if r not in rates:
+                        rates.append(r)
+                for rate in rates:
+                    try:
+                        # WHY: WASAPI shared mode (exclusive=False) — không chiếm device độc
+                        # quyền, không bị kẹt khi app khác dùng mic, hỗ trợ đổi default tốt.
+                        extra = sd.WasapiSettings(exclusive=False) if 'WASAPI' in hostapi_name else None
+                        stream = sd.InputStream(
+                            device=index,
+                            channels=1,
+                            samplerate=rate,
+                            blocksize=1024,
+                            callback=_mic_level_callback,
+                            extra_settings=extra,
+                        )
+                        stream.start()
+                        opened = (stream, index, hostapi_name, rate)
+                        break
+                    except Exception as e:
+                        last_err = e
+                        # WHY: Close stream vừa fail — tránh giữ handle device tới khi GC chạy
+                        # (đúng nguyên nhân WdmSyncIoctl GLE=0x490: stream cũ chưa release).
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                        # WHY: Retry NGẮN cho WASAPI — khi restart monitor NGAY sau set-default,
+                        # Windows Audio cần ~0.3-0.6s để WASAPI nhận device default mới. QUAN
+                        # TRỌNG: loop này chạy trên thread request poll /mic-level (widget poll
+                        # 200ms), nên retry dài (0.7s x2 x 5 rates = ~7s) làm poll bị giữ >5s →
+                        # widget VU "đứng" 3-5s mỗi lần đổi mic + request timeout (đã xác nhận
+                        # trong stress test 15 phút: 1 poll fail mỗi lần đổi mic).
+                        # Retry 1 lần x 0.4s, giới hạn tổng thời gian WASAPI <= ~1.5s — nếu fail
+                        # vẫn còn MME fallback (luôn mở được, đúng thiết bị).
+                        if 'WASAPI' in hostapi_name and rate in (native, 48000):
+                            time.sleep(0.4)
+                            try:
+                                stream2 = sd.InputStream(
+                                    device=index,
+                                    channels=1,
+                                    samplerate=rate,
+                                    blocksize=1024,
+                                    callback=_mic_level_callback,
+                                    extra_settings=extra,
+                                )
+                                stream2.start()
+                                opened = (stream2, index, hostapi_name, rate)
+                                break
+                            except Exception as e2:
+                                last_err = e2
+                                try:
+                                    stream2.close()
+                                except Exception:
+                                    pass
+                            if opened:
+                                break
+                            # WHY: Log 1 lần cho thấy lý do WASAPI thất bại (không spam —
+                            # chỉ khi WASAPI là candidate đầu và fail hết retry).
+                            if time.monotonic() - _mic_level_last_error > 30:
+                                _mic_level_last_error = time.monotonic()
+                                debug_log(f"[mic-level] WASAPI open failed on #{index} rate={rate}: {str(last_err)[:120]}")
+                        continue
+                if opened:
+                    break
+            except Exception as e:
+                last_err = e
+                continue
+        
+        if opened is not None:
+            stream, index, hostapi_name, rate = opened
             # WHY: Gán vào biến local trước, commit vào global CHỈ SAU KHI start() thành công.
             # Nếu start() throw, _mic_level_stream không giữ tham chiếu stream chưa start
             # (tránh leak object + tránh ghi đè stream cũ đang chạy).
-            stream = sd.InputStream(
-                device=default_input,
-                channels=1,
-                samplerate=16000,
-                blocksize=1024,
-                callback=_mic_level_callback,
-            )
-            stream.start()
+            try:
+                _dev_name = sd.query_devices(index)['name']
+            except Exception:
+                _dev_name = '?'
             with _mic_level_lock:
                 _mic_level_stream = stream
                 _mic_level_started = True
-            debug_log(f"[mic-level] Monitor started on device #{default_input}")
+                _mic_level_current_device_id = default_mic_id if default_mic_id else None
+                _mic_level_monitor_info = {
+                    'hostapi': hostapi_name,
+                    'samplerate': rate,
+                    'device_index': index,
+                    'device_name': _dev_name,
+                }
+            debug_log(f"[mic-level] Monitor started on device #{index} [{hostapi_name}] '{_dev_name}' rate={rate} (pycaw_id={default_mic_id})")
         elif time.monotonic() - _mic_level_last_error > 30:
             # WHY: Không có mic mặc định — log tối đa 1 lần/30s (poll 200ms sẽ spam)
             _mic_level_last_error = time.monotonic()
             with _mic_level_lock:
                 _mic_level_stream = None
+                _mic_level_monitor_info = None
             debug_log("[mic-level] No default input device found")
     except Exception as e:
         if time.monotonic() - _mic_level_last_error > 30:
@@ -6084,6 +6549,7 @@ def _ensure_mic_level_monitor():
             debug_log(f"[mic-level] Failed to start monitor: {e}")
         with _mic_level_lock:
             _mic_level_stream = None
+            _mic_level_monitor_info = None
 
 @app.route("/api/audio/mic-level")
 # WHY: Endpoint siêu nhẹ — chỉ trả về RMS level (float 0.0-1.0).
@@ -6103,19 +6569,25 @@ def api_audio_mic_level():
 @app.route("/api/audio/devices/<dev_id>/mute", methods=["POST"])
 # WHY: Audio v2 — dev_id là id chuỗi (GUID) từ pycaw, match chính xác tuyệt đối,
 # không còn nhập nhằng index/name. Toggle mute qua IAudioEndpointVolume.
+# WHY: Toàn bộ COM chạy trên dedicated COM thread (qua _com_call) — không bao giờ
+# gọi pycaw từ thread request (cross-apartment → crash _ctypes.pyd).
 def api_audio_mute(dev_id):
     """Bật/tắt mute cho thiết bị audio (theo device id chuỗi)"""
     try:
-        pythoncom.CoInitialize()
-        py_dev = _find_pycaw_device(dev_id)
-        if py_dev is None:
+        def _mute_worker(did):
+            py_dev = _find_pycaw_device(did)
+            if py_dev is None:
+                return None
+            name = str(py_dev.FriendlyName or did)
+            vol_obj = py_dev.EndpointVolume
+            current = bool(vol_obj.GetMute())
+            vol_obj.SetMute(not current, None)
+            return {'name': name, 'muted': not current}
+        result = _com_call(_mute_worker, dev_id, timeout=10)
+        if result is None:
             return jsonify({'error': 'Không tìm thấy thiết bị'}), 404
-        name = str(py_dev.FriendlyName or dev_id)
-        vol_obj = py_dev.EndpointVolume
-        current = bool(vol_obj.GetMute())
-        vol_obj.SetMute(not current, None)
-        debug_log(f"[audio] mute '{name}' -> {'muted' if not current else 'unmuted'}")
-        return jsonify({'status': 'toggled', 'muted': not current, 'name': name})
+        debug_log(f"[audio] mute '{result['name']}' -> {'muted' if result['muted'] else 'unmuted'}")
+        return jsonify({'status': 'toggled', 'muted': result['muted'], 'name': result['name']})
     except Exception as e:
         debug_log(f"[audio] mute {dev_id} error: {e}")
         return jsonify({'error': str(e)}), 500
@@ -6125,16 +6597,21 @@ def api_audio_mute(dev_id):
 def api_audio_volume(dev_id):
     """Điều chỉnh âm lượng thiết bị audio (theo device id chuỗi)"""
     try:
-        pythoncom.CoInitialize()
         data = request.get_json() or {}
         vol = max(0, min(100, int(data.get('volume', 50)))) / 100.0
-        py_dev = _find_pycaw_device(dev_id)
-        if py_dev is None:
+        # WHY: Set volume phải qua COM worker thread (pycaw cần thread đã CoInitialize).
+        def _volume_worker(did, v):
+            py_dev = _find_pycaw_device(did)
+            if py_dev is None:
+                return None
+            name = str(py_dev.FriendlyName or did)
+            py_dev.EndpointVolume.SetMasterVolumeLevelScalar(v, None)
+            return {'name': name, 'volume': int(v * 100)}
+        result = _com_call(_volume_worker, dev_id, vol, timeout=10)
+        if result is None:
             return jsonify({'error': 'Không tìm thấy thiết bị'}), 404
-        name = str(py_dev.FriendlyName or dev_id)
-        py_dev.EndpointVolume.SetMasterVolumeLevelScalar(vol, None)
-        debug_log(f"[audio] volume '{name}' -> {int(vol * 100)}%")
-        return jsonify({'status': 'set', 'volume': int(vol * 100), 'name': name})
+        debug_log(f"[audio] volume '{result['name']}' -> {result['volume']}%")
+        return jsonify({'status': 'set', 'volume': result['volume'], 'name': result['name']})
     except Exception as e:
         debug_log(f"[audio] volume {dev_id} error: {e}")
         return jsonify({'error': str(e)}), 500
@@ -6143,59 +6620,75 @@ def api_audio_volume(dev_id):
 # WHY: Set default qua AudioUtilities.SetDefaultDevice (pycaw helper dùng
 # CLSID_CPolicyConfigClient/IPolicyConfig — verify hoạt động, HRESULT 0).
 # WHY: Set CẢ 3 role + verify default đổi thật, nếu không đổi trả lỗi rõ ràng.
+# WHY: TOÀN BỘ COM (SetDefaultDevice + verify) chạy trên dedicated COM thread qua
+# _com_call — không bao giờ gọi pycaw từ thread request (cross-apartment crash).
 def api_audio_set_default(dev_id):
-    """Đặt thiết bị audio làm mặc định (set 3 role + verify)"""
+    """Đặt thiết bị audio làm mặc định (set 3 role + verify)
+    Toàn bộ COM chạy trên dedicated COM thread qua _com_call."""
     try:
-        pythoncom.CoInitialize()
-        from pycaw.pycaw import AudioUtilities
-        from pycaw.constants import ERole, EDataFlow
+        # WHY: Toàn bộ SetDefaultDevice + verify loop chạy trong 1 worker trên COM thread.
+        # Worker trả dict plain: {'found': bool, 'name': str, 'is_input': bool, 'changed': bool}.
+        # KHÔNG bao giờ trả comtypes object xuyên thread. Verify bên trong worker — retry
+        # sleep cũng nằm trong worker (chỉ 1 request set-default tại 1 thời điểm vì queue).
+        def _set_default_worker(did):
+            from pycaw.pycaw import AudioUtilities
+            from pycaw.constants import ERole, EDataFlow
+            from comtypes import CoCreateInstance, CLSCTX_INPROC_SERVER
+            from pycaw.pycaw import IMMDeviceEnumerator
+            from pycaw.utils import CLSID_MMDeviceEnumerator
 
-        py_dev = _find_pycaw_device(dev_id)
-        if py_dev is None:
-            return jsonify({'error': 'Không tìm thấy thiết bị'}), 404
-        name = str(py_dev.FriendlyName or dev_id)
-        try:
-            flow_code = AudioUtilities.GetEndpointDataFlow(dev_id, outputType=1)
-        except Exception:
-            flow_code = EDataFlow.eAll.value
-        is_input = (flow_code == EDataFlow.eCapture.value)
-
-        roles = [ERole.eConsole, ERole.eMultimedia, ERole.eCommunications]
-        AudioUtilities.SetDefaultDevice(dev_id, roles=roles)
-
-        # WHY: Verify default đổi THẬT bằng cách đọc lại endpoint default đúng flow
-        # của thiết bị vừa đặt. Retry tăng dần (0.3s → 0.6s → 1.2s → 2.4s) vì Windows
-        # áp dụng SetDefaultEndpoint BẤT ĐỒNG BỘ — máy bận (audio service đang xử lý
-        # 3 role liên tiếp) có thể mất >200ms mới đổi. Trước đây chỉ sleep 0.2s 1 lần
-        # → nếu đọc sớm vẫn thấy device cũ → trả 500 "chưa thay đổi" dù đổi THÀNH CÔNG
-        # (lỗi giả — một nguyên nhân "lúc được lúc không").
-        # WHY: Helper local — đọc lại default endpoint (flow đúng của thiết bị vừa đặt,
-        # role eMultimedia) và so sánh id. Tách riêng để retry loop gọi nhiều lần.
-        def _verify_default():
+            py_dev = _find_pycaw_device(did)
+            if py_dev is None:
+                return {'found': False}
+            name = str(py_dev.FriendlyName or did)
             try:
-                from comtypes import CoCreateInstance, CLSCTX_INPROC_SERVER
-                from pycaw.pycaw import IMMDeviceEnumerator
-                from pycaw.utils import CLSID_MMDeviceEnumerator
-                devEnum = CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, CLSCTX_INPROC_SERVER)
-                flow_to_check = EDataFlow.eCapture.value if is_input else EDataFlow.eRender.value
-                curr = devEnum.GetDefaultAudioEndpoint(flow_to_check, ERole.eMultimedia.value)
-                return curr is not None and curr.GetId() == dev_id
+                flow_code = AudioUtilities.GetEndpointDataFlow(did, outputType=1)
             except Exception:
-                return False
+                flow_code = EDataFlow.eAll.value
+            is_input = (flow_code == EDataFlow.eCapture.value)
 
-        changed = False
-        for _delay in (0.3, 0.6, 1.2, 2.4):
-            time.sleep(_delay)
-            changed = _verify_default()
-            if changed:
-                break
+            roles = [ERole.eConsole, ERole.eMultimedia, ERole.eCommunications]
+            AudioUtilities.SetDefaultDevice(did, roles=roles)
 
-        debug_log(f"[audio] set-default '{name}' roles={[r.name for r in roles]} verified={changed}")
+            # WHY: Verify lại thực tế default device đã đổi (SetDefaultDevice đôi
+            # khi "thành công" nhưng hệ thống không áp dụng — check qua IMMDeviceEnumerator).
+            def _verify_default():
+                try:
+                    devEnum = CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, CLSCTX_INPROC_SERVER)
+                    flow_to_check = EDataFlow.eCapture.value if is_input else EDataFlow.eRender.value
+                    curr = devEnum.GetDefaultAudioEndpoint(flow_to_check, ERole.eMultimedia.value)
+                    return curr is not None and curr.GetId() == did
+                except Exception:
+                    return False
+
+            changed = False
+            for _delay in (0.3, 0.6, 1.2, 2.4):
+                time.sleep(_delay)
+                changed = _verify_default()
+                if changed:
+                    break
+            return {'found': True, 'name': name, 'is_input': is_input, 'changed': changed}
+
+        result = _com_call(_set_default_worker, dev_id, timeout=20)
+        if not result.get('found'):
+            # WHY: Ghi log cả trường hợp 404 — trước đây bỏ im lặng → user thấy
+            # toast "thất bại" nhưng tab Nhật ký không có dòng nào (không biết lý do).
+            debug_log(f"[audio][ERROR] set-default '{dev_id}' FAILED: device not found")
+            return jsonify({'error': 'Không tìm thấy thiết bị'}), 404
+
+        name = result['name']
+        is_input = result['is_input']
+        changed = result['changed']
+        debug_log(f"[audio] set-default '{name}' verified={changed}")
         if not changed:
+            debug_log(f"[audio][ERROR] set-default '{name}' FAILED: verified=False after retries")
             return jsonify({'error': 'API đã gọi nhưng thiết bị mặc định chưa thay đổi'}), 500
+        debug_log(f"[audio][SUCCESS] set-default '{name}' OK")
         return jsonify({'status': 'set_default', 'is_input': is_input, 'name': name})
     except Exception as e:
-        debug_log(f"[audio] set-default {dev_id} error: {e}")
+        debug_log(f"[audio][ERROR] set-default '{dev_id}' exception: {e}")
+        import traceback
+        debug_log(f"[audio][ERROR] set-default traceback: {traceback.format_exc()}")
         return jsonify({'error': str(e)}), 500
 
 
@@ -6408,6 +6901,22 @@ def api_debug_log():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# WHY: Log phiên trước — Rust setup rename debug.log → debug.log.old mỗi phiên app.
+# Endpoint này cho tab Nhật ký đọc file .old để user so sánh lỗi cũ mà không phải
+# mò file thủ công. Trả exists=False khi chưa có (phiên đầu tiên).
+@app.route("/api/debug-log/old")
+def api_debug_log_old():
+    """Lấy nội dung file debug.log.old (log phiên trước)"""
+    try:
+        old_path = CONFIG_DIR / "debug.log.old"
+        if old_path.exists():
+            with open(old_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            return jsonify({'log': ''.join(lines), 'exists': True})
+        return jsonify({'log': '', 'exists': False})
+    except Exception as e:
+        return jsonify({'error': str(e), 'exists': False}), 500
+
 # WHY: Endpoint ghi log từ widget (webview riêng) vào debug.log — widget không
 # gọi được debug_log() trực tiếp vì chạy ngoài backend; mọi thao tác drag/resize/
 # close của widget POST qua đây để Log tab trong app chính thấy được, phục vụ
@@ -6456,6 +6965,39 @@ def api_debug_log_export_write():
         return jsonify({"ok": True, "path": path})
     except OSError as e:
         return jsonify({"error": str(e)}), 500
+
+# ─── AUDIO ERROR LOGS ─────────────────────────────────────────────
+# WHY: Endpoint chuyên lấy log lỗi audio gần nhất — Log tab hiển thị
+# filter 'error' sẽ lọc được, nhưng thêm endpoint này để UI dễ dàng
+# hiển thị danh sách lỗi audio riêng (không bị trộn với tunnel/watchdog).
+@app.route("/api/audio/errors")
+def api_audio_errors():
+    """Lấy các log lỗi audio gần nhất (200 dòng cuối)"""
+    try:
+        if not DEBUG_LOG.exists():
+            return jsonify({'errors': [], 'total_lines': 0})
+        with open(DEBUG_LOG, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        # Lọc dòng có [audio] và (ERROR hoặc error hoặc exception)
+        audio_errors = []
+        for line in lines:
+            if '[audio]' in line and ('ERROR' in line.upper() or 'EXCEPTION' in line.upper() or 'FAILED' in line.upper()):
+                audio_errors.append(line.strip())
+        return jsonify({'errors': audio_errors[-200:], 'total_lines': len(lines)})
+    except Exception as e:
+        return jsonify({'error': str(e), 'errors': []}), 500
+
+# WHY: Endpoint lấy TẤT CẢ log (không filter) cho debug sâu
+@app.route("/api/debug-log/raw")
+def api_debug_log_raw():
+    """Lấy toàn bộ debug.log raw (giữ nguyên format)"""
+    try:
+        if DEBUG_LOG.exists():
+            with open(DEBUG_LOG, 'r', encoding='utf-8') as f:
+                return f.read()
+        return 'Chưa có log'
+    except Exception as e:
+        return str(e), 500
 
 shutdown_server = False
 
@@ -6537,7 +7079,7 @@ def _autostart_servers():
     for p in config["projects"]:
         if not p.get("start_on_launch"):
             continue
-        if _is_port_running_for_dev(p.get("port")):
+        if _is_project_port_busy(p):
             skipped.append(f"{p['name']} (port {p.get('port')} busy)")
             continue
         try:
@@ -6569,7 +7111,7 @@ if __name__ == "__main__":
             print(f"Dashboard API running on http://127.0.0.1:{port} (attempt {restart_count + 1}/{max_restarts})")
             # WHY: Ghi version vào debug.log mỗi lần boot — Log tab hiển thị được
             # version app đang chạy, tránh nhầm lẫn khi kiểm tra bug trên bản cũ.
-            debug_log(f"[app] MultiTool Pro v1.11.3 started (attempt {restart_count + 1})")
+            debug_log(f"[app] MultiTool Pro v1.11.4 started (attempt {restart_count + 1})")
             # WHY: Khôi phục projects start_on_launch — chạy TRƯỚC app.run (chặn
             # /api/projects trả running sau khi auto-start). Idempotent: server đã
             # chạy sẵn trên port → skip.
