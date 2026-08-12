@@ -63,6 +63,82 @@ fn find_project_root() -> std::path::PathBuf {
         })
 }
 
+// WHY: Nhúng backend.exe (PyInstaller onefile — chứa Python runtime + Flask + mọi dep) vào
+// thẳng binary Tauri → portable exe khép kín 1 file duy nhất (không cần Python cài sẵn).
+// include_bytes! yêu cầu file tồn tại LÚC COMPILE — build.rs tạo placeholder rỗng cho dev
+// build; bản thật được build-portable.ps1 (chạy PyInstaller) copy vào src-tauri/backend-embed/
+// TRƯỚC khi gọi tauri build. Dev build có placeholder rỗng → len nhỏ → fallback python.
+static EMBEDDED_BACKEND: &[u8] = include_bytes!("../backend-embed/backend.exe");
+
+// WHY: Giải nén backend.exe nhúng ra %LOCALAPPDATA%/multitool-pro/backend/backend.exe — cache
+// CỐ ĐỊNH (không phải temp) để không ghi lại mỗi lần mở app; chỉ ghi khi file thiếu hoặc kích
+// thước khác (bản backend mới). Ghi temp rồi rename (atomic) tránh file nửa chừng khi đọc.
+fn ensure_embedded_backend() -> Option<std::path::PathBuf> {
+    // WHY: Placeholder dev = rỗng (0 byte) → bỏ qua. Backend thật luôn là PE (MZ) ≥ vài MB.
+    if EMBEDDED_BACKEND.len() < 1_000_000 || !EMBEDDED_BACKEND.starts_with(b"MZ") {
+        return None;
+    }
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join("multitool-pro").join("backend");
+    std::fs::create_dir_all(&dir).ok()?;
+    let target = dir.join("backend.exe");
+    let needs_write = !target.exists()
+        || std::fs::metadata(&target)
+            .map(|m| m.len() as usize != EMBEDDED_BACKEND.len())
+            .unwrap_or(true);
+    if needs_write {
+        let tmp = dir.join("backend.exe.new");
+        if std::fs::write(&tmp, EMBEDDED_BACKEND).is_err() {
+            return None;
+        }
+        let _ = std::fs::remove_file(&target);
+        if std::fs::rename(&tmp, &target).is_err() {
+            return None;
+        }
+    }
+    Some(target)
+}
+
+// WHY: Helper dùng chung — build Command spawn backend. Ưu tiên backend.exe NHÚNG (portable
+// khép kín), fallback python backend/app.py (dev build hoặc chưa build backend thật). Dùng
+// chung cho run() (spawn lần đầu), spawn_backend() (restart/watchdog) — tránh lệch logic.
+fn build_backend_command(
+    project_root: &std::path::Path,
+    exe_path_str: &str,
+) -> Option<std::process::Command> {
+    // WHY: DEBUG build ưu tiên python backend/app.py (source LIVE) — sau khi build release
+    // bằng build-portable.ps1, backend-embed/backend.exe THẬT (38MB) tồn tại vĩnh viễn;
+    // nếu dev build cũng dùng nó thì sửa app.py không ăn (stale embedded). Dev = code mới.
+    // RELEASE build ưu tiên backend nhúng (khép kín 1 file, không cần Python).
+    if !cfg!(debug_assertions) {
+        if let Some(bexe) = ensure_embedded_backend() {
+            let mut cmd = Command::new(&bexe);
+            cmd.args(["5050"])
+                .current_dir(project_root)
+                .env("SERVER_DASHBOARD_EXE", exe_path_str)
+                .env("MULTITOOL_PRO_EXE", exe_path_str);
+            return Some(cmd);
+        }
+    }
+    let python = find_python()?;
+    let use_pythonw = python
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .contains("pythonw");
+    let mut cmd = Command::new(&python);
+    if !use_pythonw {
+        cmd.arg("-u");
+    }
+    cmd.args(["backend/app.py", "5050"])
+        .current_dir(project_root)
+        .env("SERVER_DASHBOARD_EXE", exe_path_str)
+        .env("MULTITOOL_PRO_EXE", exe_path_str);
+    Some(cmd)
+}
+
 // WHY: Tìm Python interpreter - pythonw ẩn console, python hiện console.
 // Thử pythonw → python → py launcher → các đường dẫn phổ biến (gồm 3.13/3.14).
 fn find_python() -> Option<std::path::PathBuf> {
@@ -125,28 +201,18 @@ fn spawn_backend(app: &tauri::AppHandle) -> Result<String, String> {
     let exe_path = std::env::current_exe().unwrap_or_default();
     let exe_path_str = exe_path.to_string_lossy().to_string();
 
-    let python_path = find_python();
-    let use_pythonw = python_path.as_ref().map(|p| p.file_name().unwrap_or_default().to_string_lossy().contains("pythonw")).unwrap_or(false);
-
     // WHY: Kill backend cũ (nếu còn sống) trước khi spawn mới — tránh pythonw mồ côi
     // từ lần chạy trước giữ port 5050 làm backend mới bind fail.
     kill_orphan_backend();
     kill_flask_child(app);
 
-    let flask = if let Some(python) = python_path {
-        let mut cmd = Command::new(&python);
-        if !use_pythonw {
-            // WHY: Nếu dùng python (không phải pythonw), thêm -u để unbuffered output
-            cmd.arg("-u");
+    // WHY: Ưu tiên backend.exe NHÚNG (portable khép kín 1 file) — fallback python
+    // backend/app.py ở dev build (placeholder rỗng).
+    let flask = match build_backend_command(&project_root, &exe_path_str) {
+        Some(mut cmd) => cmd.spawn().ok(),
+        None => {
+            return Err("Python not found. Please install Python and add to PATH.".to_string())
         }
-        cmd.args(["backend/app.py", "5050"])
-            .current_dir(&project_root)
-            .env("SERVER_DASHBOARD_EXE", &exe_path_str)
-            .env("MULTITOOL_PRO_EXE", &exe_path_str)
-            .spawn()
-            .ok()
-    } else {
-        return Err("Python not found. Please install Python and add to PATH.".to_string());
     };
 
     if let Some(child) = flask {
@@ -378,28 +444,17 @@ pub fn run() {
     //   không spawn (single-instance plugin sẽ focus cửa sổ cũ và thoát instance 2). ✓
     let backend_healthy = is_backend_healthy();
     let flask = if !backend_healthy {
-        let python_path = find_python();
-        let use_pythonw = python_path.as_ref().map(|p| p.file_name().unwrap_or_default().to_string_lossy().contains("pythonw")).unwrap_or(false);
+        // WHY: Chỉ dọn orphan khi backend chưa khỏe — backend khỏe nghĩa là có instance
+        // khác đang chạy (single-instance) hoặc backend mồ côi vẫn sống khỏe → giữ nguyên.
+        kill_orphan_backend();
 
-        if !backend_healthy {
-            kill_orphan_backend();
-        }
-
-        if let Some(python) = python_path {
-            let mut cmd = Command::new(&python);
-            if !use_pythonw {
-                // Nếu dùng python (không phải pythonw), thêm -u để unbuffered output
-                cmd.arg("-u");
+        // WHY: Ưu tiên backend.exe NHÚNG (portable khép kín) — fallback python dev.
+        match build_backend_command(&project_root, &exe_path_str) {
+            Some(mut cmd) => cmd.spawn().ok(),
+            None => {
+                eprintln!("[backend] ERROR: Python not found. Please install Python and add to PATH.");
+                None
             }
-            cmd.args(["backend/app.py", "5050"])
-                .current_dir(&project_root)
-                .env("SERVER_DASHBOARD_EXE", &exe_path_str)
-                .env("MULTITOOL_PRO_EXE", &exe_path_str)
-                .spawn()
-                .ok()
-        } else {
-            eprintln!("[backend] ERROR: Python not found. Please install Python and add to PATH.");
-            None
         }
     } else {
         // WHY: Backend hiện tại đang khỏe — KHÔNG spawn mới (tái sử dụng).

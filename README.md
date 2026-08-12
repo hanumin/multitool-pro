@@ -4,7 +4,7 @@
 
 **Công cụ quản lý dự án, máy in, âm thanh & sao chép tập tin — tất cả trong một**
 
-![Version](https://img.shields.io/badge/phi%C3%AAn%20b%E1%BA%A3n-1.6.0-emerald)
+![Version](https://img.shields.io/badge/phi%C3%AAn%20b%E1%BA%A3n-1.11.4-emerald)
 ![Platform](https://img.shields.io/badge/n%E1%BB%81n%20t%E1%BA%A3ng-Windows%2010%2F11-blue)
 ![UI](https://img.shields.io/badge/giao%20di%E1%BB%87n-Ti%E1%BA%BFng%20Vi%E1%BB%87t-brightgreen)
 
@@ -68,28 +68,35 @@
 
 ## ⚙️ Yêu cầu hệ thống
 
+### 🖥 Người dùng cuối (chạy bản release)
+
 | Thành phần | Yêu cầu |
 |-----------|---------|
 | 🖥 Hệ điều hành | Windows 10 / Windows 11 (64-bit) |
-| 🐍 Python | 3.8+ (chạy backend API) |
-| 📦 Node.js | 18+ (cho frontend build) |
+| 🐍 Python | ✅ **Không cần** — backend đã đóng gói sẵn trong file build |
 | 🖨 Máy in | Tùy chọn (nếu dùng Printer Module) |
 | 🎤 Mic | Tùy chọn (nếu dùng Audio Module) |
+
+### 🛠 Nhà phát triển (build từ mã nguồn)
+
+| Thành phần | Yêu cầu |
+|-----------|---------|
+| 🖥 Hệ điều hành | Windows 10 / Windows 11 (64-bit) |
+| 🐍 Python | 3.10+ (chạy backend API + PyInstaller) |
+| 📦 Node.js | 18+ (cho frontend build) |
+| 🦀 Rust | stable (cho Tauri build) |
 
 ### Thư viện Python bắt buộc
 
 ```bash
-pip install flask flask-cors psutil
+pip install -r backend/requirements.txt
 ```
 
-Cho Printer Module (tùy chọn):
-```bash
-pip install pywin32 pywin32-com
-```
+Bao gồm: `flask`, `flask-cors`, `psutil`, `pywin32`, `requests`, `psycopg2-binary`, `mysql-connector-python`, `pycaw`
 
-Cho Audio Module (tùy chọn):
+Cài PyInstaller (chỉ cần khi build portable):
 ```bash
-pip install pycaw comtypes sounddevice
+pip install pyinstaller
 ```
 
 ---
@@ -98,19 +105,20 @@ pip install pycaw comtypes sounddevice
 
 ### Cách 1: Cài đặt từ file build (Khuyên dùng)
 
-Tải file `.msi` hoặc `.exe` từ [Releases](https://github.com/NguyenThanhDat2410/server-dashboard/releases) và chạy.
+Tải file `.msi` hoặc `.exe` từ [Releases](https://github.com/NguyenThanhDat2410/multitool-pro/releases) và chạy.
+
+> ✅ Bản build mới **đóng gói cả backend Python** — người dùng cuối **không cần cài Python hay thư viện**. App chạy khép kín, backend tự giải nén và chạy ngầm ở `%LOCALAPPDATA%\multitool-pro\`.
 
 File cài đặt sẽ tự động:
-1. Cài đặt Python + thư viện (nếu chưa có)
-2. Tạo shortcut Start Menu + Desktop
-3. Cấu hình backend chạy ngầm
+1. Tạo shortcut Start Menu + Desktop
+2. Cấu hình backend chạy ngầm
 
 ### Cách 2: Chạy từ mã nguồn
 
 ```bash
 # Clone repo
-git clone https://github.com/NguyenThanhDat2410/server-dashboard.git
-cd server-dashboard
+git clone https://github.com/NguyenThanhDat2410/multitool-pro.git
+cd multitool-pro
 
 # Cài đặt frontend
 npm install
@@ -118,16 +126,15 @@ npm install
 # Build frontend
 npm run build
 
-# Chạy backend
-cd backend
-pip install flask flask-cors psutil
-python app.py &
+# Cài backend deps + chạy backend
+pip install -r backend/requirements.txt
+python backend/app.py &
 
 # Mở trình duyệt
 start http://127.0.0.1:5050
 ```
 
-### Cách 3: Build Tauri app
+### Cách 3: Build installer (NSIS/MSI)
 
 ```bash
 # Yêu cầu: Rust + Tauri CLI
@@ -135,9 +142,54 @@ npm install -g @tauri-apps/cli
 npm run tauri build
 ```
 
-File output tại:
-- MSI: `src-tauri/target/release/bundle/msi/Server Dashboard_x64_en-US.msi`
-- EXE: `src-tauri/target/release/bundle/nsis/Server Dashboard_x64-setup.exe`
+File output tại (`<version>` lấy từ `src-tauri/tauri.conf.json`):
+- MSI: `src-tauri/target/release/bundle/msi/MultiTool Pro_<version>_x64_en-US.msi`
+- EXE: `src-tauri/target/release/bundle/nsis/MultiTool Pro_<version>_x64-setup.exe`
+
+> ⚠️ **Lưu ý quan trọng**: `npm run tauri build` trần sẽ chạy với `backend-embed/backend.exe` **placeholder rỗng** nếu chưa chạy PyInstaller (build.rs tự tạo placeholder để code compile được + cảnh báo). Installer tạo ra sẽ **không có backend bên trong** — dùng **Cách 4** để build đúng chuẩn khép kín.
+
+### Cách 4: Build portable khép kín 1 file (Khuyên dùng cho dev)
+
+Bản portable = **1 file `.exe` duy nhất** chứa cả frontend + backend Python + mọi dependency. Chạy được ngay trên máy Windows bất kỳ, **không cần cài Python**, không cần cài đặt.
+
+```powershell
+# Chạy từ thư mục gốc project (PowerShell)
+./build-portable.ps1
+```
+
+Pipeline tự động gồm 4 bước:
+1. **`npm run build`** → build frontend ra `dist/`
+2. **PyInstaller** → đóng gói `backend/app.py` + Flask + toàn bộ dependency thành `backend.exe` (~38 MB, nhúng cả `dist/`, `auto-start.ps1`, `printer-monitor/`)
+3. **Embed** → copy `backend.exe` vào `src-tauri/backend-embed/` để `include_bytes!` nhúng thẳng vào binary Rust
+4. **`npx tauri build --no-bundle`** → sinh portable exe + copy vào `release/portable/`
+
+**Output** (`<version>` lấy từ `src-tauri/tauri.conf.json`):
+
+```
+release/portable/MultiTool Pro_<version>_x64.exe   (~47 MB)
+```
+
+**Cơ chế chạy khép kín:** khi app khởi động, Rust giải nén backend từ bytes nhúng ra `%LOCALAPPDATA%\multitool-pro\backend\backend.exe` (chỉ ghi khi thiếu/đổi kích thước) rồi spawn. Debug build ưu tiên chạy `python` từ source để dev nhanh; release build dùng backend nhúng.
+
+> 💡 Dữ liệu người dùng (config, printer settings, debug.log) vẫn nằm ở `%APPDATA%\multitool-pro\` — cài bản mới **không mất dữ liệu cũ**.
+>
+> 🔄 Sau khi build, nếu bản cũ đang chạy sẽ **lock file** → đóng app (hoặc chạy `scripts/cleanup-portable-test.ps1`) trước khi build lại.
+
+---
+
+### Build tự động trên GitHub Actions (CI)
+
+Workflow `.github/workflows/build-release.yml` build release đúng chuẩn trên `windows-latest`:
+
+| Trigger | Kết quả |
+|---------|---------|
+| Push `main` | Build portable + installer NSIS/MSI → upload **artifact** |
+| Push tag `v*` | Tạo **GitHub Release** kèm installer + `latest.json` (auto-update) |
+| Bấm **Run workflow** | Build thủ công từ GitHub UI |
+
+Pipeline CI giống hệt `build-portable.ps1`: npm build → PyInstaller → embed → `tauri build` (thêm bundle NSIS/MSI).
+
+> 🔑 **Auto-update cần signing key**: tạo key bằng `npx tauri signer generate -w ~/.tauri/multitool-pro.key`, thêm vào GitHub Secrets với tên `TAURI_SIGNING_PRIVATE_KEY` (+ `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` nếu có). Không có key → CI vẫn build + release bình thường, chỉ thiếu auto-update.
 
 ---
 
@@ -192,31 +244,26 @@ File output tại:
 ## 🏗 Cấu trúc thư mục
 
 ```
-server-dashboard/
-├── backend/           # Python Flask API
-│   └── app.py         # Main backend server
-├── src/               # React frontend (TypeScript)
-│   ├── App.tsx        # Root component
-│   ├── index.css      # Global styles
-│   ├── types/         # TypeScript interfaces
-│   └── components/
-│       ├── Sidebar.tsx
-│       ├── Header.tsx
-│       ├── Footer.tsx
-│       ├── SettingsModal.tsx
-│       ├── ChangelogModal.tsx
-│       └── modules/
-│           ├── ServersModule.tsx    # Quản lý dự án
-│           ├── PrintersModule.tsx   # Quản lý máy in
-│           ├── AudioModule.tsx      # Quản lý âm thanh
-│           └── FileCopierModule.tsx # Sao chép tập tin
-├── src-tauri/         # Tauri desktop wrapper
-│   ├── src/lib.rs     # Rust backend
-│   ├── icons/         # App icons
+multitool-pro/
+├── backend/              # Python Flask API
+│   ├── app.py            # Main backend server
+│   └── requirements.txt  # Python dependencies
+├── src/                  # React frontend (TypeScript)
+│   ├── App.tsx           # Root component
+│   ├── index.css         # Global styles
+│   ├── types/            # TypeScript interfaces
+│   └── components/       # Sidebar, modals, modules/
+├── src-tauri/            # Tauri desktop wrapper
+│   ├── src/lib.rs        # Rust — spawn backend (nhúng / fallback python)
+│   ├── build.rs          # Đảm bảo backend-embed/backend.exe tồn tại để nhúng
+│   ├── backend-embed/    # backend.exe đã build (gitignored) → include_bytes!
 │   ├── tauri.conf.json
 │   └── Cargo.toml
-├── scripts/           # Utility scripts
-├── dist/              # Built frontend
+├── scripts/              # Utility scripts (cleanup-portable-test.ps1, ...)
+├── build-portable.ps1    # Build portable khép kín 1 file
+├── .github/workflows/    # CI: ci.yml (typecheck) + build-release.yml (release)
+├── release/              # Output: installers + portable/ (gitignored)
+├── dist/                 # Built frontend
 └── package.json
 ```
 
@@ -279,8 +326,52 @@ Backend chạy tại `http://127.0.0.1:5050`
 
 ## 📝 Changelog
 
+### v1.11.4 (11/08/2026)
+- 📦 **Portable khép kín 1 file**: backend Python (Flask + mọi dependency) đóng gói bằng PyInstaller → nhúng trực tiếp vào binary Tauri (`include_bytes!`) → chạy **không cần cài Python**, 1 file `.exe` duy nhất (~47 MB)
+- 🖥 **Tray menu Fluent UI**: menu khay hệ thống custom (glassmorphism, zero padding trái) — điều hướng module, Start/Stop All, toggle audio widget, auto-hide khi mất focus, IPC event bus (`tray-command`)
+- 🖨 **LAN Printer Scan**: tự động quét mạng phát hiện máy in mới chưa cấu hình IP → Windows toast kèm nút "⚡ Gán IP" (deep-link mở thẳng tab Máy in), quét theo chu kỳ + retry khi gửi toast thất bại
+- 🖨 **Vật tư & Supplies**: cấu hình IP máy in mạng → đọc tự động % toner/drum/ink qua SNMP (RFC 3805, thuần Python), hoặc nhập tay cho máy USB; ngưỡng cảnh báo vật tư thấp
+- 🖨 **Background Print Listener**: phát hiện lệnh in hoàn thành bằng `FindFirstPrinterChangeNotification` (event-driven, bắt cả job laser <100ms) — không bỏ sót job khi UI ở tab khác
+- ⚙️ **CI build release**: workflow GitHub Actions (`build-release.yml`) — npm build → PyInstaller → embed → tauri build (NSIS/MSI) → artifact + GitHub Release + `latest.json` khi tag `v*`
+- 🔧 `build-portable.ps1`: script build portable khép kín tự động toàn pipeline
+
+> ⏳ Các mục LAN scan, supplies, listener, portable & CI workflow là tính năng **đang phát triển cho v1.11.4** (chưa phát hành chính thức).
+
+### v1.11.3 (07/08/2026)
+- 🎤 **Audio set-default v2 rewrite**: đặt mic mặc định hoạt động tin cậy (GUID Core Audio thay index thiết bị), verify đổi thành công với backoff retry, chống crash comtypes
+- 🧩 Widget audio quản lý tập trung (`audioWidget.ts`) — đồng bộ trạng thái giữa module, tray menu & Rust
+
+### v1.11.2 (28/07/2026)
+- 🎨 **Major UI overhaul**: redesign server cards (compact footer, bỏ URL tunnel trùng), gom về 1 nút settings
+- 🇻🇳 **Việt hoá 100%** toàn bộ UI (hoàn thiện triệt để so với bản trước)
+- 🌐 Fix tunnel metrics polling (metrics không refresh đúng chu kỳ)
+- 🖥 Servers: làm lại luồng theo dõi, batch actions & npm scripts runner cải tiến
+
+### v1.9.10 (26/07/2026)
+- 📐 Tăng window size + font chữ, sidebar responsive auto-collapse trên màn hình nhỏ
+
+### v1.9.3 (20/07/2026)
+- 🖨 **GDI printer detection**: tự nhận diện máy in GDI (host-based) → badge `driver_type`, bỏ qua EventLog không có dữ liệu, WMI fallback
+
+### v1.9.2 (20/07/2026)
+- 🖨 **Printer page count fixes**: module giám sát C#/PowerShell (XPath query nhanh), fix Properties[3]→[4] cho tên máy in (test thật Windows 11)
+
+### v1.9.1 (20/07/2026)
+- 🐛 Fix PermissionError khi start project, fix audio API 501, update dependencies
+
+### v1.9.0 (20/07/2026)
+- 🗄 **Database Export**: xuất dữ liệu CSV/JSON, SQL syntax highlighting
+- 📋 **Logs Download**: tải log về máy, cải thiện accessibility
+
+### v1.8.0 (20/07/2026)
+- 🗄 **Database Manager**: kết nối SQLite/PostgreSQL/MySQL, SQL editor, xem bảng/dữ liệu
+- ⚡ **Batch Actions**: Start/Stop/Restart All hàng loạt
+- 🔍 **Port Scanner**: phát hiện xung đột cổng, Quick SSL
+- 📋 **Log Search**: tìm kiếm log + npm Scripts runner
+- 📊 **Performance History** + Disk Usage cache
+
 ### v1.6.0 (14/07/2026)
-- 🇻🇳 **Việt hoá 100%** toàn bộ UI
+- 🇻🇳 **Việt hoá giao diện chính** (hoàn thiện toàn diện ở v1.11.2)
 - 🖨 Printer: Watching tự động + auto-detect print + laser detection + thống kê
 - 🎤 Audio: Auto show/hide widget, opacity slider, session timer
 - 🔒 Single Instance Lock (chống chạy 2 cửa sổ)
@@ -318,8 +409,8 @@ Dự án được phân phối dưới giấy phép **MIT**.
 <div align="center">
   <p>Built with ❤️ by <a href="https://github.com/NguyenThanhDat2410">NguyenThanhDat2410</a></p>
   <p>
-    <a href="https://github.com/NguyenThanhDat2410/server-dashboard/issues">Báo cáo lỗi</a>
+    <a href="https://github.com/NguyenThanhDat2410/multitool-pro/issues">Báo cáo lỗi</a>
     ·
-    <a href="https://github.com/NguyenThanhDat2410/server-dashboard/issues">Đề xuất tính năng</a>
+    <a href="https://github.com/NguyenThanhDat2410/multitool-pro/issues">Đề xuất tính năng</a>
   </p>
 </div>

@@ -6,9 +6,17 @@ from flask import Flask, jsonify, request, Response, send_from_directory
 from flask_cors import CORS
 from datetime import datetime, timedelta
 from detector import detect_project
+import printer_mib  # SNMP Printer MIB probe (RFC 3805) — thuần Python, không dependency
 
 # Thư mục gốc của project (chứa backend/, dist/, ...)
-BASE_DIR = Path(__file__).resolve().parent.parent
+# WHY: PyInstaller frozen (sys.frozen=True) → chạy từ backend.exe đóng gói, mọi tài nguyên
+# (dist/, auto-start.ps1, printer-monitor/) được --add-data nhúng vào exe và giải nén ra
+# thư mục tạm sys._MEIPASS lúc chạy → BASE_DIR phải trỏ tới _MEIPASS (không phải project
+# root vì exe có thể nằm bất kỳ đâu). Dev (python backend/app.py) → BASE_DIR = project root.
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+else:
+    BASE_DIR = Path(__file__).resolve().parent.parent
 
 # File cấu hình để ở %APPDATA%/server-dashboard/config.json
 # (chuẩn Windows, không phụ thuộc vào vị trí đặt exe)
@@ -1766,6 +1774,118 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($template)
     except Exception as e:
         debug_log(f"[alert] Toast notification failed: {e}")
         return False
+
+
+# WHY: Escape chuỗi cho an toàn trong XML attribute/text (tên máy in có thể chứa & < >) khi nhúng vào toast XML.
+def _xml_escape(s):
+    """Escape chuỗi cho an toàn trong XML attribute/text (tên máy in có thể chứa & < >)."""
+    return (str(s).replace('&', '&amp;').replace('<', '&lt;')
+            .replace('>', '&gt;').replace('"', '&quot;').replace("'", '&apos;'))
+
+
+# WHY: Gửi Windows toast kèm nút hành động '⚡ Gán IP' cho từng máy phát hiện được — toast mở SPA với ?printer=<tên> để App.tsx chuyển tab + mở card máy đó.
+def _show_printer_toast(detections):
+    """Gửi Windows toast kèm nút hành động '⚡ Gán IP' cho từng máy phát hiện được.
+    Bấm nút (activationType=protocol) → mở SPA backend serve tại 127.0.0.1:5050 với
+    query ?printer=<tên máy> → App.tsx đọc param, chuyển tab Máy in + tự mở card máy đó.
+    Dùng template ToastGeneric (ToastText02 của _show_windows_toast không hỗ trợ action button).
+    Viết XML ra temp file rồi load qua XmlDocument để tránh lỗi escape khi truyền inline."""
+    try:
+        from urllib.parse import quote
+        if not detections:
+            return False
+        pending = detections[:3]
+        title = '📡 Phát hiện máy in mạng mới'
+        if len(pending) > 1:
+            title += f' ({len(pending)} máy)'
+        lines = [
+            f"<text>{_xml_escape(d.get('printer_name', 'Máy in'))} tại "
+            f"{_xml_escape(str(d.get('ip', '?')))} — chưa cấu hình IP</text>"
+            for d in pending
+        ]
+        actions = []
+        for d in pending:
+            name = d.get('printer_name', 'Máy in')
+            url = f'http://127.0.0.1:5050/?printer={quote(name, safe="")}'
+            actions.append(
+                f'<action activationType="protocol" arguments="{_xml_escape(url)}" '
+                f'content="⚡ Gán IP: {_xml_escape(name)}"/>'
+            )
+        xml = (
+            '<?xml version="1.0" encoding="utf-8"?>\n<toast>\n  <visual>\n'
+            '    <binding template="ToastGeneric">\n'
+            f'      <text>{_xml_escape(title)}</text>\n'
+            + ''.join(f'      {ln}\n' for ln in lines)
+            + '    </binding>\n  </visual>\n  <actions>\n'
+            + ''.join(f'    {a}\n' for a in actions)
+            + '  </actions>\n</toast>'
+        )
+        import tempfile, os
+        xml_path = os.path.join(tempfile.gettempdir(), 'multitool_printer_toast.xml')
+        with open(xml_path, 'w', encoding='utf-8') as f:
+            f.write(xml)
+        try:
+            ps_code = (
+                "$doc = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]\n"
+                f"$doc.LoadXml([IO.File]::ReadAllText('{xml_path}'))\n"
+                "$toast = [Windows.UI.Notifications.ToastNotification]::new($doc)\n"
+                '[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("MultiTool Pro").Show($toast)'
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_code],
+                capture_output=True, timeout=5,
+                startupinfo=get_startupinfo(),
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+        finally:
+            try:
+                os.remove(xml_path)
+            except Exception:
+                pass
+        return True
+    except Exception as e:
+        debug_log(f"[alert] Printer toast failed: {e}")
+        return False
+
+
+# Lock bọc check→send→mark của retry toast — 2 thread retry cùng key thức dậy cùng
+# lúc sẽ không cùng vượt qua re-check notified rồi gửi trùng (race hiếm, tự phục hồi
+# ở scan sau, nhưng đóng chặt cho chắc).
+_toast_retry_lock = threading.Lock()
+
+
+# WHY: Retry gửi toast 1 lần sau 10s khi lần đầu THẤT BẠI — chạy thread riêng, tôn trọng lan_scan_notify + re-check notified từ settings mới để tránh toast trùng.
+def _retry_printer_toast(pending):
+    """Retry gửi toast 1 lần sau 10s khi lần đầu THẤT BẠI — chạy trong THREAD RIÊNG
+    nên không block worker quét nền hay Flask. Trước khi gửi lại: (1) tôn trọng
+    lan_scan_notify — user có thể TẮT thông báo trong lúc retry đang ngủ; (2) RE-CHECK
+    notified từ settings mới — nếu luồng khác đã thông báo thành công cùng key thì bỏ
+    qua, tránh toast trùng và tránh log 'vừa thành công vừa thất bại cùng lúc'."""
+    try:
+        time.sleep(10)
+        settings = load_printer_settings()
+        if not settings.get('lan_scan_notify', True):
+            return
+        with _toast_retry_lock:
+            notified = set(settings.get('lan_scan_notified') or [])
+            pending = [d for d in pending if d.get('key') not in notified]
+            if not pending:
+                return
+            if _show_printer_toast(pending):
+                debug_log(f"[printer-scan] Toast retry thành công sau 10s cho: "
+                          + ', '.join(f"{d['printer_name']} ({d['ip']})" for d in pending))
+                settings['lan_scan_notified'] = list(
+                    (notified | {d['key'] for d in pending}))[:200]
+                try:
+                    save_printer_settings(settings)
+                except Exception:
+                    pass
+            else:
+                debug_log(f"[printer-scan] Toast retry THẤT BẠI sau 10s — bỏ: "
+                          + ', '.join(f"{d['printer_name']} ({d['ip']})" for d in pending))
+    except Exception:
+        pass
+
 
 # WHY: Cảnh báo khi request rate vượt ngưỡng — rate tính từ diff ~60s window
 # (không phải count/uptime lifetime bị pha loãng bởi uptime dài) + cooldown 5p.
@@ -3695,6 +3815,26 @@ DEFAULT_PRINTER_SETTINGS = {
     "last_print_date": None,
     "excluded_printers": [],            "page_count": {},  # {printer_name: total_pages} — nhập thủ công hoặc auto-increment
             "page_count_timestamp": {},  # {printer_name: "dd/mm/yy HH:MM:SS"} — thời gian cập nhật cuối
+    # ─── NÂNG CẤP: Vật tư & supplies ─────────────────────────────
+    # printer_ips: {printer_name: ip} — địa chỉ IP cho máy in MẠNG (SNMP/PJL)
+    #   → cho phép đọc tự động page_count + % toner/drum/ink (RFC 3805)
+    # manual_supplies: {printer_name: {supply_key: percent}}
+    #   → dùng cho máy in USB (không có SNMP): người dùng tự nhập % còn lại
+    #   supply_key: "toner" | "drum" | "ink" | ... (tên do người dùng đặt)
+    "printer_ips": {},      # {printer_name: "192.168.1.100"}
+    # printer_communities: {printer_name: "public"|"admin"|...} — SNMP community string
+    #   → mặc định "public"; một số máy in đổi community để bảo mật
+    "printer_communities": {},
+    "manual_supplies": {},  # {printer_name: {"toner": 80, "drum": 45}}
+    # supply_warning_threshold: Ngưỡng % cảnh báo vật tư thấp (mực/drum)
+    "supply_warning_threshold": 20,
+    # ─── Quét LAN nền — tự phát hiện máy in mạng chưa cấu hình IP ──
+    "lan_scan_enabled": True,           # bật/tắt worker quét nền (mặc định 5 phút)
+    "lan_scan_interval_minutes": 5,     # chu kỳ quét (phút, clamp 1-120)
+    "lan_scan_subnet": "",              # subnet quét (VD "192.168.1.0/24"); trống = tự động /24
+    "lan_scan_notify": True,            # gửi Windows toast khi phát hiện máy in mới (cả khi app ẩn)
+    "lan_scan_notified": [],            # ["ip|printer_name"] — đã gửi toast (chống báo lại sau restart)
+    "dismissed_detections": [],         # ["ip|printer_name"] — gợi ý người dùng đã ẩn
 }
 
 # WHY: Merge với DEFAULT_PRINTER_SETTINGS để đảm bảo không thiếu field kể cả khi user xóa key khỏi file.
@@ -3975,6 +4115,11 @@ def api_printer_test(name):
 # Format: {printer_name: {count: int, cached_at: float}}
 _eventlog_cache = {}
 _eventlog_cache_lock = threading.Lock()
+# WHY: TTL 2 phút cho cache page count — số trang chỉ đổi khi có job in mới, không cần
+# query lại mỗi 10s poll. Trước đây TTL 30s VÀ cache check nằm SAU layer C# (layer C#
+# return sớm nên cache không bao giờ được đọc lại) → mỗi poll chạy lại query EventLog
+# 30 ngày → timeout 10s với log lớn (xem query_printer_page_count_eventlogs).
+EVENTLOG_CACHE_TTL = 120
 
 # ─── Printer driver type cache (sống 5 phút) ─────────────────────
 _printer_info_cache = {}
@@ -4135,7 +4280,8 @@ _printer_job_lock = threading.Lock()
 # WHY: Snapshot diff mechanism — so sánh job list hiện tại với lần quét trước.
 # Job biến mất = completed (không phân biệt success/cancel/error).
 # Không xài EventLogs vì GDI printers không tạo Event ID 307.
-# Cần frontend poll auto-detect mỗi 5s để không miss job.
+# Được gọi từ 2 nơi: frontend poll /api/printer/auto-detect VÀ background listener
+# thread (_printer_job_listener_worker) — snapshot dùng chung nên không double-count.
 def detect_completed_print_jobs():
     """
     Phát hiện các lệnh in mới hoàn thành.
@@ -4148,7 +4294,9 @@ def detect_completed_print_jobs():
     
     ⚠️ Hạn chế:
     - Không phân biệt được in thành công vs bị hủy
-    - Chỉ phát hiện được nếu frontend gọi auto-detect liên tục
+    - Chỉ phát hiện được khi có listener quét liên tục (frontend poll auto-detect
+      HOẶC background thread _printer_job_listener_worker — thread đảm bảo detection
+      kể cả khi UI đang ở tab khác)
     - Job biến mất có thể do hủy, lỗi, hoặc hoàn thành
     
     Returns: list [{printer, document, job_id}]
@@ -4163,11 +4311,16 @@ def detect_completed_print_jobs():
         # Quét tất cả local printers
         for p in win32print.EnumPrinters(flags):
             name = p[2]
+            # WHY: Khởi tạo rỗng TRƯỚC try — nếu OpenPrinter/EnumJobs fail (máy in
+            # tắt/ngủ/unplugged), carry-forward snapshot cũ để KHÔNG báo false-positive
+            # "job hoàn thành" (trước đây printer thiếu trong current_jobs → mọi job cũ
+            # bị coi là đã xong → phantom page_count +1 mỗi lần quét khi máy in offline;
+            # với background listener chạy 24/7 thì rủi ro này cao hơn nhiều).
+            current_jobs[name] = {}
             try:
                 handle = win32print.OpenPrinter(name)
                 try:
                     jobs = win32print.EnumJobs(handle, 0, 100, 2)  # Level 2 = JOB_INFO_2 (có TotalPages)
-                    current_jobs[name] = {}
                     for j in jobs:
                         jid = j.get('JobId', 0)
                         status = j.get('Status', 0)
@@ -4178,7 +4331,10 @@ def detect_completed_print_jobs():
                 finally:
                     win32print.ClosePrinter(handle)
             except Exception:
-                pass
+                # WHY: Giữ nguyên snapshot cũ cho printer lỗi (không đánh dấu job biến
+                # mất) — lần sau scan được sẽ so sánh tiếp từ trạng thái cũ.
+                with _printer_job_lock:
+                    current_jobs[name] = dict(_printer_prev_jobs.get(name, {}))
         
         # So sánh: job cũ biến mất = đã hoàn thành
         with _printer_job_lock:
@@ -4371,20 +4527,7 @@ def api_printer_auto_detect():
     """
     try:
         completed = detect_completed_print_jobs()
-        results = []
-        for job in completed:
-            printer_name = job['printer']
-            document = job.get('document', '')
-            job_pages = job.get('total_pages', 0) or 0
-            entry = add_print_history_entry(
-                f"Tự động: {document} ({job_pages} trang)" if document else "Phát hiện in tự động",
-                printer_name
-            )
-            add_print_stats_entry(printer_name, document)
-            # Tự động tăng page_count với số trang thực tế từ job info
-            auto_increment_page_count(printer_name, job_pages)
-            if entry:
-                results.append(entry)
+        results = _process_completed_jobs(completed)
         return jsonify({'detected': results, 'count': len(results)})
     except Exception as e:
         return jsonify({'error': str(e), 'detected': [], 'count': 0})
@@ -4447,6 +4590,207 @@ def add_print_history_entry(action, printer_name):
     save_printer_settings(settings)
     
     return entry
+
+# ═══════════════════════════════════════════════════════════════
+# BACKGROUND PRINT JOB LISTENER (listen mode)
+# ═══════════════════════════════════════════════════════════════
+#
+# WHY: Trước đây phát hiện in xong CHỈ chạy khi frontend mở PrintersModule và poll
+# /api/printer/auto-detect (fire-and-forget mỗi 5-10s). Khi user ở tab khác hoặc app
+# chạy nền → job in xong bị BỎ QUA → page_count không tăng. Thread daemon này chạy
+# liên tục trong backend, đóng vai "listen mode": quét spooler mỗi vài giây, job nào
+# biến mất khỏi queue = đã in xong → tự động tăng page_count + ghi history/stats.
+#
+# Vì sao KHÔNG cần Event 307: EPSON EP-804A không ghi Event ID 307 (đã kiểm chứng
+# no_data ở phần query) — cơ chế snapshot-diff spooler hoạt động cho MỌI loại driver
+# (GDI/inkjet/PCL), không phụ thuộc EventLog.
+#
+# Không double-count với frontend poll: _printer_prev_jobs là snapshot dùng CHUNG
+# (bảo vệ bởi _printer_job_lock) — job được thread tiêu thụ thì API poll trả rỗng
+# và ngược lại.
+PRINTER_LISTENER_INTERVAL = 4  # giây timeout safety poll — notification (FindFirstPrinterChangeNotification) là cơ chế chính
+
+# WHY: Spooler gửi DELETE_JOB notification 2 lần cho cùng 1 job (test thực tế: 1 job -> 2
+# lần increment "snapshot + Fast job fallback"). Cooldown chặn fallback trùng: nếu printer
+# này VỪA xử lý completion trong khoảng này thì bỏ qua (job đã được đếm qua snapshot).
+_PRINTER_LISTENER_FALLBACK_COOLDOWN = 2.0
+_last_completed_at = {}  # printer -> time.monotonic() lần xử lý completion gần nhất
+
+# WHY: Shared helper — xử lý danh sách job hoàn thành (ghi history + stats + auto-
+# increment page_count). Dùng chung bởi /api/printer/auto-detect (frontend poll) VÀ
+# background listener thread — tránh duplicate logic 2 nơi.
+def _process_completed_jobs(completed):
+    """Ghi history + stats + tăng page_count cho các job đã hoàn thành."""
+    if not completed:
+        return []
+    # WHY: Bỏ qua máy in ảo bị ẩn (Microsoft Print to PDF, Fax...) — trước đây
+    # excluded_printers chỉ là frontend-filter, nhưng background listener ghi history/
+    # stats/page_count cho MỌI máy in local → mỗi lần "in ra PDF" tạo entry rác.
+    try:
+        excluded = set(load_printer_settings().get('excluded_printers', []) or [])
+    except Exception:
+        excluded = set()
+    results = []
+    for job in completed:
+        # WHY: Cách ly từng job — 1 job fail (file lock, lỗi ghi) không được làm mất
+        # các job còn lại trong batch (snapshot đã tiêu thụ nên không thể phát hiện lại).
+        try:
+            printer_name = job['printer']
+            document = job.get('document', '')
+            job_pages = job.get('total_pages', 0) or 0
+            if printer_name in excluded:
+                debug_log(f"[printer] Skip excluded printer {printer_name}")
+                continue
+            entry = add_print_history_entry(
+                f"Tự động: {document} ({job_pages} trang)" if document else "Phát hiện in tự động",
+                printer_name
+            )
+            add_print_stats_entry(printer_name, document)
+            # Tự động tăng page_count với số trang thực tế từ job info (JOB_INFO_2),
+            # fallback +1 nếu driver không báo số trang (VD: EPSON EP-804A).
+            auto_increment_page_count(printer_name, job_pages)
+            # WHY: Ghi dấu completion vừa xử lý cho printer này — listener fallback (Fast job)
+            # dùng cooldown này để tránh double-count khi spooler gửi DELETE 2 lần/1 job.
+            _last_completed_at[printer_name] = time.monotonic()
+            if entry:
+                results.append(entry)
+        except Exception as e:
+            debug_log(f"[printer] Process completed job error ({job.get('printer')}): {e}")
+    return results
+
+# WHY: Worker loop của background listener — quét spooler mỗi PRINTER_LISTENER_INTERVAL
+# giây. Bắt lỗi từng job + cả loop để 1 lỗi không giết thread (thread chết = mất
+# detection vĩnh viễn tới khi restart backend).
+# WHY: Handle notification của FindFirstPrinterChangeNotification — pywin32 KHÔNG expose API
+# này (test thực tế: module 'win32print' no attribute). Gọi thẳng winspool.drv qua ctypes.
+# Handle trả về là kernel event — wait được bằng win32event.
+_winspool = None
+
+def _get_winspool():
+    global _winspool
+    if _winspool is None:
+        import ctypes
+        _winspool = ctypes.WinDLL('winspool.drv')
+        _winspool.FindFirstPrinterChangeNotification.restype = ctypes.c_void_p
+        _winspool.FindFirstPrinterChangeNotification.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+        _winspool.FindNextPrinterChangeNotification.restype = ctypes.c_int
+        _winspool.FindNextPrinterChangeNotification.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        _winspool.FindClosePrinterChangeNotification.argtypes = [ctypes.c_void_p]
+    return _winspool
+
+# PRINTER_CHANGE_JOB = 0xF00 (ADD 0x100 | SET 0x200 | DELETE 0x400 | WRITE 0x800) — mọi
+# thay đổi liên quan job trong queue. Cần DELETE (0x400) để nhận biết job đã rời queue.
+_PRINTER_CHANGE_JOB = 0xF00
+_PRINTER_CHANGE_DELETE_JOB = 0x400
+
+# WHY: Duy trì 1 notify handle/máy in. Refresh mỗi vòng: máy in mới (vd cắm lại USB) được
+# đăng ký tự động; máy in đã gỡ thì đóng handle. Máy in phantom (EP-804A đang rút USB) —
+# OpenPrinter vẫn OK, FindFirst có thể fail → bỏ qua, safety poll bù.
+def _refresh_printer_notifications(reg):
+    import ctypes
+    try:
+        import win32print
+        names = [p[2] for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL)]
+    except Exception:
+        return
+    for name in [n for n in list(reg) if n not in names]:
+        ph, nh = reg.pop(name)
+        try:
+            _get_winspool().FindClosePrinterChangeNotification(nh)
+        except Exception:
+            pass
+        try:
+            win32print.ClosePrinter(ph)
+        except Exception:
+            pass
+    for name in names:
+        if name in reg:
+            continue
+        ph = None
+        try:
+            ph = win32print.OpenPrinter(name)
+            nh = _get_winspool().FindFirstPrinterChangeNotification(ctypes.c_void_p(int(ph)), _PRINTER_CHANGE_JOB, 0, None)
+            if nh:
+                reg[name] = (ph, nh)
+            else:
+                try:
+                    win32print.ClosePrinter(ph)
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                if ph is not None:
+                    win32print.ClosePrinter(ph)
+            except Exception:
+                pass
+
+# WHY: Event-driven listener: Windows thông báo NGAY khi job vào/ra queue spooler (FindFirstPrinterChangeNotification) — bắt được cả job laser sống <100ms mà poll không thấy.
+def _printer_job_listener_worker():
+    """Event-driven listener: Windows thông báo NGAY khi job vào/ra khỏi queue spooler
+    (FindFirstPrinterChangeNotification) — bắt được cả job in cực nhanh. Trước đây poll
+    4s: máy in laser (Brother HL-2240D) có job sống trong queue < 100ms → bỏ lỡ ~2/3 lần
+    (đo thực tế: poll 100ms vẫn không thấy job trong queue, listener chỉ bắt được 1/3).
+    Kèm safety poll định kỳ cho trường hợp notification không hoạt động."""
+    import ctypes
+    reg = {}
+    while True:
+        try:
+            _refresh_printer_notifications(reg)
+            if not reg:
+                # Không đăng ký được notification nào (vd winspool lỗi) → poll thay thế
+                completed = detect_completed_print_jobs()
+                if completed:
+                    _process_completed_jobs(completed)
+                    debug_log(f"[printer-listener] {len(completed)} job hoàn thành được xử lý (poll)")
+                time.sleep(2)
+                continue
+            names = list(reg.keys())
+            handles = [reg[n][1] for n in names]
+            import win32event
+            rc = win32event.WaitForMultipleObjects(handles, False, PRINTER_LISTENER_INTERVAL * 1000)
+            if rc >= len(handles):
+                # Timeout (không có sự kiện) → safety poll
+                completed = detect_completed_print_jobs()
+                if completed:
+                    _process_completed_jobs(completed)
+                    debug_log(f"[printer-listener] {len(completed)} job hoàn thành được xử lý (safety)")
+                continue
+            name = names[rc]
+            flags = 0
+            try:
+                cf = ctypes.c_uint32()
+                _get_winspool().FindNextPrinterChangeNotification(ctypes.c_void_p(handles[rc]), ctypes.byref(cf), None, None)
+                flags = cf.value
+            except Exception:
+                pass
+            # Snapshot NGAY lúc notification — ADD_JOB: job vẫn còn trong queue (bắt được
+            # TotalPages); DELETE_JOB: job đã in xong và rời queue.
+            completed = detect_completed_print_jobs()
+            handled_this = any(c.get('printer') == name for c in completed)
+            if completed:
+                _process_completed_jobs(completed)
+                debug_log(f"[printer-listener] {len(completed)} job hoàn thành được xử lý")
+            # DELETE_JOB nhưng snapshot không thấy job (laser quá nhanh — đã rời queue
+            # trước khi ta kịp quét) → fallback +1 để không mất count. Chỉ fallback khi
+            # printer này KHÔNG nằm trong completed (tránh double-count với snapshot trên).
+            # Cooldown: nếu printer này vừa xử lý completion (snapshot path hoặc fallback
+            # trước đó) trong _PRINTER_LISTENER_FALLBACK_COOLDOWN giây → DELETE hiện tại là
+            # notification TRÙNG của cùng 1 job → bỏ qua, không đếm thêm.
+            last_done = _last_completed_at.get(name, 0.0)
+            if (not handled_this and (flags & _PRINTER_CHANGE_DELETE_JOB)
+                    and (time.monotonic() - last_done) > _PRINTER_LISTENER_FALLBACK_COOLDOWN):
+                _process_completed_jobs([{'printer': name, 'document': '', 'job_id': 0, 'total_pages': 0}])
+                debug_log(f"[printer-listener] Fast job fallback on {name} (+1)")
+        except Exception as e:
+            debug_log(f"[printer-listener] Scan error: {e}")
+            # WHY: Clear toàn bộ registration — nếu notify handle stale (spooler restart,
+            # USB rút/cắm lại giữ nguyên tên queue) thì WaitForMultipleObjects lỗi vĩnh
+            # viễn. Clear → vòng sau đăng ký lại từ đầu (idempotent, an toàn).
+            reg.clear()
+            time.sleep(2)
+
+# WHY: Daemon thread — tự tắt khi backend exit, không block shutdown.
+threading.Thread(target=_printer_job_listener_worker, daemon=True).start()
 
 @app.route("/api/printer/log", methods=["GET", "POST"])
 # WHY: GET/POST cùng endpoint — POST ghi log, GET đọc last_print_date + settings.
@@ -4638,6 +4982,49 @@ def api_printer_settings():
             printer_to_delete = data['delete_page_count']
             if 'page_count' in settings and printer_to_delete in settings['page_count']:
                 del settings['page_count'][printer_to_delete]
+        # ─── Supplies nâng cấp ─────────────────────────────
+        if 'printer_ips' in data:
+            settings['printer_ips'] = dict(data['printer_ips'] or {})
+        if 'manual_supplies' in data:
+            settings['manual_supplies'] = dict(data['manual_supplies'] or {})
+        if 'printer_communities' in data:
+            settings['printer_communities'] = dict(data['printer_communities'] or {})
+        if 'delete_printer_ip' in data:
+            # Xóa IP config cho printer cụ thể
+            pdel = data['delete_printer_ip']
+            if 'printer_ips' in settings and pdel in settings['printer_ips']:
+                del settings['printer_ips'][pdel]
+        if 'delete_printer_community' in data:
+            # Xóa community config cho printer cụ thể
+            pdel = data['delete_printer_community']
+            if 'printer_communities' in settings and pdel in settings['printer_communities']:
+                del settings['printer_communities'][pdel]
+        if 'delete_manual_supplies' in data:
+            # Xóa manual supplies cho printer cụ thể
+            pdel = data['delete_manual_supplies']
+            if 'manual_supplies' in settings and pdel in settings['manual_supplies']:
+                del settings['manual_supplies'][pdel]
+        if 'supply_warning_threshold' in data:
+            try:
+                settings['supply_warning_threshold'] = max(1, min(100, int(data['supply_warning_threshold'])))
+            except (TypeError, ValueError):
+                pass
+        # ─── Quét LAN nền ────────────────────────────────────
+        if 'lan_scan_enabled' in data:
+            settings['lan_scan_enabled'] = bool(data['lan_scan_enabled'])
+        if 'lan_scan_interval_minutes' in data:
+            try:
+                settings['lan_scan_interval_minutes'] = max(1, min(120, int(data['lan_scan_interval_minutes'])))
+            except (TypeError, ValueError):
+                pass
+        if 'lan_scan_subnet' in data:
+            settings['lan_scan_subnet'] = (data['lan_scan_subnet'] or '').strip()
+        if 'lan_scan_notify' in data:
+            settings['lan_scan_notify'] = bool(data['lan_scan_notify'])
+        if 'lan_scan_notified' in data:
+            settings['lan_scan_notified'] = list(data['lan_scan_notified'] or [])[:200]
+        if 'dismissed_detections' in data:
+            settings['dismissed_detections'] = list(data['dismissed_detections'] or [])[:100]
         save_printer_settings(settings)
         return jsonify({'status': 'saved', 'settings': settings})
     
@@ -4996,18 +5383,18 @@ def _query_active_print_jobs(printer_name):
     
     return None
 
-# WHY: Hybrid 4 lớp đọc số trang: C#/PS module > cache 30s > EventLog PowerShell
-# (chỉ PCL/PostScript) > WMI+Get-PrintJob (GDI). Mỗi lớp failover sang lớp sau
-# khi không có dữ liệu — vì KHÔNG có 1 nguồn duy nhất cho mọi loại driver.
+# WHY: Hybrid 4 lớp đọc số trang: cache 2 phút (check TRƯỚC) > C#/PS module > EventLog
+# PowerShell (chỉ PCL/PostScript) > WMI (GDI). Mỗi lớp failover sang lớp sau khi không
+# có dữ liệu — vì KHÔNG có 1 nguồn duy nhất cho mọi loại driver.
 def query_printer_page_count_eventlogs(printer_name, port_name):
     """
     Đọc tổng số trang từ Event Logs Windows (PrintService/Operational).
     
-    Cơ chế Hybrid 4 lớp:
-    1. PrinterMonitor C#/PS module (ưu tiên cao nhất)
-    2. PowerShell EventLog (Properties[7]) — dành cho PCL/PostScript printers (EPSON, HP...)
-    3. WMI + Get-PrintJob — dành cho GDI/host-based printers (Brother HL-2240D...)
-    4. Cache 30s TTL
+    Cơ chế Hybrid 4 lớp (cache-first):
+    1. Cache 2 phút — kiểm tra TRƯỚC, tránh query lại mỗi 10s poll
+    2. PrinterMonitor C#/PS module (ưu tiên cao nhất — XPath query nhanh)
+    3. PowerShell EventLog (Properties[7]/[5]) — PCL/PostScript printers (EPSON, HP...)
+    4. WMI + Get-PrintJob — GDI/host-based printers (Brother HL-2240D...)
     
     Args:
         printer_name: Tên máy in (VD: "EPSON L3210 Series")
@@ -5020,9 +5407,22 @@ def query_printer_page_count_eventlogs(printer_name, port_name):
     printer_info = _get_cached_printer_info(printer_name)
     is_gdi = (printer_info.get('driver_type') == 'gdi')
     
-    # Lớp 1: PrinterMonitor C# module (ưu tiên cao nhất, nhanh nhất)
+    # Lớp 1: Kiểm tra cache TRƯỚC (EVENTLOG_CACHE_TTL = 2 phút).
+    # WHY: Trước đây cache check nằm SAU layer C# (layer C# return sớm) → cache gần như
+    # không bao giờ được dùng, mỗi 10s poll chạy lại query EventLog 30 ngày → timeout.
+    with _eventlog_cache_lock:
+        cached = _eventlog_cache.get(printer_name)
+        if cached and (time.time() - cached['cached_at']) < EVENTLOG_CACHE_TTL:
+            # WHY: Không log khi cached=0 (no_data) — máy in không ghi Event 307
+            # sẽ spam "CACHED" mỗi 10s poll (6 dòng/phút).
+            if cached['count'] > 0:
+                debug_log(f"EventLog count CACHED for {printer_name}: {cached['count']}")
+            return cached['count']
+    
+    # Lớp 2: PrinterMonitor C# module (ưu tiên cao nhất — XPath query nhanh, đã fix
+    # bug quét cả log). Timeout 25s: 10s trước đây quá ngắn cho scan 30 ngày.
     try:
-        cs_result = query_printer_monitor_cs(printer_name, "query", timeout=10)
+        cs_result = query_printer_monitor_cs(printer_name, "query", timeout=25)
         if cs_result and cs_result.get('page_count') is not None:
             count = int(cs_result['page_count'])
             if count > 0:
@@ -5033,62 +5433,51 @@ def query_printer_page_count_eventlogs(printer_name, port_name):
     except Exception as e:
         debug_log(f"C#/PS module query error: {e}")
     
-    # Lớp 2: Kiểm tra cache (30s TTL)
-    with _eventlog_cache_lock:
-        cached = _eventlog_cache.get(printer_name)
-        if cached and (time.time() - cached['cached_at']) < 30:
-            debug_log(f"EventLog count CACHED for {printer_name}: {cached['count']}")
-            return cached['count']
-    
     # Lớp 3: PowerShell EventLog (chỉ cho PCL/PostScript printers, 
     # GDI printers thường không tạo Event ID 307)
     if not is_gdi:
         try:
+            # WHY: Gộp 2 query Properties[7] + Properties[5] thành 1 lần scan DUY NHẤT +
+            # dùng -FilterXPath (engine lọc EventID=307/30 ngày ngay tại service, không
+            # tải toàn bộ log về PowerShell). Trước đây 2 subprocess riêng, mỗi cái tải
+            # 30 ngày event về PowerShell rồi lọc → chậm → timeout 10s với log lớn.
             ps_cmd = (
-                'Get-WinEvent -FilterHashtable @{LogName="Microsoft-Windows-PrintService/Operational";'
-                'ID=307;StartTime=(Get-Date).AddDays(-30)} -ErrorAction SilentlyContinue | '
-                f'Where-Object {{ $_.Properties[4].Value -like "*{printer_name}*" }} | '
-                'Select-Object @{N="Pages";E={$_.Properties[7].Value}} | '
-                'Measure-Object -Property Pages -Sum | Select-Object -ExpandProperty Sum'
+                '$evts = Get-WinEvent -LogName "Microsoft-Windows-PrintService/Operational" '
+                '-FilterXPath "*[System[(EventID=307) and TimeCreated[timediff(@SystemTime) <= 2592000000]]]" '
+                '-ErrorAction SilentlyContinue | '
+                'Where-Object { $_.Properties[4].Value -like "*' + printer_name + '*" }; '
+                '$s7 = 0; $s5 = 0; '
+                'foreach ($e in $evts) { '
+                '$v7 = $e.Properties[7].Value; if ($null -ne $v7) { try { $s7 += [int]$v7 } catch {} }; '
+                '$v5 = $e.Properties[5].Value; if ($null -ne $v5) { try { $s5 += [int]$v5 } catch {} } }; '
+                'Write-Output "$s7|$s5"'
             )
             result = subprocess.run(
                 ['powershell', '-NoProfile', '-Command', ps_cmd],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=25,
                 startupinfo=get_startupinfo(),
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
             if result.returncode == 0 and result.stdout.strip():
-                count = int(float(result.stdout.strip()))
-                if count > 0:
+                parts = result.stdout.strip().split('|')
+                try:
+                    c7 = int(float(parts[0]))
+                    c5 = int(float(parts[1]))
+                except (ValueError, IndexError):
+                    c7 = c5 = 0
+                if c7 > 0:
                     with _eventlog_cache_lock:
-                        _eventlog_cache[printer_name] = {'count': count, 'cached_at': time.time()}
-                    debug_log(f"EventLog count for {printer_name}: {count} (Properties[7], 30 days)")
-                    return count
-            
-            # WHY: Properties[7] = 0 (máy in không lưu page count ở field này, hoặc chưa in trang nào)
-            # Fallback: Properties[5] cho Windows cũ hơn. Không log ở đây vì Properties[7]=0
-            # là code path bình thường cho nhiều máy in (VD: EPSON EP-804A).
-            # Nếu cần debug, xem log phía dưới cho kết quả của Properties[5].
-            ps_cmd_fb = (
-                'Get-WinEvent -FilterHashtable @{LogName="Microsoft-Windows-PrintService/Operational";'
-                'ID=307;StartTime=(Get-Date).AddDays(-30)} -ErrorAction SilentlyContinue | '
-                f'Where-Object {{ $_.Properties[4].Value -like "*{printer_name}*" }} | '
-                'Select-Object @{N="Pages";E={$_.Properties[5].Value}} | '
-                'Measure-Object -Property Pages -Sum | Select-Object -ExpandProperty Sum'
-            )
-            result2 = subprocess.run(
-                ['powershell', '-NoProfile', '-Command', ps_cmd_fb],
-                capture_output=True, text=True, timeout=10,
-                startupinfo=get_startupinfo(),
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-            )
-            if result2.returncode == 0 and result2.stdout.strip():
-                count = int(float(result2.stdout.strip()))
-                if count > 0:
+                        _eventlog_cache[printer_name] = {'count': c7, 'cached_at': time.time()}
+                    debug_log(f"EventLog count for {printer_name}: {c7} (Properties[7], 30 days)")
+                    return c7
+                # WHY: Properties[7] = 0 (máy in không lưu page count ở field này, hoặc
+                # chưa in trang nào) → fallback Properties[5] cho Windows cũ hơn. Đây là
+                # code path bình thường cho nhiều máy in (VD: EPSON EP-804A).
+                if c5 > 0:
                     with _eventlog_cache_lock:
-                        _eventlog_cache[printer_name] = {'count': count, 'cached_at': time.time()}
-                    debug_log(f"EventLog count for {printer_name}: {count} (Properties[5] fallback, 30 days)")
-                    return count
+                        _eventlog_cache[printer_name] = {'count': c5, 'cached_at': time.time()}
+                    debug_log(f"EventLog count for {printer_name}: {c5} (Properties[5] fallback, 30 days)")
+                    return c5
         except Exception as e:
             debug_log(f"PowerShell EventLog query error: {e}")
     else:
@@ -5106,6 +5495,13 @@ def query_printer_page_count_eventlogs(printer_name, port_name):
     else:
         # Non-GDI printers: EventLog đã query, nếu vẫn không có → thử WMI
         pass
+
+    # WHY: Cache kết quả "không có dữ liệu" (count=0) — máy in không ghi Event 307
+    # (VD: EPSON EP-804A) trả None mỗi lần query; nếu không cache, mỗi 10s poll lại
+    # chạy full chain C# + PS + WMI → chính máy in trong log lỗi bị query liên tục
+    # (1-2s/query). Cached 0 được caller xử lý giống None (falls qua manual count).
+    with _eventlog_cache_lock:
+        _eventlog_cache[printer_name] = {'count': 0, 'cached_at': time.time()}
     return None
 
 @app.route("/api/printer/page-count")
@@ -5135,8 +5531,28 @@ def api_printer_page_count():
     if not printer_name:
         return jsonify({'page_count': None, 'source': None, 'error': 'Chưa chọn máy in', 'driver_type': None, 'tracking_method': None})
     
-    # 1. EventLogs (PowerShell) — 30 ngày gần nhất, đã cache 30s
     now_str = datetime.now().strftime('%d/%m/%y %H:%M:%S')
+    
+    # 0. SNMP (RFC 3805) — máy in MẠNG đã cấu hình IP: đọc thẳng từ phần cứng
+    #    (prtMarkerLifeCount = tổng số trang lifetime, chính xác nhất).
+    #    Chỉ khi có IP trong settings.printer_ips — không làm chậm máy USB.
+    settings0 = load_printer_settings()
+    saved_ip = (settings0.get('printer_ips') or {}).get(printer_name, '')
+    if saved_ip:
+        try:
+            saved_community = (settings0.get('printer_communities') or {}).get(printer_name, '').strip() or 'public'
+            probe = printer_mib.probe_printer_status(saved_ip, community=saved_community, timeout=1.5, retries=0)
+            if probe.get('online') and probe.get('page_count') is not None:
+                debug_log(f"Page count for {printer_name}: SNMP {probe['page_count']} via {saved_ip}")
+                pr_info = _get_cached_printer_info(printer_name)
+                return jsonify({'page_count': probe['page_count'], 'source': 'snmp', 'printer': printer_name,
+                                'updated_at': now_str,
+                                'driver_type': pr_info.get('driver_type'),
+                                'tracking_method': pr_info.get('tracking_method')})
+        except Exception as e:
+            debug_log(f"page-count SNMP error for {printer_name}: {e}")
+    
+    # 1. EventLogs (PowerShell) — 30 ngày gần nhất, đã cache 30s
     eventlog_count = query_printer_page_count_eventlogs(printer_name, port_name)
     
     # 2. Lấy settings
@@ -5419,6 +5835,562 @@ def api_printer_pjl_status():
     with _pjl_cache_lock:
         _pjl_cache[cache_key] = {'data': result, 'cached_at': time.time()}
     
+    return jsonify(result)
+
+# ═══════════════════════════════════════════════════════════════
+# SUPPLIES — Vật tư máy in (NÂNG CẤP: SNMP RFC 3805 + PJL + manual)
+# ═══════════════════════════════════════════════════════════════
+#
+# Đọc vật tư máy in — 3 nguồn, theo thứ tự:
+#   1. SNMP (printer_mib.py, RFC 3805) — máy in MẠNG có IP:
+#      → Tổng số trang (prtMarkerLifeCount) + % toner/drum/ink
+#        (prtMarkerSuppliesLevel/MaxCapacity) + trạng thái thiết bị.
+#      Kỹ thuật giống các repo cộng đồng: Cartriage, alfonsrv/printer-monitoring,
+#      bieniu/brother (đều walk RFC 3805 supplies table để tính %).
+#   2. PJL network (cổng 9100) — bổ sung khi SNMP không trả supplies
+#      (một số Brother chỉ báo DRUM/ TONER qua @PJL INFO STATUS).
+#   3. Manual (settings.manual_supplies) — máy in USB không có SNMP:
+#      người dùng tự nhập % còn lại (không có đường đọc tự động nào khác
+#      cho USB — đã kiểm chứng: ESC/P-R write-only, WMI = 0, bidi không export).
+#
+# ⚠️ Cache 20s (SUPPLIES_CACHE_TTL) để tránh probe SNMP/PJL mỗi poll 10s.
+# ═══════════════════════════════════════════════════════════════
+
+# ── LAN scan — tự phát hiện IP máy in (SNMP port 161) ──
+_scan_cache = {}
+_scan_cache_lock = threading.Lock()
+SCAN_CACHE_TTL = 60
+
+@app.route("/api/printer/scan")
+# WHY: Người dùng thêm/cấu hình máy in mạng không cần đoán IP — quét cả subnet,
+# host nào trả lời SNMP sysDescr (máy in/thiết bị mạng) sẽ xuất hiện kèm tên model.
+def api_printer_scan():
+    """
+    GET /api/printer/scan?subnet=192.168.1.0/24&community=public&refresh=1
+
+    Quét LAN tìm thiết bị SNMP (máy in). Cache kết quả 60s — dùng refresh=1
+    để quét lại ngay (tốn vài giây).
+
+    Returns:
+        {
+            ok, cached, subnet, scanned, duration_ms,
+            devices: [{ip, model, printer_name, is_printer}],
+            error?
+        }
+    """
+    subnet = request.args.get('subnet', '').strip() or None
+    community = request.args.get('community', '').strip() or 'public'
+    refresh = request.args.get('refresh', '') == '1'
+    cache_key = f'{subnet or "default"}|{community}'
+
+    if not refresh:
+        with _scan_cache_lock:
+            cached = _scan_cache.get(cache_key)
+            if cached and time.time() - cached['ts'] < SCAN_CACHE_TTL:
+                data = cached['data']
+                return jsonify({'ok': not data.get('error'), 'cached': True, **data})
+
+    try:
+        result = printer_mib.scan_lan_printers(subnet=subnet, community=community)
+    except Exception as e:
+        return jsonify({'ok': False, 'cached': False, 'error': str(e),
+                        'devices': [], 'subnet': subnet or '?', 'scanned': 0,
+                        'duration_ms': 0})
+
+    # Gợi ý ghép thiết bị quét được với máy in Windows local
+    # (VD model "EPSON EP-804A series" ↔ máy in "EPSON EP-804A")
+    try:
+        import win32print
+        local_names = [p[2] for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL)]
+        if local_names:
+            printer_mib.annotate_device_matches(result.get('devices') or [], local_names)
+    except Exception:
+        pass
+    # Cập nhật luôn _scan_detections từ quét tay → banner phát hiện hiện ngay
+    # (không phải chờ chu kỳ quét nền tiếp theo)
+    try:
+        _merge_scan_devices(result.get('devices') or [], load_printer_settings())
+    except Exception:
+        pass
+
+    with _scan_cache_lock:
+        if len(_scan_cache) > 20:
+            _scan_cache.clear()
+        _scan_cache[cache_key] = {'ts': time.time(), 'data': result}
+    return jsonify({'ok': not result.get('error'), 'cached': False, **result})
+
+
+# ── Quét LAN nền — tự phát hiện máy in mạng chưa cấu hình IP ──
+# Worker chạy nền mỗi lan_scan_interval_minutes (mặc định 5 phút):
+#   scan subnet → ghép model với máy in Windows → máy nào KHỚP mà chưa
+#   có IP trong settings.printer_ips thì đưa vào _scan_detections để UI báo.
+_scan_detections = []          # [{key, ip, model, printer_name, confidence, first_seen, last_seen, count}]
+_scan_detections_lock = threading.Lock()
+_last_background_scan = None   # epoch seconds của lần quét nền cuối
+DETECTION_PRUNE_HOURS = 24     # bỏ gợi ý sau 24h không còn thấy thiết bị
+DETECTION_MAX = 20             # giới hạn số gợi ý hiển thị
+
+
+# WHY: Ghép kết quả quét vào _scan_detections (thread-safe): gợi ý máy in khớp chưa cấu hình IP, tự prune khi đã gán IP/dismiss/lâu không thấy (24h) hoặc vượt DETECTION_MAX.
+def _merge_scan_devices(devices, settings, now=None):
+    """
+    Ghép kết quả quét vào _scan_detections (thread-safe): máy in khớp với
+    máy Windows mà chưa cấu hình IP → gợi ý. Tự bỏ gợi ý khi: đã gán IP,
+    đã dismiss, lâu không còn thấy (24h), hoặc vượt DETECTION_MAX.
+    Dùng chung cho quét nền lẫn quét tay (để banner cập nhật ngay).
+
+    Returns: SỐ gợi ý MỚI được thêm trong lần này (0 = không có gì mới).
+    """
+    if now is None:
+        now = time.time()
+    ips_configured = set((settings.get('printer_ips') or {}).values())
+    dismissed = set(settings.get('dismissed_detections') or [])
+    new_count = 0
+    refreshed_keys = set()
+    with _scan_detections_lock:
+        for d in devices:
+            mp = d.get('matched_printer')
+            if not mp:
+                continue
+            ip = d.get('ip') or ''
+            if not ip:
+                continue
+            key = f'{ip}|{mp["name"]}'
+            if key in dismissed or ip in ips_configured:
+                continue
+            existing = next((e for e in _scan_detections if e.get('key') == key), None)
+            if existing:
+                existing['last_seen'] = now
+                existing['count'] = existing.get('count', 0) + 1
+                existing['missing_logged'] = False  # thấy lại → reset cờ "mất tích"
+                refreshed_keys.add(key)
+            else:
+                # IP DHCP đổi: cùng máy in nhưng ở IP khác (entry cũ vẫn còn)
+                # → ghi log + xóa entry cũ (thay bằng entry mới) để tránh lặp log mỗi chu kỳ
+                old = next((e for e in _scan_detections
+                            if e.get('printer_name') == mp['name'] and e.get('key') != key), None)
+                if old:
+                    debug_log(f"[printer-scan] IP đổi (DHCP?): {mp['name']} {old['ip']} → {ip}")
+                    _scan_detections.remove(old)
+                _scan_detections.append({
+                    'key': key, 'ip': ip, 'model': d.get('model') or '',
+                    'printer_name': mp['name'], 'confidence': mp.get('confidence'),
+                    'first_seen': now, 'last_seen': now, 'count': 1,
+                    'missing_logged': False,
+                })
+                refreshed_keys.add(key)
+                new_count += 1
+                debug_log(f"[printer-scan] Phát hiện mới: {mp['name']} ({d.get('model') or ''}) tại {ip}"
+                          f" (độ khớp {mp.get('confidence')})")
+        # Dọn với LÝ DO cụ thể (ghi log) thay vì filter vô danh
+        kept, removed = [], []
+        for e in _scan_detections:
+            if e.get('ip') in ips_configured:
+                removed.append((e, 'đã cấu hình IP'))
+            elif e.get('key') in dismissed:
+                removed.append((e, 'user đã ẩn'))
+            elif (now - e.get('last_seen', 0)) >= DETECTION_PRUNE_HOURS * 3600:
+                removed.append((e, f'biến mất khỏi mạng ({DETECTION_PRUNE_HOURS}h không còn thấy)'))
+            else:
+                kept.append(e)
+        _scan_detections[:] = kept[:DETECTION_MAX]
+        if len(kept) > DETECTION_MAX:
+            for e in kept[DETECTION_MAX:]:
+                removed.append((e, 'vượt giới hạn gợi ý hiển thị'))
+        for e, reason in removed:
+            debug_log(f"[printer-scan] Gợi ý đóng: {e['printer_name']} tại {e['ip']} — {reason}")
+        _scan_detections.sort(key=lambda e: e.get('last_seen', 0), reverse=True)
+        # Đánh dấu máy "tạm biến mất" (mất tích > 30 phút, ghi 1 lần duy nhất)
+        for e in _scan_detections:
+            if e['key'] in refreshed_keys:
+                e['missing_logged'] = False
+            elif (now - e.get('last_seen', 0)) > 1800 and not e.get('missing_logged'):
+                mins = int((now - e.get('last_seen', 0)) / 60)
+                debug_log(f"[printer-scan] {e['printer_name']} tại {e['ip']} không thấy trên mạng"
+                          f" ({mins} phút) — có thể đã tắt / ngắt mạng")
+                e['missing_logged'] = True
+    return new_count
+
+
+# WHY: Quét LAN + ghép model với máy Windows + merge detection + gửi Windows toast cho phát hiện MỚI (lan_scan_notified persist chống báo lại sau restart).
+def _run_background_scan(settings):
+    """Quét LAN + ghép máy + cập nhật danh sách máy in mạng chưa cấu hình IP."""
+    global _last_background_scan
+    subnet = (settings.get('lan_scan_subnet') or '').strip() or None
+    try:
+        result = printer_mib.scan_lan_printers(subnet=subnet, timeout=0.35)
+    except Exception as e:
+        debug_log(f"[lan-scan] Lỗi quét nền: {e}")
+        return
+    devices = result.get('devices') or []
+    # Ghép model với máy in Windows local
+    try:
+        import win32print
+        local_names = [p[2] for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL)]
+        if local_names:
+            printer_mib.annotate_device_matches(devices, local_names)
+    except Exception:
+        pass
+    new_count = _merge_scan_devices(devices, settings)
+    _last_background_scan = time.time()
+    with _scan_detections_lock:
+        total_detections = len(_scan_detections)
+    debug_log(f"[printer-scan] Quét nền xong: {result.get('scanned')} host, "
+              f"{len(devices)} thiết bị SNMP, {new_count} phát hiện mới, "
+              f"{total_detections} gợi ý đang hiển thị")
+    # 🔔 Windows toast cho phát hiện MỚI — backend là process độc lập nên gửi
+    # được kể cả khi cửa sổ app đang ẩn/minimized. Chỉ báo khi thêm gợi ý mới
+    # (không lặp lại mỗi chu kỳ 5 phút) và khi user bật lan_scan_notify.
+    # lan_scan_notified (persist) chống báo LẠI sau khi backend/app restart
+    # (detection in-memory bị dựng lại → new_count>0 nhưng key đã thông báo rồi).
+    if new_count > 0 and settings.get('lan_scan_notify', True):
+        try:
+            notified = set(settings.get('lan_scan_notified') or [])
+            with _scan_detections_lock:
+                pending = [e for e in _scan_detections if e.get('key') not in notified][:3]
+            if pending:
+                if _show_printer_toast(pending):
+                    # 📣 Log sự kiện toast đã GỬI THÀNH CÔNG (kèm máy + IP)
+                    debug_log(f"[printer-scan] Đã gửi Windows toast cho: "
+                              + ', '.join(f"{d['printer_name']} ({d['ip']})" for d in pending))
+                    settings['lan_scan_notified'] = list(
+                        (notified | {d['key'] for d in pending}))[:200]
+                    try:
+                        save_printer_settings(settings)
+                    except Exception:
+                        pass
+                else:
+                    debug_log(f"[printer-scan] Gửi Windows toast THẤT BẠI cho: "
+                              + ', '.join(f"{d['printer_name']} ({d['ip']})" for d in pending))
+                    # 🔄 Retry 1 lần sau 10s (thread riêng — không block worker).
+                    # Snapshot các field cần thiết vì detection trong list có thể bị
+                    # prune/thay thế sau khi thread ngủ.
+                    snap = [{k: d.get(k) for k in ('key', 'printer_name', 'ip')} for d in pending]
+                    threading.Thread(target=_retry_printer_toast, args=(snap,), daemon=True).start()
+        except Exception:
+            pass
+
+
+# WHY: Worker nền quét LAN định kỳ theo cài đặt (mặc định 5 phút); chờ 60s sau boot cho hệ thống ổn định.
+def _lan_scan_worker():
+    """Worker nền: quét LAN định kỳ theo cài đặt (mặc định 5 phút).
+    Chờ 60s sau boot cho hệ thống ổn định, rồi ngủ interval → quét."""
+    time.sleep(60)
+    while True:
+        try:
+            settings = load_printer_settings()
+            interval = int(settings.get('lan_scan_interval_minutes', 5) or 5)
+            time.sleep(max(1, min(120, interval)) * 60)
+            if not settings.get('lan_scan_enabled', True):
+                # Tắt quét → bỏ gợi ý cũ (banner không hiện dữ liệu cũ)
+                with _scan_detections_lock:
+                    if _scan_detections:
+                        debug_log(f"[printer-scan] Quét nền bị TẮT — xóa {len(_scan_detections)} gợi ý cũ")
+                        _scan_detections.clear()
+                continue
+            # Reload settings NGAY TRƯỚC khi quét — user có thể đổi IP/subnet/
+            # interval trong lúc worker đang ngủ → không dùng snapshot cũ.
+            _run_background_scan(load_printer_settings())
+        except Exception:
+            time.sleep(120)
+
+
+@app.route("/api/printer/scan-detections")
+# WHY: Frontend poll endpoint — danh sách máy in mạng phát hiện được mà CHƯA
+# cấu hình IP (do worker nền quét định kỳ). Kèm trạng thái cài đặt quét.
+def api_printer_scan_detections():
+    settings = load_printer_settings()
+    with _scan_detections_lock:
+        dets = [dict(e) for e in _scan_detections]
+    return jsonify({
+        'ok': True,
+        'detections': dets,
+        'enabled': bool(settings.get('lan_scan_enabled', True)),
+        'interval_minutes': int(settings.get('lan_scan_interval_minutes', 5) or 5),
+        'subnet': settings.get('lan_scan_subnet') or '',
+        'last_scan': _last_background_scan,
+    })
+
+
+@app.route("/api/printer/scan-detections/dismiss", methods=["POST"])
+# WHY: Ẩn 1 gợi ý — ghi "ip|printer_name" vào dismissed_detections (persist),
+# lần quét sau sẽ bỏ qua. Không ảnh hưởng tới việc cấu hình IP thủ công.
+def api_printer_scan_detections_dismiss():
+    data = request.get_json() or {}
+    ip = (data.get('ip') or '').strip()
+    name = (data.get('printer_name') or '').strip()
+    if not ip or not name:
+        return jsonify({'ok': False, 'error': 'Thiếu ip và printer_name'}), 400
+    key = f'{ip}|{name}'
+    settings = load_printer_settings()
+    dismissed = list(settings.get('dismissed_detections') or [])
+    if key not in dismissed:
+        dismissed.append(key)
+        settings['dismissed_detections'] = dismissed[:100]
+        save_printer_settings(settings)
+    with _scan_detections_lock:
+        _scan_detections[:] = [e for e in _scan_detections if e.get('key') != key]
+    return jsonify({'ok': True})
+
+
+# WHY: Phân loại sự kiện [printer-scan] theo keyword để frontend chọn icon/màu — check keyword cụ thể TRƯỚC keyword chung, 'THẤT BẠI' trước 'Đã gửi' (tránh substring chéo).
+def _classify_scan_event(msg):
+    """Phân loại sự kiện [printer-scan] theo keyword trong message — frontend dùng
+    để chọn icon/màu. Thứ tự quan trọng: check 'THẤT BẠI' TRƯỚC 'Đã gửi' (không trùng
+    substring chéo) và các keyword cụ thể trước các keyword chung."""
+    if 'Phát hiện mới' in msg:
+        return 'discovered'
+    if 'IP đổi (DHCP?)' in msg:
+        return 'ip_changed'
+    if 'không thấy trên mạng' in msg:
+        return 'disappeared'
+    if 'Gợi ý đóng' in msg:
+        return 'closed'
+    if 'Gửi Windows toast THẤT BẠI' in msg:
+        return 'toast_failed'
+    if 'Đã gửi Windows toast' in msg:
+        return 'toast_sent'
+    if 'Quét nền xong' in msg:
+        return 'scan_summary'
+    if 'Quét nền bị TẮT' in msg:
+        return 'scan_disabled'
+    return 'info'
+
+
+# WHY: Đọc sự kiện [printer-scan] gần nhất từ debug.log — đọc TAIL bằng BINARY mode (log ghi \n→CRLF trên Windows, text-mode seek không an toàn) rồi splitlines() xử lý cả \r\n lẫn \n.
+def _read_scan_events(limit=50, type_filter=None):
+    """Đọc các sự kiện [printer-scan] gần nhất từ debug.log.
+    Đọc TAIL bằng BINARY mode (debug.log ghi \n -> CRLF trên Windows; text-mode seek
+    tới byte offset tuỳ ý không an toàn với universal-newline decoder) rồi decode +
+    splitlines() — tự xử lý cả \r\n lẫn \n. Dòng lẻ đầu đoạn cắt bị bỏ.
+    Trả về list mới nhất trước: [{timestamp, type, message}, ...]."""
+    try:
+        size = DEBUG_LOG.stat().st_size
+        with open(DEBUG_LOG, 'rb') as f:
+            if size > 524288:
+                f.seek(size - 524288)
+                f.readline()  # bỏ nửa dòng lẻ ở đầu đoạn cắt
+            raw = f.read().decode('utf-8', errors='replace')
+    except Exception:
+        return []
+    events = []
+    for ln in reversed(raw.splitlines()):
+        m = re.match(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] \[printer-scan\] (.*)$', ln)
+        if not m:
+            continue
+        ts, msg = m.group(1), m.group(2)
+        ev_type = _classify_scan_event(msg)
+        if type_filter and ev_type != type_filter:
+            continue
+        events.append({'timestamp': ts, 'type': ev_type, 'message': msg})
+        if len(events) >= limit:
+            break
+    return events
+
+
+@app.route("/api/printer/scan-events")
+# WHY: Frontend hiển thị lịch sử phát hiện (máy xuất hiện/biến mất, IP DHCP đổi,
+# toast gửi) — parse trực tiếp từ debug.log (đã có sẵn logging [printer-scan]).
+# ?limit= (1-200, mặc định 50) + ?type= (lọc theo loại sự kiện, tùy chọn).
+def api_printer_scan_events():
+    try:
+        limit = int(request.args.get('limit', 50))
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(200, limit))
+    type_filter = (request.args.get('type') or '').strip() or None
+    return jsonify({'ok': True, 'events': _read_scan_events(limit, type_filter)})
+
+
+# Lock chống chồng scan khi bấm "Quét ngay" nhiều lần liên tiếp
+_scan_now_lock = threading.Lock()
+
+
+@app.route("/api/printer/scan-now", methods=["POST"])
+# WHY: Nút "⚡ Quét ngay" trên banner — chạy ĐÚNG hàm quét nền (_run_background_scan,
+# dùng subnet/community đã cấu hình, merge detection + toast Windows) trong THREAD RIÊNG
+# → request trả về ngay, kết quả được UI lấy qua GET /api/printer/scan-detections (poll 10s).
+def api_printer_scan_now():
+    if not _scan_now_lock.acquire(blocking=False):
+        return jsonify({'ok': True, 'already_running': True})
+
+# WHY: Chạy _run_background_scan trong THREAD RIÊNG cho nút 'Quét ngay' — request trả về ngay, kết quả UI poll qua /api/printer/scan-detections.
+    def _worker():
+        try:
+            _run_background_scan(load_printer_settings())
+        except Exception:
+            pass
+        finally:
+            _scan_now_lock.release()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return jsonify({'ok': True, 'already_running': False})
+
+
+threading.Thread(target=_lan_scan_worker, daemon=True).start()
+
+
+_supplies_cache = {}
+_supplies_cache_lock = threading.Lock()
+SUPPLIES_CACHE_TTL = 20
+
+@app.route("/api/printer/supplies")
+# WHY: Endpoint tổng hợp vật tư — SNMP là nguồn chính cho máy mạng, PJL bổ sung,
+# manual cho USB. IP lấy từ query param HOẶC settings.printer_ips (đã cấu hình).
+def api_printer_supplies():
+    """
+    GET /api/printer/supplies?printer=NAME&ip=IP
+
+    Đọc vật tư máy in (số trang đã in, % toner/drum/ink còn lại).
+
+    Query params:
+        printer: Tên máy in
+        ip: Địa chỉ IP (nếu máy in có mạng — SNMP/PJL)
+
+    Returns:
+        {
+            printer, ip, online, model, status,
+            page_count, page_count_source,
+            supplies: [{name, kind, percent, level, max, source, ...}],
+            sources: ['snmp'|'pjl'|'manual'],
+            error?
+        }
+    """
+    printer_name = request.args.get('printer', '').strip()
+    ip = request.args.get('ip', '').strip()
+
+    if not printer_name:
+        settings = load_printer_settings()
+        printer_name = settings.get('selected_printer', '')
+
+    settings = load_printer_settings()
+    if not ip:
+        ip = (settings.get('printer_ips') or {}).get(printer_name, '')
+    # SNMP community string theo từng máy (mặc định "public"; strip chống whitespace)
+    community = (settings.get('printer_communities') or {}).get(printer_name, '').strip() or 'public'
+
+    refresh = request.args.get('refresh', '') == '1'
+    # Cache key gồm cả community — đổi community với cùng IP phải probe lại
+    cache_key = f'{printer_name}|{ip}|{community}'
+    if not refresh:
+        with _supplies_cache_lock:
+            cached = _supplies_cache.get(cache_key)
+            if cached:
+                ttl = cached.get('ttl', SUPPLIES_CACHE_TTL)
+                if (time.time() - cached['cached_at']) < ttl:
+                    return jsonify(cached['data'])
+
+    result = {
+        'printer': printer_name,
+        'ip': ip or None,
+        'community': community if ip else None,
+        'online': False,
+        'model': None,
+        'status': None,
+        'page_count': None,
+        'page_count_source': None,
+        'supplies': [],
+        'sources': [],
+        'error': None,
+    }
+
+    # ── 1. SNMP probe (máy in mạng) ──
+    snmp_ok = False
+    if ip:
+        try:
+            # retries=0 + timeout ngắn: máy chết không được treo request lâu
+            probe = printer_mib.probe_printer_status(ip, community=community, timeout=1.5, retries=0)
+            if probe.get('online'):
+                snmp_ok = True
+                result['online'] = True
+                result['model'] = probe.get('model')
+                result['status'] = probe.get('status')
+                if probe.get('page_count') is not None:
+                    result['page_count'] = probe['page_count']
+                    result['page_count_source'] = 'snmp'
+                for s in probe.get('supplies', []):
+                    s['source'] = 'snmp'
+                    result['supplies'].append(s)
+                result['sources'].append('snmp')
+            else:
+                result['error'] = probe.get('error')
+                debug_log(f"supplies SNMP fail for {printer_name}@{ip}: {probe.get('error')}")
+        except Exception as e:
+            debug_log(f"supplies SNMP error: {e}")
+            result['error'] = str(e)
+
+    # ── 2. PJL network — bổ sung khi SNMP không có supplies / không online ──
+    if ip and (not snmp_ok or not result['supplies']):
+        try:
+            if not snmp_ok:
+                # Thử đọc page count qua PJL khi SNMP chết
+                pjl_resp = _send_pjl_network(ip, 9100, b"@PJL INFO PAGECOUNT", timeout=2)
+                if pjl_resp:
+                    pc = _parse_pjl_page_count(pjl_resp)
+                    if pc and result['page_count'] is None:
+                        result['page_count'] = pc
+                        result['page_count_source'] = 'pjl'
+                    result['sources'].append('pjl')
+            else:
+                # SNMP sống nhưng thiếu supplies → thử @PJL INFO STATUS (drum/toner)
+                status_resp = _send_pjl_network(ip, 9100, b"@PJL INFO STATUS", timeout=2)
+                if status_resp:
+                    parsed = _parse_pjl_status(status_resp)
+                    for key, pct in (('drum_life', 'drum'), ('drum_remaining', 'drum'), ('toner_level', 'toner')):
+                        if key in parsed and parsed[key] is not None:
+                            result['supplies'].append({
+                                'name': 'Trống (Drum)' if key.startswith('drum') else 'Mực (Toner)',
+                                'kind': 'drum' if key.startswith('drum') else 'toner',
+                                'percent': max(0, min(100, int(parsed[key]))),
+                                'level': None, 'max': None, 'unit': None,
+                                'some_remaining': False, 'source': 'pjl',
+                            })
+                            result['sources'].append('pjl')
+        except Exception as e:
+            debug_log(f"supplies PJL error: {e}")
+
+    # ── 3. Manual supplies (máy in USB) — merge vào danh sách ──
+    # WHY: SNMP/PJL là nguồn tự động → ƯU TIÊN. Manual chỉ dùng khi chưa có
+    # nguồn tự động cho kind đó (tránh trùng 2 thanh "Mực (Toner)").
+    manual = (settings.get('manual_supplies') or {}).get(printer_name, {})
+    auto_kinds = {s['kind'] for s in result['supplies']}
+    if manual:
+        label_map = {
+            'toner': 'Mực (Toner)', 'ink': 'Mực (Ink)', 'drum': 'Trống (Drum)',
+            'black': 'Mực Đen (Black)', 'cyan': 'Mực Xanh dương (Cyan)',
+            'magenta': 'Mực Đỏ (Magenta)', 'yellow': 'Mực Vàng (Yellow)',
+        }
+        for key, pct in manual.items():
+            try:
+                pct = int(pct)
+            except (TypeError, ValueError):
+                continue
+            kl = key.lower()
+            if 'toner' in kl:
+                kind = 'toner'
+            elif 'drum' in kl:
+                kind = 'drum'
+            else:
+                kind = 'ink'  # black/cyan/magenta/yellow/ink
+            if kind in auto_kinds:
+                continue  # đã có nguồn tự động cho kind này → bỏ manual
+            result['supplies'].append({
+                'name': label_map.get(kl, key),
+                'kind': kind,
+                'percent': max(0, min(100, pct)),
+                'level': None, 'max': None, 'unit': None,
+                'some_remaining': False, 'source': 'manual',
+            })
+        result['sources'].append('manual')
+
+    # Lưu cache — máy không online (lỗi SNMP) cache lâu hơn (120s) để
+    # không probe lại IP chết mỗi poll 10s → không chặn thread.
+    # Cap 100 entries tránh phình bộ nhớ khi user thử nhiều IP khác nhau.
+    ttl = SUPPLIES_CACHE_TTL if (result.get('online') or result.get('sources')) else 120
+    with _supplies_cache_lock:
+        if len(_supplies_cache) > 100:
+            _supplies_cache.clear()
+        _supplies_cache[cache_key] = {'data': result, 'cached_at': time.time(), 'ttl': ttl}
     return jsonify(result)
 
 # ═══════════════════════════════════════════════════════════════
@@ -6088,6 +7060,11 @@ _mic_level_stream = None
 _mic_level_started = False
 _mic_level_last_poll = 0.0          # time.monotonic() lúc poll gần nhất
 _mic_level_last_error = 0.0         # throttle log lỗi khởi động (tránh spam mỗi 200ms)
+# WHY: Đánh dấu lần start ĐẦU TIÊN của monitor trong 1 process backend — CHỈ lần đầu
+# này mới retry WASAPI dài để né lỗi transient WdmSyncIoctl GLE=0x490 (xem retry block
+# trong _ensure_mic_level_monitor). Sau khi start thành công (hoặc thất bại hoàn toàn)
+# → False, các lần start sau (đổi default mic) dùng retry ngắn 0.4s để không kẹt poll.
+_mic_level_first_start = True
 MIC_LEVEL_IDLE_TIMEOUT = 5.0        # dừng stream sau 5s không có poll
 _mic_level_current_device_id = None  # device id đang được monitor
 # WHY: Thông tin monitor đang chạy (host API + sample rate + device name) — tab Âm thanh
@@ -6287,7 +7264,7 @@ threading.Thread(target=_mic_level_idle_watchdog, daemon=True).start()
 def _ensure_mic_level_monitor():
     """Lazy start InputStream. Nếu stream đang chạy → return ngay (không mở lại).
     Nếu default mic đã đổi → stop stream cũ, start stream mới trên device mới."""
-    global _mic_level_stream, _mic_level_started, _mic_level_last_error, _mic_level_current_device_id, _mic_level_last_default_check, _mic_level_monitor_info
+    global _mic_level_stream, _mic_level_started, _mic_level_last_error, _mic_level_current_device_id, _mic_level_last_default_check, _mic_level_monitor_info, _mic_level_first_start
     # WHY: Check + start trong cùng 1 khóa lock (atomic) — tránh check-then-act race:
     # widget poll /mic-level mỗi 200ms VÀ AudioModule cũng poll /mic-level mỗi 200ms
     # → 2 request song song cùng thấy _mic_level_started=False → cùng tạo InputStream
@@ -6453,7 +7430,13 @@ def _ensure_mic_level_monitor():
                     try:
                         # WHY: WASAPI shared mode (exclusive=False) — không chiếm device độc
                         # quyền, không bị kẹt khi app khác dùng mic, hỗ trợ đổi default tốt.
-                        extra = sd.WasapiSettings(exclusive=False) if 'WASAPI' in hostapi_name else None
+                        # WHY: auto_convert=True (PortAudio paWinWasapiAutoConvert) — WASAPI
+                        # shared mode CHỈ nhận đúng mix format của device (thường 48k 16-bit
+                        # stereo). Không có flag này, mọi rate khác mix format đều fail với
+                        # AUDCLNT_E_UNSUPPORTED_FORMAT (log thực tế: "WASAPI open failed on
+                        # #29 rate=44100 / #30 rate=48000 ... -9999"). auto_convert cho WASAPI
+                        # tự convert format client về mix format → hết lỗi unsupported format.
+                        extra = sd.WasapiSettings(exclusive=False, auto_convert=True) if 'WASAPI' in hostapi_name else None
                         stream = sd.InputStream(
                             device=index,
                             channels=1,
@@ -6482,25 +7465,41 @@ def _ensure_mic_level_monitor():
                         # Retry 1 lần x 0.4s, giới hạn tổng thời gian WASAPI <= ~1.5s — nếu fail
                         # vẫn còn MME fallback (luôn mở được, đúng thiết bị).
                         if 'WASAPI' in hostapi_name and rate in (native, 48000):
-                            time.sleep(0.4)
-                            try:
-                                stream2 = sd.InputStream(
-                                    device=index,
-                                    channels=1,
-                                    samplerate=rate,
-                                    blocksize=1024,
-                                    callback=_mic_level_callback,
-                                    extra_settings=extra,
-                                )
-                                stream2.start()
-                                opened = (stream2, index, hostapi_name, rate)
-                                break
-                            except Exception as e2:
-                                last_err = e2
+                            # WHY: Retry WASAPI NGẮN khi restart monitor (đổi default mic) —
+                            # Windows Audio cần ~0.3-0.6s để nhận device default mới. QUAN
+                            # TRỌNG: loop chạy trên thread request poll /mic-level (200ms),
+                            # retry dài làm widget VU "đứng" + request timeout.
+                            # RIÊNG lần start ĐẦU TIÊN sau khi backend vừa khởi động:
+                            # WASAPI có thể trả lỗi transient WdmSyncIoctl GLE=0x490
+                            # (ERROR_INVALID_DEVICE_STATE — Windows Audio/driver chưa sẵn
+                            # sàng, đã ghi nhận trong log 18:22:08). Retry DÀI hơn
+                            # (0.4/1.0/2.0s) chỉ trong lần đầu để né lỗi này; nếu vẫn fail
+                            # → MME fallback. Tổng ~3.4s block lần đầu — trade-off chấp
+                            # nhận được (chỉ xảy ra 1 lần khi monitor khởi động lần đầu).
+                            # WHY: Retry dài CHỈ cho native rate — nếu áp cả 48000, device có
+                            # native=44100 (VD: PC-LM1E) sẽ chạy retry 3.4s x2 (native + 48000)
+                            # = ~6.8s block lần đầu, gấp đôi trade-off đã thống nhất (~3.4s).
+                            retry_delays = (0.4, 1.0, 2.0) if (_mic_level_first_start and rate == native) else (0.4,)
+                            for _rd in retry_delays:
+                                time.sleep(_rd)
                                 try:
-                                    stream2.close()
-                                except Exception:
-                                    pass
+                                    stream2 = sd.InputStream(
+                                        device=index,
+                                        channels=1,
+                                        samplerate=rate,
+                                        blocksize=1024,
+                                        callback=_mic_level_callback,
+                                        extra_settings=extra,
+                                    )
+                                    stream2.start()
+                                    opened = (stream2, index, hostapi_name, rate)
+                                    break
+                                except Exception as e2:
+                                    last_err = e2
+                                    try:
+                                        stream2.close()
+                                    except Exception:
+                                        pass
                             if opened:
                                 break
                             # WHY: Log 1 lần cho thấy lý do WASAPI thất bại (không spam —
@@ -6534,15 +7533,26 @@ def _ensure_mic_level_monitor():
                     'device_index': index,
                     'device_name': _dev_name,
                 }
+            # WHY: Monitor đã start — không còn là lần đầu. Lần start sau (đổi default
+            # mic, widget đóng/mở lại) dùng retry WASAPI ngắn.
+            _mic_level_first_start = False
             debug_log(f"[mic-level] Monitor started on device #{index} [{hostapi_name}] '{_dev_name}' rate={rate} (pycaw_id={default_mic_id})")
-        elif time.monotonic() - _mic_level_last_error > 30:
-            # WHY: Không có mic mặc định — log tối đa 1 lần/30s (poll 200ms sẽ spam)
-            _mic_level_last_error = time.monotonic()
-            with _mic_level_lock:
-                _mic_level_stream = None
-                _mic_level_monitor_info = None
-            debug_log("[mic-level] No default input device found")
+        else:
+            # WHY: Lần đầu thất bại hoàn toàn (vd không có default mic) — tắt chế độ
+            # retry dài ngay: nếu giữ True, mỗi poll 200ms lại block ~3.4s retry WASAPI
+            # → widget VU meter "đứng" vĩnh viễn tới khi có mic khả dụng.
+            _mic_level_first_start = False
+            if time.monotonic() - _mic_level_last_error > 30:
+                # WHY: Không có mic mặc định — log tối đa 1 lần/30s (poll 200ms sẽ spam)
+                _mic_level_last_error = time.monotonic()
+                with _mic_level_lock:
+                    _mic_level_stream = None
+                    _mic_level_monitor_info = None
+                debug_log("[mic-level] No default input device found")
     except Exception as e:
+        # WHY: Reset flag trong mọi đường lỗi — nếu sót, flag True vô hạn → mỗi poll
+        # lại thử retry dài (dù thực tế retry block không chạm tới khi sounddevice thiếu).
+        _mic_level_first_start = False
         if time.monotonic() - _mic_level_last_error > 30:
             # WHY: Throttle log lỗi khởi động — tránh spam mỗi 200ms khi thiếu dependency
             _mic_level_last_error = time.monotonic()

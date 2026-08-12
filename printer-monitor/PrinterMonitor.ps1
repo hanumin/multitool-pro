@@ -66,11 +66,12 @@ function Query-PageCount {
     param([string]$printerFilter = "")
 
     try {
-        $events = Get-WinEvent -FilterHashtable @{
-            LogName   = $LogName
-            ID        = $EventId
-            StartTime = (Get-Date).AddDays(-30)
-        } -ErrorAction SilentlyContinue
+        # WHY: Dùng -FilterXPath thay vì -FilterHashtable — Windows EventLog engine lọc
+        # EventID=307 trong 30 ngày NGAY TẠI service (timediff <= 2,592,000,000 ms).
+        # FilterHashtable tải toàn bộ event 307/30 ngày về PowerShell rồi lọc message
+        # → chậm (> 10s timeout) khi log có hàng nghìn event (máy in in liên tục).
+        $xpath = '*[System[(EventID=307) and TimeCreated[timediff(@SystemTime) <= 2592000000]]]'
+        $events = Get-WinEvent -LogName $LogName -FilterXPath $xpath -ErrorAction SilentlyContinue
 
         $totalPages = 0
         $eventCount = 0
@@ -169,10 +170,10 @@ function Listen-PrintJobs {
 
 # ─── Stats for all printers ───────────────────────────────
 function Get-AllStats {
-    $events = Get-WinEvent -FilterHashtable @{
-        LogName = $LogName; ID = $EventId
-        StartTime = (Get-Date).AddDays(-30)
-    } -ErrorAction SilentlyContinue
+    # WHY: FilterXPath giống Query-PageCount — engine lọc ID=307/30 ngày tại service,
+    # tránh tải toàn bộ log về PowerShell (chậm → timeout với log lớn).
+    $xpath = '*[System[(EventID=307) and TimeCreated[timediff(@SystemTime) <= 2592000000]]]'
+    $events = Get-WinEvent -LogName $LogName -FilterXPath $xpath -ErrorAction SilentlyContinue
 
     $printerStats = @{}
 

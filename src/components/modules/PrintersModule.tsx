@@ -27,6 +27,93 @@ interface PrinterSettings {
   last_print_date: string | null
   excluded_printers?: string[]
   page_count?: Record<string, number>
+  // ─── Supplies nâng cấp ───
+  printer_ips?: Record<string, string>        // {printer: IP} — máy in mạng (SNMP/PJL)
+  printer_communities?: Record<string, string> // {printer: 'public'|'admin'|...} — SNMP community string
+  manual_supplies?: Record<string, Record<string, number>>  // {printer: {toner: %, drum: %}}
+  supply_warning_threshold?: number           // Ngưỡng % cảnh báo vật tư thấp (mặc định 20)
+  // ─── Quét LAN nền (tự phát hiện máy in mạng chưa cấu hình IP) ───
+  lan_scan_enabled?: boolean
+  lan_scan_interval_minutes?: number
+  lan_scan_subnet?: string
+  lan_scan_notify?: boolean             // Gửi Windows toast khi phát hiện máy in mới
+  dismissed_detections?: string[]
+}
+
+interface PrinterSupply {
+  name: string
+  kind: 'toner' | 'ink' | 'drum' | 'developer' | 'waste' | 'other' | string
+  percent: number | null
+  level?: number | null
+  max?: number | null
+  some_remaining?: boolean
+  source: string
+}
+
+interface SuppliesInfo {
+  printer: string
+  ip?: string | null
+  community?: string | null
+  online: boolean
+  model?: string | null
+  status?: string | null
+  page_count?: number | null
+  page_count_source?: string | null
+  supplies: PrinterSupply[]
+  sources?: string[]
+  error?: string | null
+}
+
+// ── LAN scan — thiết bị tìm được khi quét SNMP port 161 ──
+interface LanScanDevice {
+  ip: string
+  model: string
+  printer_name: string | null
+  is_printer: boolean
+  // Gợi ý máy in Windows khớp với thiết bị này (từ backend)
+  matched_printer?: { name: string; confidence: number } | null
+}
+
+interface LanScanResult {
+  devices: LanScanDevice[]
+  subnet: string
+  scanned: number
+  duration_ms: number
+  error?: string
+}
+
+// Máy in mạng phát hiện được bởi quét LAN nền — chưa cấu hình IP
+interface ScanDetection {
+  key: string
+  ip: string
+  model: string
+  printer_name: string
+  confidence?: number
+  first_seen: number
+  last_seen: number
+  count: number
+}
+
+// WHY: Sự kiện [printer-scan] từ debug.log — GET /api/printer/scan-events.
+// type phân loại sẵn ở backend; frontend chỉ map sang icon/màu để hiển thị.
+interface ScanEvent {
+  timestamp: string
+  type: string
+  message: string
+}
+
+// WHY: Icon/màu cho từng loại sự kiện phát hiện — khớp type do backend phân loại
+// (_classify_scan_event). Key fallback 'info' cho sự kiện chưa biết.
+const SCAN_EVENT_META: Record<string, { icon: string; color: string }> = {
+  discovered:   { icon: '🆕', color: '#22c55e' },
+  ip_changed:   { icon: '🔁', color: '#f59e0b' },
+  disappeared:  { icon: '📴', color: '#94a3b8' },
+  closed:       { icon: '🏁', color: '#38bdf8' },
+  toast_sent:   { icon: '🔔', color: '#22c55e' },
+  toast_failed: { icon: '⚠️', color: '#ef4444' },
+  scan_summary: { icon: '📊', color: '#a78bfa' },
+  scan_disabled:{ icon: '⏹️', color: '#ef4444' },
+  info:         { icon: 'ℹ️', color: '#94a3b8' },
 }
 
 interface PrinterStats {
@@ -75,6 +162,10 @@ interface PrintersModuleProps {
   backgroundPolling?: boolean
   onBackgroundPollingChange?: (enabled: boolean) => void
   preloadedData?: PreloadedData
+  // WHY: Deep-link từ Windows toast (nút 'Gán IP') — App.tsx đọc ?printer= param
+  // rồi truyền tên máy xuống; module tự mở card máy đó khi printers đã load xong.
+  openPrinter?: string | null
+  onOpenPrinterHandled?: () => void
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -171,7 +262,7 @@ const statusGradients: Record<string, string> = {
 // WHY: Module quản lý máy in — dashboard, WMI status, print history, settings, PJL diagnostics.
 // Polling 5s: printers + reminder + settings + history + stats + activity + WMI.
 // Kiến trúc: fetchAll() gọi song song 4 API chính → xử lý settings trước → printers sau.
-export default function PrintersModule({ theme, setStatusText, inactive, backgroundPolling, onBackgroundPollingChange, preloadedData }: PrintersModuleProps) {
+export default function PrintersModule({ theme, setStatusText, inactive, backgroundPolling, onBackgroundPollingChange, preloadedData, openPrinter, onOpenPrinterHandled }: PrintersModuleProps) {
   const { addToast } = useToast()
   const pollAbortRef = useRef<AbortController | null>(null)
   // WHY: Nếu có preloadedData từ LoadingScreen, dùng làm initial state để skip loading flash
@@ -187,7 +278,11 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
   const [printerSettings, setPrinterSettings] = useState<PrinterSettings>(preloadedSettingsObj || {
     days_between_prints: 5, selected_printer: '', remind_minutes: 15,
     reminder_enabled: true, last_print_date: null,
-    excluded_printers: [], page_count: {}
+    excluded_printers: [], page_count: {},
+    printer_ips: {}, printer_communities: {}, manual_supplies: {},
+    supply_warning_threshold: 20,
+    lan_scan_enabled: true, lan_scan_interval_minutes: 5, lan_scan_subnet: '',
+    lan_scan_notify: true, dismissed_detections: []
   })
   const [printHistory, setPrintHistory] = useState<PrintHistoryEntry[]>([])
   const [historyOpen, setHistoryOpen] = useState(false)
@@ -201,6 +296,27 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
   const [pjlLoading, setPjlLoading] = useState(false)
   const [pjlIpInput, setPjlIpInput] = useState('')
   const [showPjlIpInput, setShowPjlIpInput] = useState(false)
+
+  // ── Supplies (vật tư) state ──
+  const [suppliesData, setSuppliesData] = useState<Record<string, SuppliesInfo>>({})
+  const [manualSupplyInputs, setManualSupplyInputs] = useState<Record<string, Record<string, string>>>({})
+  const [printerIpInput, setPrinterIpInput] = useState<Record<string, string>>({})
+  const [printerCommunityInput, setPrinterCommunityInput] = useState<Record<string, string>>({})
+  const [suppliesSaving, setSuppliesSaving] = useState<Record<string, boolean>>({})
+
+  // ── LAN scan (tự phát hiện IP máy in trong mạng) ──
+  const [scanResults, setScanResults] = useState<LanScanResult | null>(null)
+  const [scanLoading, setScanLoading] = useState<Record<string, boolean>>({})
+  const [showScanList, setShowScanList] = useState<Record<string, boolean>>({})
+
+  // ── Phát hiện máy in mạng chưa cấu hình IP (quét LAN nền) ──
+  const [scanDetections, setScanDetections] = useState<ScanDetection[]>([])
+  const [scanNowLoading, setScanNowLoading] = useState(false)
+  // ── Lịch sử sự kiện phát hiện (GET /api/printer/scan-events) ──
+  const [scanEvents, setScanEvents] = useState<ScanEvent[]>([])
+  const [scanEventsLoading, setScanEventsLoading] = useState(false)
+  const [scanEventsOpen, setScanEventsOpen] = useState(false)
+  const [scanEventsError, setScanEventsError] = useState(false)
 
   // ── History modal state ──
   const [historySearch, setHistorySearch] = useState('')
@@ -354,7 +470,249 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
   // ──────────────────────────────────────────────────────────────
   // WHY: autoSelectDefault ref: chạy 1 lần duy nhất khi lần đầu fetchAll có printers,
   // chọn máy in mặc định và lưu vào settings. Không chạy lại mỗi 5s poll.
+  // WHY: Fetch vật tư máy in — backend tự resolve IP từ settings.printer_ips.
+  // Nếu force=true → bỏ qua cache backend (khi user bấm nút 🔄 sau khi sửa).
+  const fetchSupplies = useCallback(async (name: string, force = false) => {
+    try {
+      const url = `${API}/api/printer/supplies?printer=${encodeURIComponent(name)}${force ? '&refresh=1' : ''}`
+      const res = await fetchWithRetry(url)
+      if (res.ok) {
+        const data = await res.json()
+        setSuppliesData(prev => ({ ...prev, [name]: data }))
+      }
+    } catch {}
+  }, [])
+
+  // WHY: Lưu cấu hình vật tư — manual_supplies (máy USB nhập tay) + printer_ips (máy mạng).
+  // POST settings → fetch lại supplies để hiển thị ngay dữ liệu SNMP nếu có IP.
+  // overrides.ip/community: dùng khi tự điền từ kết quả quét LAN (setState chưa kịp áp dụng).
+  const saveSuppliesConfig = async (name: string, overrides?: { ip?: string; community?: string }) => {
+    setSuppliesSaving(prev => ({ ...prev, [name]: true }))
+    try {
+      const ms = { ...(printerSettings.manual_supplies || {}) }
+      const edits = manualSupplyInputs[name] || {}
+      const cleaned: Record<string, number> = {}
+      for (const [k, v] of Object.entries(edits)) {
+        const n = parseInt(v)
+        if (!isNaN(n)) cleaned[k] = Math.max(0, Math.min(100, n))
+      }
+      // ⚠️ Chỉ ghi đè khi user ĐÃ mở card máy này (inputs đã được seed).
+      // Tránh xóa nhầm manual_supplies khi gán IP cho máy KHÁC (từ scan)
+      // mà card của máy đó chưa từng mở → inputs rỗng → cleaned = {} → mất dữ liệu.
+      if (manualSupplyInputs[name] !== undefined) {
+        ms[name] = cleaned
+      } else if (!(name in ms)) {
+        ms[name] = {}
+      }
+      const ips = { ...(printerSettings.printer_ips || {}) }
+      const ip = ((overrides?.ip ?? printerIpInput[name]) || '').trim()
+      if (ip) ips[name] = ip
+      else delete ips[name]
+      const coms = { ...(printerSettings.printer_communities || {}) }
+      const com = ((overrides?.community ?? printerCommunityInput[name]) || '').trim()
+      if (com) coms[name] = com
+      else delete coms[name]
+      const res = await fetchWithRetry(`${API}/api/printer/settings`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ manual_supplies: ms, printer_ips: ips, printer_communities: coms })
+      })
+      if (res.ok) {
+        setPrinterSettings(prev => ({ ...prev, manual_supplies: ms, printer_ips: ips, printer_communities: coms }))
+        addToast({ type: 'success', title: `🧰 ${name}`, message: 'Đã lưu vật tư & cấu hình' })
+        fetchSupplies(name, true)
+      }
+    } catch {
+      addToast({ type: 'error', title: `❌ ${name}`, message: 'Lưu vật tư thất bại' })
+    } finally {
+      setSuppliesSaving(prev => ({ ...prev, [name]: false }))
+    }
+  }
+
+  // WHY: Quét LAN qua backend (/api/printer/scan) — backend gửi SNMP GET sysDescr
+  // tới từng host trong subnet, host nào trả lời = thiết bị có SNMP.
+  // refresh=1 luôn quét mới (không dùng cache 60s) vì người dùng chủ động bấm.
+  // ⚠️ Nếu user đã gõ IP (VD 192.168.1.50) → quét /24 QUANH IP đó để né gotcha
+  // VPN/adapter ảo: máy đang chạy VPN có thể lấy nhầm subnet từ IP local.
+  const scanLan = async (name: string) => {
+    setScanLoading(prev => ({ ...prev, [name]: true }))
+    setShowScanList(prev => ({ ...prev, [name]: true }))
+    try {
+      const typedIp = (printerIpInput[name] || '').trim()
+      const ipParts = typedIp.split('.')
+      const isV4 = ipParts.length === 4 && ipParts.every(p => /^\d{1,3}$/.test(p) && +p <= 255)
+      const subnet = isV4 ? `${ipParts[0]}.${ipParts[1]}.${ipParts[2]}.0/24` : undefined
+      const url = `${API}/api/printer/scan?refresh=1${subnet ? `&subnet=${encodeURIComponent(subnet)}` : ''}`
+      const res = await fetchWithRetry(url)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      setScanResults(data)
+      if (!data.ok) addToast({ type: 'error', title: '🌐 Quét LAN', message: data.error || 'Không thể quét mạng' })
+    } catch {
+      setScanResults({ error: 'Không kết nối được backend để quét LAN', devices: [], subnet: '', scanned: 0, duration_ms: 0 })
+      addToast({ type: 'error', title: '🌐 Quét LAN', message: 'Không kết nối được backend' })
+    } finally {
+      setScanLoading(prev => ({ ...prev, [name]: false }))
+    }
+  }
+
+  // WHY: Click 1 thiết bị tìm được → điền IP vào input + LƯU NGAY (override ip)
+  // rồi fetch supplies để thấy SNMP data (page count, % mực) không cần bấm thêm.
+  // targetName = máy in sẽ gán IP (máy khớp gợi ý HOẶC máy đang mở card),
+  // fromCard = card đang hiển thị list (đóng list của card này).
+  // KHÔNG toast riêng ở đây — saveSuppliesConfig đã toast success.
+  const applyScannedIp = (targetName: string, ip: string, fromCard: string) => {
+    setPrinterIpInput(prev => ({ ...prev, [targetName]: ip }))
+    setShowScanList(prev => ({ ...prev, [fromCard]: false }))
+    saveSuppliesConfig(targetName, { ip })
+  }
+
+  // WHY: Mở rộng card máy in + seed inputs + fetch dữ liệu. Tách thành hàm để
+  // tái sử dụng từ banner phát hiện máy in mạng (không chỉ click trên card).
+  const expandPrinter = (pr: Printer) => {
+    const newSel = selectedPrinter === pr.name ? null : pr.name
+    setSelectedPrinter(newSel)
+    if (newSel) {
+      setPjlData(null)
+      fetchJobs(pr.name)
+      fetchSupplies(pr.name)
+      // Seed inputs cho editor vật tư thủ công từ settings hiện tại
+      setManualSupplyInputs(prev => {
+        if (prev[pr.name]) return prev
+        const ms = (printerSettings.manual_supplies || {})[pr.name] || {}
+        const keys = pr.is_laser ? ['toner', 'drum'] : ['black', 'cyan', 'magenta', 'yellow']
+        const seeded: Record<string, string> = {}
+        keys.forEach(k => { seeded[k] = ms[k]?.toString() || '' })
+        return { ...prev, [pr.name]: seeded }
+      })
+      // Guard giống manualSupplyInputs: giữ text đang gõ nếu đã seed rồi
+      setPrinterIpInput(prev => prev[pr.name] !== undefined ? prev : { ...prev, [pr.name]: (printerSettings.printer_ips || {})[pr.name] || '' })
+      setPrinterCommunityInput(prev => prev[pr.name] !== undefined ? prev : { ...prev, [pr.name]: (printerSettings.printer_communities || {})[pr.name] || '' })
+      setPrinterSettings(prev => ({ ...prev, selected_printer: pr.name }))
+      fetchWithRetry(`${API}/api/printer/settings`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ selected_printer: pr.name })
+      }).catch(() => {})
+      fetchWithRetry(`${API}/api/printer/wmi-status?printer=${encodeURIComponent(pr.name)}`)
+        .then(r => r.json()).then(d => setWmiStatus(d)).catch(() => {})
+      // Auto-fetch page count
+      fetchWithRetry(`${API}/api/printer/page-count?printer=${encodeURIComponent(pr.name)}&port=${encodeURIComponent(pr.port || '')}`)
+        .then(r => r.json()).then(pc => {
+          if (pc?.page_count !== null) {
+            setPrinterSettings(prev => ({
+              ...prev,
+              page_count: { ...(prev.page_count || {}), [pr.name]: pc.page_count }
+            }))
+          }
+        }).catch(() => {})
+    }
+  }
+
+  // WHY: Nút "Mở cấu hình" trên banner phát hiện → mở card máy in tương ứng
+  // (card sẽ hiện panel 🧰 với input IP + nút Quét mạng để gán IP).
+  // Nếu máy đang bị ẩn trong excluded_printers → TỰ BỎ ẨN (state + persist
+  // backend) để card hiển thị — tránh bấm mà không thấy gì.
+  const openDetectedPrinter = (name: string) => {
+    const excluded = printerSettings.excluded_printers || []
+    if (excluded.includes(name)) {
+      const newExcluded = excluded.filter(n => n !== name)
+      setPrinterSettings(prev => ({ ...prev, excluded_printers: newExcluded }))
+      fetchWithRetry(`${API}/api/printer/settings`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ excluded_printers: newExcluded })
+      }).catch(() => {})
+      addToast({ type: 'info', title: `🙈 ${name}`, message: 'Đã bỏ ẩn để mở cấu hình' })
+    }
+    const pr = printers.find(p => p.name === name)
+    if (pr) expandPrinter(pr)
+    else {
+      setSelectedPrinter(name)
+      setPrinterSettings(prev => ({ ...prev, selected_printer: name }))
+    }
+    // Cuộn tới card máy in (có thể nằm dưới viewport sau khi bỏ ẩn)
+    setTimeout(() => {
+      const el = document.querySelector(`[data-printer-name="${CSS.escape(name)}"]`)
+      el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    }, 200)
+  }
+
+  // WHY: Deep-link từ Windows toast — App.tsx đọc ?printer=NAME và truyền openPrinter.
+  // Chờ printers load xong (loading=false) rồi mở card máy đó 1 lần duy nhất
+  // (deepLinkHandledRef chống lặp lại mỗi lần fetchAll đổi mảng printers mỗi poll).
+  const deepLinkHandledRef = useRef<string | null>(null)
+  useEffect(() => {
+    // WHY: Reset ref khi prop bị clear (App gọi onOpenPrinterHandled) — nếu không,
+    // deep-link lần 2 cho CÙNG tên máy (máy bị phát hiện lại / IP đổi / restart app)
+    // sẽ bị chặn nhầm bởi guard ref === openPrinter và card không bao giờ mở.
+    if (!openPrinter) { deepLinkHandledRef.current = null; return }
+    if (deepLinkHandledRef.current === openPrinter) return
+    if (loading) return
+    deepLinkHandledRef.current = openPrinter
+    openDetectedPrinter(openPrinter)
+    onOpenPrinterHandled?.()
+  }, [openPrinter, loading, printers, onOpenPrinterHandled])
+
+  // WHY: Nút "⚡ Quét ngay" trên banner → POST /api/printer/scan-now (chạy đúng
+  // hàm quét nền trong thread riêng của backend, trả về ngay). Kết quả detection
+  // được fetchAll poll (10s) cập nhật; gọi thêm 1 lần fetchAll sau ~5s cho nhanh.
+  const scanNow = async () => {
+    if (scanNowLoading) return
+    setScanNowLoading(true)
+    try {
+      const res = await fetchWithRetry(`${API}/api/printer/scan-now`, { method: 'POST' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      if (data.already_running) {
+        addToast({ type: 'info', title: '📡 Quét ngay', message: 'Một lượt quét đang chạy...' })
+      } else {
+        addToast({ type: 'info', title: '📡 Quét ngay', message: 'Đang quét LAN... kết quả cập nhật trong vài giây' })
+        setTimeout(() => fetchAll(), 5000)
+      }
+    } catch {
+      addToast({ type: 'error', title: '📡 Quét ngay', message: 'Không kết nối được backend' })
+    } finally {
+      setScanNowLoading(false)
+    }
+  }
+
+  // WHY: Nút "📜 Lịch sử" trên banner → GET /api/printer/scan-events (parse trực tiếp
+  // từ debug.log) → mở modal hiển thị các sự kiện phát hiện (mới nhất trước).
+  const openScanEvents = async () => {
+    setScanEventsOpen(true)
+    setScanEventsLoading(true)
+    setScanEventsError(false)
+    try {
+      const res = await fetchWithRetry(`${API}/api/printer/scan-events?limit=100`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      setScanEvents(data.events || [])
+    } catch {
+      setScanEvents([])
+      setScanEventsError(true)
+      addToast({ type: 'error', title: '📜 Lịch sử phát hiện', message: 'Không tải được lịch sử (backend?)' })
+    } finally {
+      setScanEventsLoading(false)
+    }
+  }
+
+  // WHY: Ẩn 1 gợi ý phát hiện → POST dismiss (persist) + xóa khỏi state local.
+  const dismissDetection = async (key: string) => {
+    const det = scanDetections.find(d => d.key === key)
+    if (!det) return
+    try {
+      await fetchWithRetry(`${API}/api/printer/scan-detections/dismiss`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ip: det.ip, printer_name: det.printer_name })
+      })
+      setScanDetections(prev => prev.filter(d => d.key !== key))
+    } catch {
+      addToast({ type: 'error', title: '📡 Ẩn gợi ý', message: 'Không thể ẩn gợi ý này' })
+    }
+  }
+
   const autoSelectDefault = useRef(false)
+  // WHY: fetchAll gộp 4 request độc lập (danh sách máy in, nhắc nhở, settings, lịch sử) bằng
+  // Promise.all để 1 lần load lấy đủ dữ liệu hiển thị — tránh 4 lần spinner riêng lẻ. Dùng
+  // pollAbortRef.current.signal để hủy khi component unmount (tránh setState sau unmount).
   const fetchAll = useCallback(async () => {
     try {
       const signal = pollAbortRef.current?.signal
@@ -376,6 +734,11 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
         const data = await printersRes.json()
         setPrinters(data.printers || [])
         const excluded = settingsData?.settings?.excluded_printers || []
+        // Vật tư: fetch supplies cho MỌI máy hiển thị (badge mực thấp trên list +
+        // dashboard metrics). Backend cache 20s → không tốn probe mỗi poll.
+        ;(data.printers || [])
+          .filter((p: any) => !excluded.includes(p.name))
+          .forEach((p: any) => fetchSupplies(p.name))
         const visibleCount = (data.printers || []).filter((p: any) => !excluded.includes(p.name)).length
         setStatusText(`${visibleCount}/${data.printers?.length || 0} máy in`)
 
@@ -399,6 +762,35 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
         const data = await historyRes.json()
         setPrintHistory(data.history || [])
       }
+
+      // ── Phát hiện máy in mạng chưa cấu hình IP (quét LAN nền) ──
+      try {
+        const detRes = await fetchWithRetry(`${API}/api/printer/scan-detections`, opts)
+        if (detRes.ok) {
+          const dd = await detRes.json()
+          const dets: ScanDetection[] = dd.detections || []
+          setScanDetections(dets)
+          // Toast CHỈ cho phát hiện MỚI (chưa từng thấy — lưu localStorage để
+          // không báo lại mỗi 10s poll và không báo lại sau khi restart app).
+          try {
+            const SEEN_KEY = 'multitool-pro:printer-scan-detections-seen'
+            const seen = new Set<string>(JSON.parse(localStorage.getItem(SEEN_KEY) || '[]'))
+            const newOnes = dets.filter(d => !seen.has(d.key))
+            if (newOnes.length > 0) {
+              newOnes.forEach(d => seen.add(d.key))
+              const seenArr = [...seen]
+              if (seenArr.length > 200) seenArr.splice(0, seenArr.length - 200)
+              localStorage.setItem(SEEN_KEY, JSON.stringify(seenArr))
+              const first = newOnes[0]
+              addToast({
+                type: 'info', duration: 9000,
+                title: '📡 Phát hiện máy in mạng mới',
+                message: `${first.printer_name} tại ${first.ip} — chưa cấu hình IP. Mở card máy in để quét & gán IP.`,
+              })
+            }
+          } catch { /* localStorage lỗi → bỏ qua toast */ }
+        }
+      } catch {}
 
       try {
         const statsRes = await fetchWithRetry(`${API}/api/printer/stats`)
@@ -441,7 +833,7 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
       }
     } catch { setStatusText('Đang tải dữ liệu...') }
     finally { setLoading(false) }
-  }, [setStatusText])
+  }, [setStatusText, fetchSupplies])
 
   // WHY: Polling máy in — chỉ chạy khi module active. Khi inactive: clear interval.
   // Khi active trở lại: fetch ngay lập tức + restart interval (không đợi 5s).
@@ -474,6 +866,53 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
     const mins = reminderInfo.minutes_left || 0
     setCountdownText(`${totalHours}h ${mins}m`)
   }, [reminderInfo])
+
+  // ── Cảnh báo vật tư thấp (tính trước effects để dùng được trong reminder) ──
+  // WHY: Danh sách vật tư dưới ngưỡng (mặc định 20%) cho 1 máy in.
+  // Chỉ cảnh báo toner/ink/drum/developer — không tính waste box (bản chất khác).
+  const supplyThreshold = printerSettings.supply_warning_threshold ?? 20
+  const getLowSupplies = (name: string) => {
+    const info = suppliesData[name]
+    if (!info?.supplies?.length) return []
+    return info.supplies.filter(s =>
+      (s.kind === 'toner' || s.kind === 'ink' || s.kind === 'drum' || s.kind === 'developer') &&
+      s.percent !== null && s.percent < supplyThreshold
+    )
+  }
+  const lowSupplies = getLowSupplies(printerSettings.selected_printer || '')
+
+  // WHY: Reminder vật tư thấp — toast cảnh báo khi mực/drum dưới ngưỡng.
+  // Throttle theo remind_minutes: báo 1 lần khi chuyển từ đủ → thấp, rồi
+  // chỉ nhắc lại định kỳ (remind_minutes) chừng nào vật tư vẫn thấp.
+  // Dùng lowSuppliesKey (string ổn định) làm dep thay vì lowSupplies (array
+  // mới mỗi render) → effect không chạy thừa mỗi poll.
+  const lowSuppliesKey = lowSupplies.map(s => `${s.name}:${s.percent}`).join('|')
+  const lastSupplyWarnRef = useRef(0)
+  const warnPrinterRef = useRef('')
+  useEffect(() => {
+    if (!printerSettings.reminder_enabled) return
+    if (lowSupplies.length === 0) {
+      lastSupplyWarnRef.current = 0
+      return
+    }
+    const now = Date.now()
+    // Đổi máy in đang theo dõi → reset để báo ngay cho máy mới
+    // (không bị nuốt bởi interval còn dư của máy trước)
+    if (warnPrinterRef.current !== printerSettings.selected_printer) {
+      warnPrinterRef.current = printerSettings.selected_printer || ''
+      lastSupplyWarnRef.current = 0
+    }
+    const intervalMs = Math.max(1, (printerSettings.remind_minutes || 15)) * 60 * 1000
+    if (lastSupplyWarnRef.current === 0 || (now - lastSupplyWarnRef.current) >= intervalMs) {
+      lastSupplyWarnRef.current = now
+      const names = lowSupplies.map(s => `${s.name} ${s.percent}%`).join(', ')
+      addToast({
+        type: 'warning',
+        title: `🚨 Vật tư thấp: ${printerSettings.selected_printer || 'Máy in'}`,
+        message: `Cần thay/sạc: ${names}`,
+      })
+    }
+  }, [lowSuppliesKey, printerSettings.reminder_enabled, printerSettings.remind_minutes, printerSettings.selected_printer, addToast])
 
   // WHY: fetchJobs chỉ gọi khi user click expand printer — không poll tự động.
   // [] deps: reference ổn định, tránh re-create khi component re-render.
@@ -557,9 +996,13 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
   // Backend merge vào file JSON. Đóng modal + fetchAll refresh sau khi save.
   const saveSettings = async () => {
     try {
+      // ⚠️ dismissed_detections do BACKEND quản lý (chỉ qua /dismiss) — loại
+      // khỏi payload để tránh ghi đè danh sách đã ẩn bằng snapshot cũ của state.
+      const body = { ...printerSettings }
+      delete (body as any).dismissed_detections
       const res = await fetchWithRetry(`${API}/api/printer/settings`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(printerSettings)
+        body: JSON.stringify(body)
       })
       if (res.ok) { setStatusText('Đã lưu cài đặt'); setSettingsOpen(false); fetchAll() }
     } catch { setStatusText('Thất bại') }
@@ -602,6 +1045,18 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
   const activePrintCount = printActivity.length
   const statsPrinters = printerStats?.printers || {}
   const isLaser = reminderInfo?.is_laser || false
+
+  // Supplies cho dashboard (toner/drum của máy đang theo dõi)
+  const selSupplies = suppliesData[printerSettings.selected_printer || '']?.supplies || []
+  const tonerSupply = selSupplies.find(s => s.kind === 'toner')
+  const drumSupply = selSupplies.find(s => s.kind === 'drum')
+  const inkSupply = selSupplies.find(s => s.kind === 'ink')
+  const tonerPct = tonerSupply?.percent ?? null
+  const drumPct = drumSupply?.percent ?? null
+  const inkPct = inkSupply?.percent ?? null
+  // WHY: Màu thanh % theo ngưỡng CẤU HÌNH (không hardcode 20) để đồng bộ với cảnh báo.
+  const supplyPctColor = (pct: number | null, th: number) =>
+    pct === null ? '#fbbf24' : pct >= 50 ? '#22c55e' : pct >= th ? '#f59e0b' : '#ef4444'
 
   if (loading && printers.length === 0) {
     return (
@@ -663,6 +1118,17 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
                 )}
               </div>
             </div>
+
+            {/* Cảnh báo vật tư thấp (dashboard) */}
+            {lowSupplies.length > 0 && (
+              <div className="mb-3 px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-2 animate-pulse"
+                style={{ backgroundColor: '#ef444415', color: '#f87171', border: '1px solid #ef444430' }}>
+                <span className="text-base shrink-0">🚨</span>
+                <span className="truncate">
+                  Vật tư thấp: {lowSupplies.map(s => `${s.name} ${s.percent}%`).join(' · ')}
+                </span>
+              </div>
+            )}
 
             {/* Main content */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -742,6 +1208,8 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
                     { label: 'Tốc độ in', value: wmiStatus.average_pages_per_minute, unit: 'tr/ph', icon: '⚡', color: '#3b82f6' },
                     { label: 'Độ phân giải', value: wmiStatus.page_resolution || (wmiStatus.horizontal_resolution ? `${wmiStatus.horizontal_resolution} DPI` : null), icon: '🎯', color: '#8b5cf6' },
                     { label: 'Tổng số trang', value: printerSettings.page_count?.[printerSettings.selected_printer], icon: '📄', color: '#f59e0b' },
+                    { label: tonerSupply ? 'Mực (Toner)' : inkSupply ? 'Mực (Ink)' : 'Mực', value: tonerPct ?? inkPct, unit: '%', icon: '🖤', color: supplyPctColor(tonerPct ?? inkPct, supplyThreshold) },
+                    { label: 'Drum', value: drumPct, unit: '%', icon: '🥁', color: supplyPctColor(drumPct, supplyThreshold) },
                   ].map((metric, i) => (
                     <div key={i}
                       className="rounded-xl p-2.5 border transition-all duration-200 hover:scale-[1.02] shadow-sm"
@@ -798,6 +1266,11 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
                 }},
                 { label: 'Ghi nhận in', icon: '✅', color: '#3b82f6', action: recordManualPrint },
                 { label: 'Lịch sử', icon: '📋', color: '#8b5cf6', action: () => setHistoryOpen(true) },
+                // WHY: Luôn hiển thị trong Quick Actions (không chỉ trên banner phát hiện)
+                // — banner chỉ hiện khi có máy chưa cấu hình IP, nên nút lịch sử phát hiện
+                // phải truy cập được kể cả khi không có detection nào đang hiển thị.
+                { label: 'Lịch sử phát hiện', icon: '📜', color: '#a78bfa', action: openScanEvents },
+                { label: 'Quét ngay', icon: '⚡', color: '#60a5fa', action: scanNow },
                 { label: 'Cài đặt', icon: '⚙️', color: '#f59e0b', action: () => { setImportResult(null); setSettingsOpen(true) } },
               ].map((btn, i) => (
                 <button key={i} onClick={btn.action}
@@ -811,6 +1284,18 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
           </div>
 
           {/* Alert area */}
+          {lowSupplies.length > 0 && printerSettings.reminder_enabled && (
+            <div className="mt-2 p-3 rounded-xl border text-xs flex items-center gap-3 animate-pulse shadow-sm"
+              style={{ backgroundColor: 'rgba(239,68,68,0.12)', borderColor: 'rgba(239,68,68,0.3)', color: '#f87171' }}>
+              <span className="text-xl shrink-0">🚨</span>
+              <div>
+                <div className="font-bold">Vật tư sắp hết!</div>
+                <div className="text-[10px] mt-0.5 opacity-80">
+                  {lowSupplies.map(s => `${s.name}: ${s.percent}%`).join(' · ')}
+                </div>
+              </div>
+            </div>
+          )}
           {!isLaser && reminderInfo?.should_remind && printerSettings.reminder_enabled && (
             <div className="mt-2 p-3 rounded-xl border text-xs flex items-center gap-3 animate-pulse shadow-sm"
               style={{ backgroundColor: 'rgba(239,68,68,0.12)', borderColor: 'rgba(239,68,68,0.3)', color: '#f87171' }}>
@@ -833,6 +1318,57 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
           )}
         </div>
       </div>
+
+      {/* 📡 Phát hiện máy in mạng chưa cấu hình IP (quét LAN nền) */}
+      {scanDetections.length > 0 && printerSettings.lan_scan_enabled !== false && (
+        <div className="mx-4 mb-1 rounded-xl border px-3 py-2.5 text-xs shrink-0"
+          style={{ backgroundColor: 'rgba(59,130,246,0.07)', borderColor: 'rgba(59,130,246,0.25)' }}>
+          <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+            <span className="text-sm">📡</span>
+            <span className="font-bold" style={{ color: '#60a5fa' }}>Máy in mạng phát hiện — chưa cấu hình IP</span>
+            <span className="ml-auto flex items-center gap-1.5 shrink-0">
+              <button onClick={scanNow} disabled={scanNowLoading}
+                title="Chạy ngay một lượt quét LAN nền (không chờ chu kỳ định kỳ)"
+                className="px-2 py-0.5 text-[9px] font-bold rounded-md transition-all duration-150 hover:scale-[1.04] active:scale-95 disabled:opacity-40 border-0 cursor-pointer"
+                style={{ backgroundColor: 'rgba(59,130,246,0.15)', color: '#60a5fa' }}>
+                {scanNowLoading ? '⏳ Đang quét...' : '⚡ Quét ngay'}
+              </button>
+              <button onClick={openScanEvents}
+                title="Xem lịch sử phát hiện (máy xuất hiện/biến mất, IP đổi, toast)"
+                className="px-2 py-0.5 text-[9px] font-bold rounded-md transition-all duration-150 hover:scale-[1.04] active:scale-95 border-0 cursor-pointer"
+                style={{ backgroundColor: 'rgba(139,92,246,0.15)', color: '#a78bfa' }}>
+                📜 Lịch sử
+              </button>
+              <span className="text-[9px]" style={{ color: 'var(--fg-dim)' }}>
+                quét nền mỗi {printerSettings.lan_scan_interval_minutes ?? 5} phút
+              </span>
+            </span>
+          </div>
+          <div className="space-y-1">
+            {scanDetections.map(d => (
+              <div key={d.key} className="flex items-center gap-2 rounded-lg px-2 py-1.5"
+                style={{ backgroundColor: 'rgba(59,130,246,0.06)' }}>
+                <span className="shrink-0">🖨️</span>
+                <span className="font-semibold truncate" style={{ color: 'var(--fg)' }}>{d.printer_name}</span>
+                <span className="font-mono text-[10px] shrink-0" style={{ color: 'var(--fg-secondary)' }}>{d.ip}</span>
+                <span className="text-[9px] hidden sm:inline truncate max-w-[180px] shrink-0" style={{ color: 'var(--fg-dim)' }}>
+                  {d.model}
+                </span>
+                <span className="ml-auto flex items-center gap-1 shrink-0">
+                  <button onClick={() => openDetectedPrinter(d.printer_name)}
+                    className="px-2 py-0.5 text-[9px] font-bold rounded-md transition-all duration-150 hover:scale-[1.04] active:scale-95 border-0 cursor-pointer"
+                    style={{ backgroundColor: 'rgba(59,130,246,0.15)', color: '#60a5fa' }}>
+                    Mở cấu hình
+                  </button>
+                  <button onClick={() => dismissDetection(d.key)} title="Ẩn gợi ý này"
+                    className="px-1.5 py-0.5 text-[10px] rounded-md hover:bg-black/10 dark:hover:bg-white/10 border-0 cursor-pointer"
+                    style={{ color: 'var(--fg-muted)' }}>✕</button>
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* ═══════ PRINTER LIST ═══════ */}
       <div className="flex-1 overflow-y-auto px-4 pb-4 space-y-2">
@@ -867,9 +1403,10 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
             const stats = statsPrinters[pr.name]
             const isSelected = selectedPrinter === pr.name
             const isTracking = printerSettings.selected_printer === pr.name
+            const lowSuppliesPr = getLowSupplies(pr.name)
 
             return (
-              <div key={pr.name}
+              <div key={pr.name} data-printer-name={pr.name}
                 className="rounded-xl border backdrop-blur-sm transition-all duration-200 overflow-hidden animate-device-enter"
                 style={{
                   animationDelay: `${idx * 0.06}s`,
@@ -880,31 +1417,7 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
                 {/* Header bar */}
                 <div
                   className="flex items-center justify-between p-3 cursor-pointer transition-colors duration-150 hover:brightness-110"
-                  onClick={() => {
-                    const newSel = isSelected ? null : pr.name
-                    setSelectedPrinter(newSel)
-                    if (newSel) {
-                      setPjlData(null)
-                      fetchJobs(pr.name)
-                      setPrinterSettings(prev => ({ ...prev, selected_printer: pr.name }))
-                      fetchWithRetry(`${API}/api/printer/settings`, {
-                        method: 'POST', headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ selected_printer: pr.name })
-                      }).catch(() => {})
-                      fetchWithRetry(`${API}/api/printer/wmi-status?printer=${encodeURIComponent(pr.name)}`)
-                        .then(r => r.json()).then(d => setWmiStatus(d)).catch(() => {})
-                      // Auto-fetch page count
-                      fetchWithRetry(`${API}/api/printer/page-count?printer=${encodeURIComponent(pr.name)}&port=${encodeURIComponent(pr.port || '')}`)
-                        .then(r => r.json()).then(pc => {
-                          if (pc?.page_count !== null) {
-                            setPrinterSettings(prev => ({
-                              ...prev,
-                              page_count: { ...(prev.page_count || {}), [pr.name]: pc.page_count }
-                            }))
-                          }
-                        }).catch(() => {})
-                    }
-                  }}>
+                  onClick={() => expandPrinter(pr)}>
                   <div className="flex items-center gap-3 min-w-0 flex-1">
                     {/* Printer icon */}
                     <div className="relative shrink-0 w-9 h-9 flex items-center justify-center rounded-lg"
@@ -930,6 +1443,13 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
                           <span className="text-[8px] font-bold px-1.5 py-0.5 rounded"
                             style={{ backgroundColor: '#eab30815', color: '#fbbf24', border: '1px solid #eab30825' }}>
                             LASER
+                          </span>
+                        )}
+                        {lowSuppliesPr.length > 0 && (
+                          <span title={lowSuppliesPr.map(s => `${s.name} ${s.percent}%`).join(', ')}
+                            className="text-[8px] font-bold px-1.5 py-0.5 rounded animate-pulse"
+                            style={{ backgroundColor: '#ef444415', color: '#f87171', border: '1px solid #ef444425' }}>
+                            MỰC THẤP
                           </span>
                         )}
                         {pr.driver_type === 'gdi' && (
@@ -1183,6 +1703,218 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
                       </div>
                     )}
 
+                    {/* ── Supplies & Consumables (vật tư) ── */}
+                    <div className="rounded-lg p-3 text-xs"
+                      style={{ backgroundColor: 'var(--input-bg)', border: '1px solid var(--border)' }}>
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-[8px] uppercase tracking-wider font-semibold" style={{ color: 'var(--fg-dim)' }}>
+                          🧰 Vật tư & Mực
+                        </span>
+                        <div className="flex items-center gap-1.5">
+                          {(suppliesData[pr.name]?.sources || []).map(src => (
+                            <span key={src} className="text-[8px] px-1.5 py-0.5 rounded-full font-medium"
+                              style={{
+                                backgroundColor: src === 'snmp' ? '#22c55e15' : src === 'pjl' ? '#8b5cf615' : '#f59e0b15',
+                                color: src === 'snmp' ? '#4ade80' : src === 'pjl' ? '#a78bfa' : '#fbbf24',
+                                border: `1px solid ${src === 'snmp' ? '#22c55e25' : src === 'pjl' ? '#8b5cf625' : '#f59e0b25'}`,
+                              }}>
+                              {src === 'snmp' ? 'SNMP' : src === 'pjl' ? 'PJL' : 'Thủ công'}
+                            </span>
+                          ))}
+                          <button onClick={() => fetchSupplies(pr.name, true)}
+                            className="text-[10px] px-1.5 py-0.5 rounded hover:bg-black/10 dark:hover:bg-white/10 border-0 cursor-pointer"
+                            style={{ color: 'var(--fg-muted)' }}>🔄</button>
+                        </div>
+                      </div>
+
+                      {suppliesData[pr.name]?.online && (
+                        <div className="grid grid-cols-2 gap-1.5 mb-2">
+                          <div className="p-1.5 rounded" style={{ backgroundColor: 'var(--bg-card)' }}>
+                            <div className="text-[8px] uppercase" style={{ color: 'var(--fg-dim)' }}>Số trang (SNMP)</div>
+                            <div className="font-mono font-bold" style={{ color: '#22c55e' }}>{suppliesData[pr.name]?.page_count ?? '...'}</div>
+                          </div>
+                          <div className="p-1.5 rounded" style={{ backgroundColor: 'var(--bg-card)' }}>
+                            <div className="text-[8px] uppercase" style={{ color: 'var(--fg-dim)' }}>Trạng thái</div>
+                            <div className="font-semibold truncate" style={{ color: '#60a5fa' }}>{suppliesData[pr.name]?.status || '...'}</div>
+                          </div>
+                        </div>
+                      )}
+                      {suppliesData[pr.name]?.online && suppliesData[pr.name]?.community && (
+                        <div className="text-[8px] px-1 pb-1 -mt-1 font-mono" style={{ color: 'var(--fg-dim)' }}>
+                          SNMP community: {suppliesData[pr.name]?.community}
+                        </div>
+                      )}
+
+                      {suppliesData[pr.name]?.error && (
+                        <div className="p-2 rounded text-[10px] mb-2" style={{ backgroundColor: '#ef444410', color: '#f87171' }}>
+                          ⚠️ {suppliesData[pr.name].error}
+                        </div>
+                      )}
+
+                      {(suppliesData[pr.name]?.supplies || []).length > 0 ? (
+                        <div className="space-y-2">
+                          {suppliesData[pr.name].supplies.map((s, i) => {
+                            const pct = s.percent
+                            const color = supplyPctColor(pct, supplyThreshold)
+                            return (
+                              <div key={i}>
+                                <div className="flex items-center justify-between mb-1">
+                                  <span className="flex items-center gap-1 truncate" style={{ color: 'var(--fg-secondary)' }}>
+                                    <span>{s.kind === 'toner' ? '🖤' : s.kind === 'ink' ? '💧' : s.kind === 'drum' ? '🥁' : s.kind === 'waste' ? '🗑️' : '🧩'}</span>
+                                    <span className="truncate">{s.name}</span>
+                                  </span>
+                                  <span className="font-mono font-bold text-[11px] shrink-0" style={{ color }}>
+                                    {pct !== null ? `${pct}%` : s.some_remaining ? 'Còn lại' : 'N/A'}
+                                  </span>
+                                </div>
+                                <div className="h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--border)' }}>
+                                  <div className="h-full rounded-full transition-all duration-500"
+                                    style={{ width: pct !== null ? `${pct}%` : '0%', backgroundColor: color }} />
+                                </div>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      ) : (
+                        /* ── Editor thủ công cho máy in USB (không có SNMP) ── */
+                        <div className="space-y-1.5">
+                          <p className="text-[9px]" style={{ color: 'var(--fg-dim)' }}>
+                            Máy in USB không đọc được % tự động — nhập tay. Nếu máy in có mạng, đặt IP để đọc SNMP (page count + % toner/drum).
+                          </p>
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[10px] shrink-0" style={{ color: 'var(--fg-muted)' }}>IP mạng:</span>
+                            <input value={printerIpInput[pr.name] || ''}
+                              onChange={e => setPrinterIpInput(prev => ({ ...prev, [pr.name]: e.target.value }))}
+                              placeholder="192.168.1.100"
+                              className="flex-1 px-2 py-1 text-[10px] font-mono rounded border focus:outline-none focus:ring-1 focus:ring-emerald-500/30"
+                              style={{ backgroundColor: 'var(--bg)', borderColor: 'var(--border)', color: 'var(--fg)' }} />
+                            <button onClick={() => scanLan(pr.name)} disabled={scanLoading[pr.name]}
+                              title="Quét mạng LAN để tự tìm IP máy in (SNMP port 161). Gõ trước vài số IP (VD 192.168.1.) để quét đúng mạng đó."
+                              className="shrink-0 px-2 py-1 text-[10px] font-semibold rounded-lg transition-all duration-200 hover:scale-[1.05] active:scale-95 disabled:opacity-40 border-0 cursor-pointer"
+                              style={{ backgroundColor: '#3b82f612', color: '#60a5fa', border: '1px solid #3b82f620' }}>
+                              {scanLoading[pr.name] ? '⏳' : '🔍 Quét mạng'}
+                            </button>
+                          </div>
+                          {/* Kết quả quét LAN — danh sách thiết bị SNMP tìm được */}
+                          {showScanList[pr.name] && (
+                            <div className="rounded-lg p-2 space-y-1.5 border"
+                              style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border)' }}>
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-[9px]" style={{ color: 'var(--fg-dim)' }}>
+                                  {scanLoading[pr.name]
+                                    ? '⏳ Đang quét LAN... (vài giây)'
+                                    : `Đã quét ${scanResults?.subnet || ''} · ${scanResults?.scanned || 0} host · ${scanResults?.duration_ms || 0}ms`}
+                                </span>
+                                <button onClick={() => { setShowScanList(prev => ({ ...prev, [pr.name]: false })); setScanResults(null) }}
+                                  className="text-[10px] px-1 rounded hover:bg-black/10 dark:hover:bg-white/10 border-0 cursor-pointer shrink-0"
+                                  style={{ color: 'var(--fg-muted)' }}>✕</button>
+                              </div>
+                              {!scanLoading[pr.name] && (
+                                (scanResults?.devices || []).length === 0 ? (
+                                  <div className="p-2 rounded text-[10px]" style={{ backgroundColor: '#ef444410', color: '#f87171' }}>
+                                    {scanResults?.error
+                                      ? `❌ ${scanResults.error}`
+                                      : 'Không tìm thấy thiết bị nào. Kiểm tra: máy in đang bật & cùng mạng LAN, SNMP port 161 được bật trên máy in (mặc định).'}
+                                  </div>
+                                ) : (
+                                  <>
+                                    {scanResults!.devices.map(d => {
+                                      const matched = d.matched_printer
+                                      // Máy in sẽ nhận IP: ưu tiên máy khớp gợi ý, ngược lại card đang mở
+                                      const targetName = matched?.name || pr.name
+                                      return (
+                                        <div key={d.ip}
+                                          className="rounded-lg border transition-all duration-150 overflow-hidden"
+                                          style={{ borderColor: matched ? '#22c55e40' : 'var(--border)' }}>
+                                          {/* Row chính: thông tin thiết bị */}
+                                          {/* Row chính: chỉ nhấn được khi gán cho máy đang mở card —
+                                              nếu gợi ý máy KHÁC thì phải bấm nút rõ ràng bên dưới,
+                                              tránh vô tình gán IP cho máy khác */}
+                                          <button onClick={() => { if (targetName === pr.name) applyScannedIp(targetName, d.ip, pr.name) }}
+                                            className={`w-full flex items-center gap-1.5 px-2 py-1.5 text-left hover:bg-emerald-500/5 border-0 ${targetName === pr.name ? 'cursor-pointer' : 'cursor-default'}`}
+                                            style={{ backgroundColor: 'var(--bg)' }}>
+                                            <span className="text-[11px] shrink-0">{d.is_printer ? '🖨️' : '📡'}</span>
+                                            <span className="flex-1 min-w-0">
+                                              <span className="block truncate text-[10px] font-semibold" style={{ color: 'var(--fg)' }}>
+                                                {d.printer_name || d.model || d.ip}
+                                              </span>
+                                              <span className="block truncate text-[9px] font-mono" style={{ color: 'var(--fg-dim)' }}>
+                                                {d.ip} · {d.model}
+                                              </span>
+                                            </span>
+                                            {matched ? (
+                                              <span className="text-[8px] px-1.5 py-0.5 rounded-full shrink-0 font-bold"
+                                                title={`Độ khớp ${Math.round(matched.confidence * 100)}%`}
+                                                style={{ backgroundColor: '#22c55e18', color: '#4ade80', border: '1px solid #22c55e30' }}>
+                                                ✓ {matched.name}
+                                              </span>
+                                            ) : (
+                                              <span className="text-[8px] px-1.5 py-0.5 rounded-full shrink-0 font-semibold"
+                                                style={{ backgroundColor: d.is_printer ? '#22c55e15' : '#f59e0b15', color: d.is_printer ? '#4ade80' : '#fbbf24' }}>
+                                                {d.is_printer ? 'Máy in' : 'SNMP'}
+                                              </span>
+                                            )}
+                                          </button>
+                                          {/* Action: gán IP — nhấn vào thiết bị cũng kích hoạt */}
+                                          <button onClick={() => applyScannedIp(targetName, d.ip, pr.name)}
+                                            className="w-full px-2 py-1 text-[9px] font-bold text-left transition-colors hover:brightness-125 border-0 cursor-pointer"
+                                            style={{
+                                              backgroundColor: matched ? '#22c55e10' : 'var(--bg-card)',
+                                              color: matched ? '#34d399' : 'var(--fg-muted)',
+                                              borderTop: '1px solid var(--border)',
+                                            }}>
+                                            ⚡ Gán IP này cho {targetName}
+                                            {matched && matched.name !== pr.name && (
+                                              <span className="font-normal opacity-70"> (khớp từ model)</span>
+                                            )}
+                                          </button>
+                                        </div>
+                                      )
+                                    })}
+                                    <p className="text-[8px] px-0.5" style={{ color: 'var(--fg-dim)' }}>
+                                      💡 Thiết bị có gợi ý <span style={{ color: '#4ade80' }}>✓ khớp</span> sẽ ưu tiên gán IP cho máy Windows tương ứng — bấm nút <b>⚡ Gán IP</b> bên dưới mỗi thiết bị để lưu & đọc SNMP ngay.
+                                    </p>
+                                  </>
+                                )
+                              )}
+                            </div>
+                          )}
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[10px] shrink-0" style={{ color: 'var(--fg-muted)' }}>Community:</span>
+                            <input value={printerCommunityInput[pr.name] || ''}
+                              onChange={e => setPrinterCommunityInput(prev => ({ ...prev, [pr.name]: e.target.value }))}
+                              placeholder="public"
+                              title="SNMP community string (mặc định: public)"
+                              className="flex-1 px-2 py-1 text-[10px] font-mono rounded border focus:outline-none focus:ring-1 focus:ring-emerald-500/30"
+                              style={{ backgroundColor: 'var(--bg)', borderColor: 'var(--border)', color: 'var(--fg)' }} />
+                          </div>
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                            {(pr.is_laser
+                              ? ([['toner', '🖤 Mực (Toner)'], ['drum', '🥁 Drum']] as const)
+                              : ([['black', '🖤 Đen'], ['cyan', '🩵 Xanh dương'], ['magenta', '💗 Đỏ'], ['yellow', '💛 Vàng']] as const)
+                            ).map(([k, label]) => (
+                              <div key={k}>
+                                <label className="text-[8px] uppercase block mb-0.5" style={{ color: 'var(--fg-dim)' }}>
+                                  {label} (%)
+                                </label>
+                                <input type="number" min={0} max={100}
+                                  value={manualSupplyInputs[pr.name]?.[k] ?? ''}
+                                  onChange={e => setManualSupplyInputs(prev => ({ ...prev, [pr.name]: { ...(prev[pr.name] || {}), [k]: e.target.value } }))}
+                                  placeholder="80"
+                                  className="w-full px-2 py-1 text-[10px] font-mono rounded border focus:outline-none focus:ring-1 focus:ring-emerald-500/30"
+                                  style={{ backgroundColor: 'var(--bg)', borderColor: 'var(--border)', color: 'var(--fg)' }} />
+                              </div>
+                            ))}
+                          </div>
+                          <button onClick={() => saveSuppliesConfig(pr.name)} disabled={suppliesSaving[pr.name]}
+                            className="w-full px-2.5 py-1.5 text-[10px] font-semibold rounded-lg transition-all duration-200 hover:scale-[1.02] active:scale-95 disabled:opacity-40 border-0 cursor-pointer"
+                            style={{ backgroundColor: '#22c55e12', color: '#4ade80', border: '1px solid #22c55e20' }}>
+                            {suppliesSaving[pr.name] ? '⏳ Đang lưu...' : '💾 Lưu vật tư'}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
                     {/* Print Queue */}
                     <div>
                       <div className="flex items-center justify-between mb-2">
@@ -1314,6 +2046,54 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
           - Thống kê nhanh đầu mỗi tab
           - Nút Export JSON ngay trong popup
           ═══════════════════════════════════════════════════════════ */}
+      {/* 📜 Lịch sử phát hiện máy in mạng (từ debug.log qua GET /api/printer/scan-events) */}
+      {scanEventsOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-2 sm:p-4 animate-[fadeIn_0.2s_ease-out]"
+          onClick={e => { if (e.target === e.currentTarget) setScanEventsOpen(false) }}>
+          <div className="w-full max-w-xl rounded-2xl border shadow-2xl animate-[modalIn_0.25s_ease-out] flex flex-col max-h-[90vh] sm:max-h-[80vh]"
+            style={{ backgroundColor: 'var(--bg)', borderColor: 'var(--border)', color: 'var(--fg)' }}>
+            {/* ── Header ── */}
+            <div className="flex items-center justify-between px-4 sm:px-6 pt-4 sm:pt-6 pb-3 sm:pb-4 border-b shrink-0" style={{ borderColor: 'var(--border)' }}>
+              <h3 className="text-sm sm:text-base font-bold flex items-center gap-2">
+                <span>📜</span> Lịch sử phát hiện máy in mạng
+              </h3>
+              <button onClick={() => setScanEventsOpen(false)}
+                className="p-1.5 sm:p-2 rounded-xl hover:bg-black/10 dark:hover:bg-white/10 transition-all duration-200 hover:scale-110 active:scale-90 border-0 cursor-pointer text-sm"
+                style={{ color: 'var(--fg-muted)' }}>✕</button>
+            </div>
+            {/* ── Body: danh sách sự kiện ── */}
+            <div className="px-4 sm:px-6 py-3 overflow-y-auto space-y-1.5">
+              {scanEventsLoading && (
+                <div className="text-xs py-6 text-center" style={{ color: 'var(--fg-dim)' }}>⏳ Đang tải lịch sử...</div>
+              )}
+              {!scanEventsLoading && scanEventsError && (
+                <div className="text-xs py-6 text-center font-semibold" style={{ color: '#ef4444' }}>
+                  ⚠️ Không tải được lịch sử — backend không phản hồi.
+                </div>
+              )}
+              {!scanEventsLoading && !scanEventsError && scanEvents.length === 0 && (
+                <div className="text-xs py-6 text-center" style={{ color: 'var(--fg-dim)' }}>
+                  Chưa có sự kiện phát hiện nào — bấm ⚡ Quét ngay để bắt đầu.
+                </div>
+              )}
+              {!scanEventsLoading && !scanEventsError && scanEvents.map((ev, i) => {
+                const meta = SCAN_EVENT_META[ev.type] || SCAN_EVENT_META.info
+                return (
+                  <div key={`${ev.timestamp}-${i}`} className="flex items-start gap-2.5 rounded-lg px-2.5 py-2 border"
+                    style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)' }}>
+                    <span className="text-sm shrink-0 leading-5" title={ev.type}>{meta.icon}</span>
+                    <div className="min-w-0">
+                      <div className="text-[10px] font-mono opacity-70" style={{ color: meta.color }}>{ev.timestamp}</div>
+                      <div className="text-xs leading-5 break-words" style={{ color: 'var(--fg)' }}>{ev.message}</div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
       {historyOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-2 sm:p-4 animate-[fadeIn_0.2s_ease-out]"
           onClick={e => { if (e.target === e.currentTarget) setHistoryOpen(false) }}>
@@ -1548,6 +2328,65 @@ export default function PrintersModule({ theme, setStatusText, inactive, backgro
                   className="accent-emerald-500 w-4 h-4 rounded" />
                 <span style={{ color: 'var(--fg-secondary)' }}>Bật nhắc nhở in</span>
               </label>
+              {/* ── Ngưỡng cảnh báo vật tư ── */}
+              <div className="animate-[fadeIn_0.3s_ease-out_0.225s_both]">
+                <label className="text-[10px] sm:text-xs font-semibold uppercase tracking-wider flex items-center gap-1.5" style={{ color: 'var(--fg-muted)' }}>
+                  <span>🚨</span> Ngưỡng cảnh báo vật tư
+                </label>
+                <div className="flex items-center gap-2">
+                  <input id="printer-supply-threshold" name="supplyThreshold" type="number" min={1} max={100} value={printerSettings.supply_warning_threshold ?? 20}
+                    onChange={e => setPrinterSettings(prev => ({ ...prev, supply_warning_threshold: parseInt(e.target.value) || 20 }))}
+                    className="w-full px-3 py-2 text-xs rounded-xl border mt-1 focus:outline-none focus:ring-2 focus:ring-emerald-500/30 transition-all"
+                    style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg)' }} />
+                  <span className="text-[10px] mt-1" style={{ color: 'var(--fg-muted)' }}>%</span>
+                </div>
+                <p className="text-[8px] mb-2 mt-0.5" style={{ color: 'var(--fg-dim)' }}>
+                  Cảnh báo + nhắc nhở khi mực/drum còn dưới ngưỡng này (SNMP hoặc nhập tay)
+                </p>
+              </div>
+              {/* ── Quét LAN nền (tự phát hiện máy in mạng) ── */}
+              <div className="animate-[fadeIn_0.3s_ease-out_0.24s_both]">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input id="printer-lan-scan-enabled" name="lanScanEnabled" type="checkbox"
+                    checked={printerSettings.lan_scan_enabled !== false}
+                    onChange={e => setPrinterSettings(prev => ({ ...prev, lan_scan_enabled: e.target.checked }))}
+                    className="accent-blue-500 w-4 h-4 rounded" />
+                  <span style={{ color: 'var(--fg-secondary)' }}>📡 Quét LAN nền tìm máy in mạng</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer mt-1.5">
+                  <input id="printer-lan-scan-notify" name="lanScanNotify" type="checkbox"
+                    checked={printerSettings.lan_scan_notify !== false}
+                    onChange={e => setPrinterSettings(prev => ({ ...prev, lan_scan_notify: e.target.checked }))}
+                    className="accent-blue-500 w-4 h-4 rounded" />
+                  <span style={{ color: 'var(--fg-secondary)' }}>🔔 Thông báo Windows khi phát hiện</span>
+                </label>
+                <p className="text-[8px] mb-2 mt-0.5" style={{ color: 'var(--fg-dim)' }}>
+                  Gửi toast hệ thống (góc phải màn hình) khi phát hiện máy in mới — hoạt động kể cả khi cửa sổ app bị ẩn/thu nhỏ.
+                </p>
+                <p className="text-[8px] mb-2 mt-0.5" style={{ color: 'var(--fg-dim)' }}>
+                  Tự động quét mạng định kỳ, phát hiện máy in (SNMP) khớp với máy in Windows nhưng chưa cấu hình IP → hiện banner gợi ý gán IP.
+                </p>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-[9px] font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-muted)' }}>Chu kỳ (phút)</label>
+                    <input id="printer-lan-scan-interval" name="lanScanInterval" type="number" min={1} max={120}
+                      value={printerSettings.lan_scan_interval_minutes ?? 5}
+                      onChange={e => setPrinterSettings(prev => ({ ...prev, lan_scan_interval_minutes: parseInt(e.target.value) || 5 }))}
+                      className="w-full px-2.5 py-1.5 text-xs rounded-lg border mt-1 focus:outline-none focus:ring-2 focus:ring-blue-500/30 transition-all"
+                      style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg)' }} />
+                  </div>
+                  <div>
+                    <label className="text-[9px] font-semibold uppercase tracking-wider" style={{ color: 'var(--fg-muted)' }}>Subnet quét</label>
+                    <input id="printer-lan-scan-subnet" name="lanScanSubnet" type="text"
+                      value={printerSettings.lan_scan_subnet || ''}
+                      onChange={e => setPrinterSettings(prev => ({ ...prev, lan_scan_subnet: e.target.value }))}
+                      placeholder="Tự động (/24)"
+                      title="CIDR để quét (VD 192.168.1.0/24). Để trống = tự động theo IP máy. Dùng khi máy có VPN/adapter ảo."
+                      className="w-full px-2.5 py-1.5 text-xs font-mono rounded-lg border mt-1 focus:outline-none focus:ring-2 focus:ring-blue-500/30 transition-all"
+                      style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg)' }} />
+                  </div>
+                </div>
+              </div>
               {/* ── Excluded Printers ── */}
               <div className="animate-[fadeIn_0.3s_ease-out_0.25s_both]">
                 <label className="text-[10px] sm:text-xs font-semibold uppercase tracking-wider flex items-center gap-1.5" style={{ color: 'var(--fg-muted)' }}>

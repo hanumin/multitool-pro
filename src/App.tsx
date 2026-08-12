@@ -131,6 +131,9 @@ function App() {
   const { theme, toggle: toggleTheme } = useTheme()
   const [activeModule, setActiveModule] = useState<ModuleId>('servers')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  // WHY: Deep-link từ Windows toast (nút '⚡ Gán IP') — toast mở http://127.0.0.1:5050/?printer=NAME
+  // → App chuyển ngay sang tab Máy in + PrintersModule tự mở card máy đó khi load xong.
+  const [openPrinter, setOpenPrinter] = useState<string | null>(null)
   const [statusText, setStatusText] = useState('Sẵn sàng')
   const [autostart, setAutostart] = useState(false)
   const [appVersion, setAppVersion] = useState('1.9.10')
@@ -188,6 +191,22 @@ function App() {
         setIsMaximized(max)
       } catch {}
     })
+  }, [])
+
+  // WHY: Deep-link từ Windows toast — đọc ?printer=NAME trong URL khi mở (nút 'Gán IP'
+  // trên toast mở http://127.0.0.1:5050/?printer=NAME) → chuyển tab Máy in + lưu tên máy
+  // để PrintersModule mở đúng card. history.replaceState xóa param → refresh/back không
+  // mở lại lần nữa. Chạy sớm (trước khi appReady) nên state vẫn còn khi module mount.
+  useEffect(() => {
+    try {
+      const params = new URLSearchParams(window.location.search)
+      const printer = params.get('printer')
+      if (printer) {
+        setOpenPrinter(printer)
+        setActiveModule('printers')
+        history.replaceState(null, '', window.location.pathname)
+      }
+    } catch {}
   }, [])
 
   // WHY: Kiểm tra bản cập nhật qua Tauri updater — nếu có, hỏi user rồi tải +
@@ -615,7 +634,8 @@ function App() {
               onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, servers: enabled }))}
               onLogColorsChange={setLogColors} onOpenSettings={() => { setSettingsAnim('enter'); setSettingsOpen(true) }} preloadedData={preloadedData} />
             <PrintersModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'printers'} backgroundPolling={backgroundPolling.printers}
-              onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, printers: enabled }))} preloadedData={preloadedData} />
+              onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, printers: enabled }))} preloadedData={preloadedData}
+              openPrinter={openPrinter} onOpenPrinterHandled={() => setOpenPrinter(null)} />
             <AudioModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'audio'} backgroundPolling={backgroundPolling.audio}
               onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, audio: enabled }))} preloadedData={preloadedData} />
             <FileCopierModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'file-copier'} />

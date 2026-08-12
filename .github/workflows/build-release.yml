@@ -1,0 +1,215 @@
+# WHY: Build release đúng chuẩn — chạy TRÊN WINDOWS vì backend.exe (PyInstaller) + Tauri
+#      chỉ sinh .exe Windows. Pipeline này replicate build-portable.ps1 (npm build ->
+#      PyInstaller backend -> embed -> tauri build) NHƯNG thêm bundle NSIS/MSI (installer
+#      cho end-user) + upload artifact + auto-publish GitHub Release khi tag v*.
+#
+#      Trong khi đó ci.yml (typecheck nhanh trên ubuntu) giữ nguyên — workflow này là
+#      lớp build release, chậm hơn nhiều (~10-15 phút) nên KHÔNG gộp vào CI thường.
+#
+# Trigger:
+#   - push main        -> build + upload artifact (kiểm tra pipeline không vỡ)
+#   - push tag v*      -> build + tạo GitHub Release kèm installer + latest.json
+#                        (latest.json phục vụ auto-update đã cấu hình trong tauri.conf.json)
+#   - workflow_dispatch -> chạy tay từ GitHub UI
+
+name: Build Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build portable + installers (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # WHY: Node cho frontend (dist/) — PyInstaller nhúng dist vào backend.exe,
+      #      nên phải build frontend TRƯỚC backend. Không dùng cache 'npm' vì repo
+      #      không có package-lock.json (npm ci sẽ fail).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # WHY: Python cho backend. 3.13 = bản ổn định có đủ wheel cho mọi dep
+      #      (pywin32, psycopg2-binary, mysql-connector, pycaw). PyInstaller chạy
+      #      trên chính Python này để tạo backend.exe.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # WHY: Cache cargo build (Rust compile mất ~3 phút mỗi lần).
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'src-tauri'
+
+      - name: Install backend Python deps + PyInstaller
+        run: pip install -r backend/requirements.txt pyinstaller
+
+      # WHY: --no-package-lock: repo không có lockfile (chủ đích), CI không nên tự sinh
+      #      ra file rác trong workspace.
+      - name: Install frontend deps
+        run: npm install --no-audit --no-fund --no-package-lock
+
+      - name: Build frontend (dist/)
+        run: npm run build
+
+      # WHY: PyInstaller đóng gói backend Flask + mọi dependency thành backend.exe
+      #      onefile. Các flag giống hệt build-portable.ps1:
+      #      - --windowed: không hiện console (chạy ngầm như pythonw)
+      #      - --add-data: nhúng dist/ (SPA), auto-start.ps1, printer-monitor/ (C# tool)
+      #      - --collect-all pycaw/comtypes: pycaw nạp comtypes động qua ctypes
+      #      - --hidden-import: các import TRONG hàm (lazy) mà PyInstaller không scan được
+      - name: Build backend.exe (PyInstaller)
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name backend `
+            --distpath backend/py-dist --workpath backend/py-build `
+            --add-data "dist;dist" `
+            --add-data "auto-start.ps1;." `
+            --add-data "printer-monitor;printer-monitor" `
+            --collect-all pycaw --collect-all comtypes `
+            --hidden-import psycopg2 --hidden-import mysql.connector `
+            --hidden-import win32print --hidden-import win32com.client `
+            --hidden-import win32event --hidden-import pythoncom `
+            backend/app.py
+
+      # WHY: Copy backend.exe vào src-tauri/backend-embed/ — build.rs/include_bytes!
+      #      nhúng TRỰC TIẾP bytes backend vào binary Tauri (bản portable chạy khép kín).
+      - name: Embed backend.exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path src-tauri/backend-embed -Force | Out-Null
+          Copy-Item backend/py-dist/backend.exe src-tauri/backend-embed/backend.exe -Force
+          Write-Host "backend.exe: $('{0:N1}' -f ((Get-Item src-tauri/backend-embed/backend.exe).Length/1MB)) MB"
+
+      # WHY: WiX cần cho bundle MSI. Tauri v2 TỰ TẢI WiX về cache khi build MSI (đã
+      #      kiểm chứng trên máy local — build MSI pass mà không cài WiX riêng). Bước
+      #      choco này là tối ưu hóa cho nhanh/nén — nếu choco fail thì vẫn build được
+      #      (continue-on-error) nên không bao giờ chặn release vì lý do vớ vẩn này.
+      - name: Install WiX Toolset (MSI, optional)
+        shell: pwsh
+        run: choco install wixtoolset -y --no-progress
+        continue-on-error: true
+
+      # WHY: Build Tauri đầy đủ bundle: NSIS (setup.exe) + MSI (enterprise).
+      #      Binary raw multitool-pro.exe cũng được sinh ở target/release/ — dùng làm
+      #      bản portable. beforeBuildCommand (npm run build) chạy lại frontend, vô hại.
+      #      Tauri v2 sinh MSI/NSIS unsigned mặc định (không có certificateThumbprint).
+      #      tauri.conf.json có createUpdaterArtifacts:false — nếu repo có secret
+      #      TAURI_SIGNING_PRIVATE_KEY, override qua --config để sinh .zip/.sig cho
+      #      latest.json (auto-update). Không có secret -> build unsigned bình thường.
+      - name: Build Tauri (bundle NSIS + MSI)
+        shell: pwsh
+        run: |
+          if ($env:TAURI_SIGNING_PRIVATE_KEY) {
+            Write-Host "Signing key present — enabling updater artifacts"
+            npx tauri build --config '{"bundle":{"createUpdaterArtifacts":true}}'
+          } else {
+            Write-Host "No signing key — unsigned installers only"
+            npx tauri build
+          }
+          if ($LASTEXITCODE -ne 0) { throw "tauri build failed (exit $LASTEXITCODE)" }
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      # WHY: Gom artifact giống cấu trúc release/ local: portable/ + installer ở root.
+      #      Tên file portable đọc version từ tauri.conf.json (nguồn chính thức) giống
+      #      build-portable.ps1. upload-artifact giữ nguyên cây thư mục con.
+      - name: Stage portable exe
+        shell: pwsh
+        run: |
+          $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $ver = $conf.version
+          New-Item -ItemType Directory -Path release/portable -Force | Out-Null
+          Copy-Item src-tauri/target/release/multitool-pro.exe "release/portable/$($conf.productName)_$ver`_x64.exe" -Force
+          Get-ChildItem release -Recurse | Select-Object FullName, Length
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: multitool-pro-release
+          path: |
+            release/
+            src-tauri/target/release/bundle/
+
+  # WHY: Job riêng (ubuntu, rẻ hơn) chỉ chạy khi push tag v* — tạo GitHub Release
+  #      với installer + latest.json cho auto-update. Không chạy cho push main thường.
+  publish-release:
+    name: Publish GitHub Release (tag v*)
+    needs: build-windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # WHY: checkout cần thiết để đọc src-tauri/tauri.conf.json (xác minh version
+      #      khớp tag). KHÔNG cần setup-node — job này không chạy lệnh Node nào.
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: multitool-pro-release
+          path: artifact
+
+      # WHY: latest.json = bản tin auto-update Tauri đọc (endpoint đã cấu hình trong
+      #      tauri.conf.json). Cần chữ ký cho file updater — nếu repo chưa có secret
+      #      TAURI_SIGNING_PRIVATE_KEY thì latest.json KHÔNG được tạo (release vẫn
+      #      hoạt động cho tải tay, chỉ thiếu auto-update).
+      #      Tạo key: npx tauri signer generate -w ~/.tauri/multitool-pro.key
+      - name: Create latest.json (auto-update)
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          # WHY: Xác minh version tag khớp version trong tauri.conf.json — nếu lệch,
+          #      updater sẽ nghĩ có bản mới (hoặc bỏ sót) khi version trong latest.json
+          #      khác version app thực tế. Cảnh báo (không fail) để dev tự sửa.
+          CONF_VERSION=$(python3 -c "import json;print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          if [ "$VERSION" != "$CONF_VERSION" ]; then
+            echo "::warning::Tag version ($VERSION) khac version trong tauri.conf.json ($CONF_VERSION)"
+          fi
+          echo "Version: $VERSION"
+          # Tìm file updater (zip chứa installer + signature) trong bundle
+          ZIP=$(find artifact -name '*.zip' | head -1 || true)
+          SIG=$(find artifact -name '*.sig' | head -1 || true)
+          if [ -z "$ZIP" ] || [ -z "$SIG" ]; then
+            echo "No updater artifacts (.zip/.sig) found — skipping latest.json (need signing key)"
+            exit 0
+          fi
+          SIGNATURE=$(cat "$SIG")
+          # URL chuẩn của GitHub Release download (encode space -> %20)
+          URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$(basename "$ZIP" | sed 's/ /%20/g')"
+          cat > latest.json <<EOF
+          {
+            "version": "$VERSION",
+            "notes": "MultiTool Pro $VERSION",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "windows-x86_64": {
+                "signature": "$SIGNATURE",
+                "url": "$URL"
+              }
+            }
+          }
+          EOF
+          cp latest.json artifact/latest.json
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # WHY: Glob theo đúng cây artifact đã upload: portable ở release/portable/
+          #      (do step Stage tạo), installer NSIS/MSI ở src-tauri/target/release/bundle/.
+          #      latest.json (nếu tạo được) nằm ở root artifact.
+          files: |
+            artifact/release/portable/*.exe
+            artifact/src-tauri/target/release/bundle/**/*.exe
+            artifact/src-tauri/target/release/bundle/**/*.msi
+            artifact/latest.json
+          generate_release_notes: true

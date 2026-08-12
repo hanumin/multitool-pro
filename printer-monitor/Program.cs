@@ -81,17 +81,30 @@ Usage:
 
             try
             {
-                var query = new EventLogQuery(logName, PathType.LogName)
+                // WHY: XPath filter ngay tại EventLog engine — chỉ trả về Event ID 307
+                // trong 30 ngày (timediff <= 30*24*3600*1000 ms). Trước đây quét TOÀN BỘ
+                // log rồi lọc trong code → với log lớn (máy in hoạt động liên tục như
+                // EPSON EP-804A) query chạy > 10s → Python timeout mỗi lần gọi.
+                string xpath = "*[System[(EventID=307) and TimeCreated[timediff(@SystemTime) <= 2592000000]]]";
+                var query = new EventLogQuery(logName, PathType.LogName, xpath)
                 {
                     ReverseDirection = true
                 };
 
                 using var reader = new EventLogReader(query);
                 EventLogRecord? record;
+                int recordsRead = 0;
                 while ((record = (EventLogRecord?)reader.ReadEvent()) != null)
                 {
-                    if (record.Id != 307) continue;
+                    // WHY: Safety cap — đề phòng log lỗi/clock lệch làm break không kích hoạt.
+                    if (++recordsRead > 5000) break;
+
+                    // WHY: Check time TRƯỚC check Event ID. Trước đây check ngược
+                    // (Id != 307 continue; rồi mới break theo time) → khi event mới nhất
+                    // không phải 307, code đọc tiếp xuống CẢ LOG cũ hơn 30 ngày, chỉ break
+                    // khi gặp 1 event 307 cũ hơn 30 ngày → timeout với log lớn.
                     if (record.TimeCreated.HasValue && record.TimeCreated.Value < startTime) break;
+                    if (record.Id != 307) continue;
 
                     var props = record.Properties;
 
@@ -174,7 +187,11 @@ Usage:
             {
                 try
                 {
-                    var query = new EventLogQuery(logName, PathType.LogName)
+                    // WHY: XPath giới hạn Event ID 307 trong 24h — trước đây query không
+                    // có filter, mỗi 2s poll lại quét CẢ log (cùng root cause timeout như
+                    // QueryPrintCount). lastCheck luôn <= 24h so với now nên 86400000ms đủ.
+                    var query = new EventLogQuery(logName, PathType.LogName,
+                        "*[System[(EventID=307) and TimeCreated[timediff(@SystemTime) <= 86400000]]]")
                     {
                         ReverseDirection = false
                     };
@@ -183,9 +200,11 @@ Usage:
                     EventLogRecord? record;
                     while ((record = (EventLogRecord?)reader.ReadEvent()) != null)
                     {
+                        // WHY: Check time TRƯỚC check Event ID (xem QueryPrintCount) —
+                        // tránh quét cả log khi event không phải 307.
+                        if (record.TimeCreated.HasValue && record.TimeCreated.Value > DateTime.Now) break;
                         if (record.Id != 307) continue;
                         if (record.TimeCreated.HasValue && record.TimeCreated.Value <= lastCheck) continue;
-                        if (record.TimeCreated.HasValue && record.TimeCreated.Value > DateTime.Now) break;
 
                         var props = record.Properties;
                         string? printer = props.Count > 4 ? props[4]?.Value?.ToString()?.Trim() : "";
@@ -240,13 +259,20 @@ Usage:
 
             try
             {
-                var query = new EventLogQuery(logName, PathType.LogName) { ReverseDirection = true };
+                // WHY: XPath filter EventID=307 + 30 ngày ngay tại engine (xem QueryPrintCount
+                // để biết lý do — trước đây quét cả log gây timeout > 10s).
+                string xpath = "*[System[(EventID=307) and TimeCreated[timediff(@SystemTime) <= 2592000000]]]";
+                var query = new EventLogQuery(logName, PathType.LogName, xpath) { ReverseDirection = true };
                 using var reader = new EventLogReader(query);
                 EventLogRecord? record;
+                int recordsRead = 0;
                 while ((record = (EventLogRecord?)reader.ReadEvent()) != null)
                 {
-                    if (record.Id != 307) continue;
+                    // WHY: Safety cap — đề phòng log lỗi/clock lệch làm break không kích hoạt.
+                    if (++recordsRead > 5000) break;
+                    // WHY: Check time trước ID — trước đây check ngược khiến code quét cả log.
                     if (record.TimeCreated.HasValue && record.TimeCreated.Value < startTime) break;
+                    if (record.Id != 307) continue;
 
                     var props = record.Properties;
                     string? printer = props.Count > 4 ? (props[4]?.Value?.ToString()?.Trim() ?? "") : "";

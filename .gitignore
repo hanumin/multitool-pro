@@ -5,6 +5,12 @@ node_modules/
 dist/
 src-tauri/target/
 portable/
+release/
+
+# Backend PyInstaller artifacts
+src-tauri/backend-embed/
+backend/py-dist/
+backend/py-build/
 
 # OS files
 Thumbs.db
@@ -24,6 +30,10 @@ cookies.txt
 # AI / IDE
 .claude/
 .gitnexus/
+.freebuff/
+
+# PyInstaller spec (sinh ra o project root khi build backend)
+backend.spec
 
 # .NET Build artifacts
 printer-monitor/bin/
