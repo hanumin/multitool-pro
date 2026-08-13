@@ -26,12 +26,15 @@ const TunnelsModule = lazy(() => import('./components/modules/TunnelsModule'))
 const LogModule = lazy(() => import('./components/modules/LogModule'))
 const SettingsModal = lazy(() => import('./components/SettingsModal'))
 import LoadingScreen from './components/LoadingScreen'
+import LoginScreen from './components/LoginScreen'
+import { getSupabase } from './lib/supabase'
 import { useToast } from './components/ToastManager'
 import { type LogColors, DEFAULT_LOG_COLORS } from './utils/logStyles'
 import { API, fetchWithRetry } from './utils/apiFetch'
 import { openAudioWidget, closeAudioWidget, toggleAudioWidget, subscribeAudioWidget } from './utils/audioWidget'
 import { invoke } from '@tauri-apps/api/core'
 import UpdateModal, { type UpdatePhase, type UpdateInfo } from './components/UpdateModal'
+import type { Session } from '@supabase/supabase-js'
 
 type Theme = 'dark' | 'light'
 
@@ -178,6 +181,10 @@ const SIDEBAR_BREAKPOINT = 1100
 function App() {
   const [appReady, setAppReady] = useState(false)
   const [preloadedData, setPreloadedData] = useState<PreloadedData>({})
+  // WHY: Trạng thái đăng nhập Supabase Auth — null = chưa đăng nhập → hiện màn hình
+  // login. Khởi tạo bất đồng bộ (getSession) vì Supabase đọc localStorage.
+  const [authSession, setAuthSession] = useState<Session | null>(null)
+  const [authChecking, setAuthChecking] = useState(true)
   const { theme, toggle: toggleTheme } = useTheme()
   const [activeModule, setActiveModule] = useState<ModuleId>('servers')
   // WHY: Nếu module đang chọn không khả dụng trên nền tảng này (vd mở app từ tray với
@@ -281,6 +288,28 @@ function App() {
       .then(m => m.getVersion())
       .then(setAppVersion)
       .catch(() => {})
+  }, [])
+
+  // WHY: Kiểm tra session Supabase khi mở app — nếu đã đăng nhập từ lần trước
+  // (persistSession localStorage) thì vào thẳng app, không cần nhập lại. Đồng thời
+  // đăng ký onAuthStateChange để đồng bộ đăng nhập/đăng xuất (vd token refresh,
+  // session hết hạn → tự đăng xuất). getSession + subscribe chạy trong Tauri webview
+  // bình thường (supabase-js hỗ trợ cả browser lẫn webview).
+  useEffect(() => {
+    let unsub: (() => void) | undefined
+    let disposed = false
+    ;(async () => {
+      try {
+        const supabase = getSupabase()
+        const { data } = await supabase.auth.getSession()
+        if (!disposed) setAuthSession(data.session)
+        unsub = supabase.auth.onAuthStateChange((_event, session) => {
+          if (!disposed) setAuthSession(session)
+        }).data.subscription.unsubscribe
+      } catch {}
+      if (!disposed) setAuthChecking(false)
+    })()
+    return () => { disposed = true; unsub?.() }
   }, [])
 
   // WHY: Kiểm tra trạng thái maximized khi mount để hiển thị icon maximize/restore phù hợp.
@@ -450,6 +479,17 @@ function App() {
     return () => clearTimeout(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // WHY: Đăng xuất Supabase — gọi signOut() xóa session trên server + localStorage,
+  // state authSession về null → AuthGate tự render LoginScreen. Status text cập nhật
+  // để user biết đã thoát.
+  const signOut = async () => {
+    try {
+      await getSupabase().auth.signOut()
+    } catch {}
+    setAuthSession(null)
+    setStatusText('Đã đăng xuất')
+  }
 
   // WHY: Đóng popup update với animation fade-out rồi reset phase về checking cho
   // lần mở sau (tránh giữ trạng thái cũ khi mở lại popup mới). Cũng đánh dấu ref
@@ -999,6 +1039,18 @@ function App() {
   // WHY: Preload tất cả lazy-loaded components ngay khi mount để cache chunks.
   useEffect(() => { preloadModules() }, [])
 
+  // WHY: Cổng đăng nhập (AuthGate) — chạy TRƯỚC mọi thứ: (1) đang kiểm tra session →
+  // hiện LoadingScreen tạm (tránh nháy màn hình login khi đã đăng nhập sẵn), (2)
+  // chưa đăng nhập → chỉ hiện LoginScreen, không mount app chính (bảo vệ module
+  // backend bằng auth), (3) có session → vào app bình thường.
+  if (authChecking) {
+    return <LoadingScreen onComplete={(data) => { setPreloadedData(data); setAppReady(true) }} />
+  }
+
+  if (!authSession) {
+    return <LoginScreen onAuthenticated={(session) => { setAuthSession(session) }} />
+  }
+
   if (!appReady) {
     return <LoadingScreen onComplete={(data) => { setPreloadedData(data); setAppReady(true) }} />
   }
@@ -1224,6 +1276,12 @@ function App() {
               className="hover:underline cursor-pointer font-semibold text-sky-400 hover:text-sky-300 transition-colors bg-transparent border-0 group relative">
               Giới thiệu
               <span className="tooltip-text">Thông tin tác giả & các chức năng</span>
+            </button>
+            <span style={{ color: 'var(--fg-dim)' }}>|</span>
+            <button onClick={signOut}
+              className="hover:underline cursor-pointer font-semibold text-rose-400 hover:text-rose-300 transition-colors bg-transparent border-0 group relative">
+              Đăng xuất
+              <span className="tooltip-text">{authSession?.user?.email ?? 'Thoát tài khoản hiện tại'}</span>
             </button>
           </div>
         </footer>
