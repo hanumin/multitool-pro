@@ -255,7 +255,10 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -e
-          if ! ls bundles/**/*.sig >/dev/null 2>&1; then
+          # WHY: Dùng find thay vì `ls bundles/**/*.sig` — bash mặc định KHÔNG bật
+          # globstar nên `**` không khớp đệ quy → check sai (bỏ qua latest.json dù
+          # .sig có tồn tại). find đệ quy độc lập với globstar.
+          if ! find bundles -name '*.sig' -print -quit | grep -q .; then
             echo "⚠️ Không có file .sig — bỏ qua latest.json (cần TAURI_SIGNING_PRIVATE_KEY)."
             exit 0
           fi
