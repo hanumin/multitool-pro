@@ -195,6 +195,10 @@ function App() {
   const [updateProgress, setUpdateProgress] = useState({ percent: 0, downloaded: 0, total: 0 })
   const [updateError, setUpdateError] = useState<string | undefined>(undefined)
   const updateBusyRef = useRef(false)
+  // WHY: Lưu update object (từ plugin-updater) để installUpdate dùng lại — tránh gọi
+  // check() lần 2 (tốn request + có thể lệch version nếu release đổi giữa chừng).
+  // Không đưa vào state vì Update là class Resource của plugin, không phải plain data.
+  const updateObjRef = useRef<any>(null)
   const [aboutOpen, setAboutOpen] = useState(false)
   const [aboutAnim, setAboutAnim] = useState<'enter' | 'exit'>('enter')
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -427,16 +431,17 @@ function App() {
   // xong giao diện trước, tránh popup đè lúc khởi động. Chỉ chạy trong Tauri runtime.
   useEffect(() => {
     const t = setTimeout(() => {
-      import('@tauri-apps/plugin-updater').then(({ check }) => check()).then((update) => {
-        if (update) checkUpdate()
-      }).catch(() => {})
+      // WHY: silent=true — chỉ mở popup khi CÓ bản mới; không làm phiền với popup
+      // "đã mới nhất" mỗi lần khởi động.
+      checkUpdate(true)
     }, 2500)
     return () => clearTimeout(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // WHY: Đóng popup update với animation fade-out rồi reset phase về checking cho
-  // lần mở sau (tránh giữ trạng thái cũ khi mở lại popup mới).
+  // lần mở sau (tránh giữ trạng thái cũ khi mở lại popup mới). Cũng đánh dấu ref
+  // để checkUpdate bỏ qua kết quả nếu user đóng giữa lúc đang kiểm tra.
   const closeUpdateModal = () => {
     setUpdateAnim('exit')
     setTimeout(() => {
@@ -452,28 +457,46 @@ function App() {
   // nhất (nút footer, tray menu, auto-check). Chuẩn thiết kế update dialog: hiện
   // trạng thái checking ngay, nếu có bản mới → available (hiện version + nút Cập
   // nhật ngay/Để sau), không có → latest, lỗi → error (nút Thử lại). Dynamic import
+  // WHY: Mở popup + kiểm tra bản cập nhật qua Tauri updater. Đây là điểm vào duy
+  // nhất (nút footer, tray menu, auto-check). Chuẩn thiết kế update dialog: hiện
+  // trạng thái checking ngay, nếu có bản mới → available (hiện version + nút Cập
+  // nhật ngay/Để sau), không có → latest, lỗi → error (nút Thử lại). Dynamic import
   // để không bundle nặng khi chạy dev.
-  const checkUpdate = async () => {
+  //
+  // silent = true (auto-check khi khởi động): không mở popup khi KHÔNG có bản mới
+  // (tránh làm phiền user mỗi lần mở app với popup "đã mới nhất"); chỉ mở khi có
+  // bản cập nhật thật sự. silent = false (bấm nút thủ công): luôn mở popup để hiện
+  // kết quả dù là latest hay error.
+  // WHY: Kiểm tra bản cập nhật từ plugin-updater — lưu update object vào ref cho
+  // installUpdate dùng lại (không gọi check() lần 2), mở popup theo kết quả.
+  const checkUpdate = async (silent = false) => {
     if (updateBusyRef.current) return
     updateBusyRef.current = true
     setUpdateError(undefined)
     setUpdateInfo(null)
     setUpdatePhase('checking')
-    setUpdateOpen(true)
-    setUpdateAnim('enter')
     setStatusText('Đang kiểm tra cập nhật...')
     try {
       const { check } = await import('@tauri-apps/plugin-updater')
       const update = await check()
       if (!update) {
+        if (silent) return
+        setUpdateOpen(true)
+        setUpdateAnim('enter')
         setUpdatePhase('latest')
         setStatusText(`Bạn đang dùng phiên bản mới nhất (v${appVersion})`)
         return
       }
+      updateObjRef.current = update
       setUpdateInfo({ version: update.version, date: update.date, body: update.body })
+      setUpdateOpen(true)
+      setUpdateAnim('enter')
       setUpdatePhase('available')
       setStatusText(`Có bản cập nhật mới v${update.version}`)
     } catch (e: any) {
+      if (silent) return
+      setUpdateOpen(true)
+      setUpdateAnim('enter')
       setUpdateError(e?.message || 'Không thể kết nối tới máy chủ cập nhật')
       setUpdatePhase('error')
       setStatusText('Kiểm tra cập nhật thất bại')
@@ -487,19 +510,17 @@ function App() {
   // rồi relaunch. downloadAndInstall trên Windows NSIS tải xong → installer chạy
   // khi app thoát → relaunch() tự đóng app + mở bản mới.
   const installUpdate = async () => {
-    if (updateBusyRef.current || !updateInfo) return
+    if (updateBusyRef.current || !updateInfo || !updateObjRef.current) return
     updateBusyRef.current = true
     setUpdatePhase('downloading')
     setUpdateProgress({ percent: 0, downloaded: 0, total: 0 })
     setStatusText('Đang tải bản cập nhật...')
     try {
-      const { check } = await import('@tauri-apps/plugin-updater')
       const { relaunch } = await import('@tauri-apps/plugin-process')
-      const update = await check()
-      if (!update) throw new Error('Không tìm thấy bản cập nhật sau khi tải')
+      const update = updateObjRef.current
       let downloaded = 0
       let contentLength = 0
-      await update.downloadAndInstall((event) => {
+      await update.downloadAndInstall((event: any) => {
         switch (event.event) {
           case 'Started':
             contentLength = event.data.contentLength ?? 0
@@ -1115,7 +1136,7 @@ function App() {
         <footer className="shrink-0 backdrop-blur-md border-t px-5 py-1.5 flex items-center justify-between text-xs"
           style={{ background: 'var(--bg-header)', borderColor: 'var(--border)', color: 'var(--fg-dim)' }}>
           <div className="flex items-center gap-3 flex-wrap">
-            <button onClick={checkUpdate}
+            <button onClick={() => checkUpdate()}
               className="hover:underline cursor-pointer bg-transparent border-0"
               style={{ color: 'var(--fg-muted)' }}>Kiểm tra cập nhật</button>
             <span style={{ color: 'var(--fg-dim)' }}>|</span>
