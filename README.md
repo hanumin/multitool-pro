@@ -179,7 +179,7 @@ release/portable/MultiTool Pro_<version>_x64.exe   (~47 MB)
 
 ### Build tự động trên GitHub Actions (CI)
 
-Workflow `.github/workflows/build-release.yml` build release đúng chuẩn trên `windows-latest`:
+Workflow `.github/workflows/build.yml` build release đa nền tảng (Windows x64 + macOS universal2):
 
 | Trigger | Kết quả |
 |---------|---------|
@@ -187,9 +187,9 @@ Workflow `.github/workflows/build-release.yml` build release đúng chuẩn trê
 | Push tag `v*` | Tạo **GitHub Release** kèm installer + `latest.json` (auto-update) |
 | Bấm **Run workflow** | Build thủ công từ GitHub UI |
 
-Pipeline CI giống hệt `build-portable.ps1`: npm build → PyInstaller → embed → `tauri build` (thêm bundle NSIS/MSI).
+Pipeline CI giống hệt `build-portable.ps1`: npm build → PyInstaller → embed → `tauri build` (Windows: NSIS/MSI + portable; macOS: .app + .dmg universal). Khi push tag `v*`, workflow tạo GitHub Release kèm installer + `latest.json` (auto-update).
 
-> 🔑 **Auto-update cần signing key**: tạo key bằng `npx tauri signer generate -w ~/.tauri/multitool-pro.key`, thêm vào GitHub Secrets với tên `TAURI_SIGNING_PRIVATE_KEY` (+ `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` nếu có). Không có key → CI vẫn build + release bình thường, chỉ thiếu auto-update.
+> 🔑 **Auto-update cần signing key**: tạo key bằng `npx tauri signer generate -w ~/.tauri/multitool-pro.key`, thêm vào GitHub Secrets với tên `TAURI_SIGNING_PRIVATE_KEY` (+ `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` nếu có). Có key → Tauri tự ký installer và sinh `.sig` → `latest.json` được tạo → app đã cài tự nhận bản mới. Không có key → CI vẫn build + release bình thường, chỉ thiếu auto-update.
 
 ---
 
@@ -261,7 +261,7 @@ multitool-pro/
 │   └── Cargo.toml
 ├── scripts/              # Utility scripts (cleanup-portable-test.ps1, ...)
 ├── build-portable.ps1    # Build portable khép kín 1 file
-├── .github/workflows/    # CI: ci.yml (typecheck) + build-release.yml (release)
+├── .github/workflows/    # CI: ci.yml + why-check.yml + build.yml (build & release đa nền tảng)
 ├── release/              # Output: installers + portable/ (gitignored)
 ├── dist/                 # Built frontend
 └── package.json
@@ -332,7 +332,7 @@ Backend chạy tại `http://127.0.0.1:5050`
 - 🖨 **LAN Printer Scan**: tự động quét mạng phát hiện máy in mới chưa cấu hình IP → Windows toast kèm nút "⚡ Gán IP" (deep-link mở thẳng tab Máy in), quét theo chu kỳ + retry khi gửi toast thất bại
 - 🖨 **Vật tư & Supplies**: cấu hình IP máy in mạng → đọc tự động % toner/drum/ink qua SNMP (RFC 3805, thuần Python), hoặc nhập tay cho máy USB; ngưỡng cảnh báo vật tư thấp
 - 🖨 **Background Print Listener**: phát hiện lệnh in hoàn thành bằng `FindFirstPrinterChangeNotification` (event-driven, bắt cả job laser <100ms) — không bỏ sót job khi UI ở tab khác
-- ⚙️ **CI build release**: workflow GitHub Actions (`build-release.yml`) — npm build → PyInstaller → embed → tauri build (NSIS/MSI) → artifact + GitHub Release + `latest.json` khi tag `v*`
+- ⚙️ **CI build release**: workflow GitHub Actions (`build.yml`) — npm build → PyInstaller → embed → tauri build (Windows NSIS/MSI + macOS universal) → artifact + GitHub Release + `latest.json` (auto-update có chữ ký) khi tag `v*`
 - 🔧 `build-portable.ps1`: script build portable khép kín tự động toàn pipeline
 
 > ⏳ Các mục LAN scan, supplies, listener, portable & CI workflow là tính năng **đang phát triển cho v1.11.4** (chưa phát hành chính thức).

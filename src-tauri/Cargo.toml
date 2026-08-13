@@ -1,6 +1,6 @@
 [package]
 name = "multitool-pro"
-version = "1.11.4"
+version = "1.11.5"
 description = "MultiTool Pro - All-in-one utility"
 authors = ["you"]
 edition = "2021"

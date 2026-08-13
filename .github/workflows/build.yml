@@ -18,13 +18,18 @@
 #     backend riêng cho từng arch rồi lipo (phức tạp hơn nhiều).
 #   - Tab Âm thanh / Máy in / Tunnel đã bị ẩn trên Mac ở frontend (Windows-only).
 #
-# ⚠️ CẦN THIẾT TRƯỚC KHI DÙNG:
-#   1. Push repo này lên GitHub (repo hiện tại: hanumin/multitool-pro).
-#   2. (Tùy chọn, cho auto-update) Tạo secrets:
-#      - TAURI_SIGNING_PRIVATE_KEY: nội dung file .key (npx tauri signer generate)
-#      - TAURI_SIGNING_PRIVATE_KEY_PASSWORD: mật khẩu key
-#   3. (Tùy chọn, cho Mac "sạch") Code-signing/notarization certs — nếu không có,
-#      app Mac vẫn chạy nhưng macOS báo "unidentified developer" (right-click → Open).
+# ⚠️ AUTO-UPDATE (đã triển khai đầy đủ ở workflow này):
+#   - Nếu repo có 2 secrets TAURI_SIGNING_PRIVATE_KEY + TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#     (nội dung file .key sinh bởi `npx tauri signer generate`), bước Build Tauri sẽ
+#     bật createUpdaterArtifacts → Tauri tự ký installer → sinh file .sig bên cạnh
+#     installer. Job release tạo latest.json (bản tin auto-update) đẩy lên GitHub
+#     Release → app đã cài sẽ tự nhận bản mới qua endpoint trong tauri.conf.json.
+#   - Không có secrets → build vẫn thành công (installer unsigned), chỉ thiếu auto-update.
+#
+# Trigger:
+#   - push main         -> build + upload artifact (kiểm tra pipeline)
+#   - push tag v*       -> build + tạo GitHub Release (draft) kèm installer + latest.json
+#   - workflow_dispatch -> chạy tay từ GitHub UI
 
 name: Build & Release
 
@@ -132,16 +137,29 @@ jobs:
           cp "backend/py-dist/${{ matrix.backend_bin }}" "src-tauri/backend-embed/${{ matrix.backend_bin }}"
           file "src-tauri/backend-embed/${{ matrix.backend_bin }}" 2>/dev/null || ls -la src-tauri/backend-embed/
 
-      # WHY: Tauri build ra bundle theo OS: Windows = .msi + .exe (NSIS), macOS =
-      # universal2 = .app + .dmg (chạy cả Intel + Silicon). Nếu có signing secrets,
-      # tauri tự tạo .sig cho auto-update.
+      # WHY: Tauri build ra bundle theo OS: Windows = .msi + .exe (NSIS), macOS
+      # universal2 = .app + .dmg. Nếu có signing secrets (TAURI_SIGNING_PRIVATE_KEY)
+      # → bật createUpdaterArtifacts để Tauri tự ký installer và sinh .sig (cần cho
+      # auto-update). Không có key → build unsigned bình thường (auto-update tắt).
+      # Lưu ý: createUpdaterArtifacts mặc định là false trong tauri.conf.json (để build
+      # local không đòi key) nên phải override qua --config khi CI có secret.
       - name: Build Tauri app (bundles)
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npx tauri build ${{ matrix.tauri_args }}
+        run: |
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "Signing key present — enabling updater artifacts (.sig)"
+            npx tauri build ${{ matrix.tauri_args }} --config '{"bundle":{"createUpdaterArtifacts":true}}'
+          else
+            echo "No signing key — unsigned installers only (no auto-update)"
+            npx tauri build ${{ matrix.tauri_args }}
+          fi
 
+      # WHY: Upload artifacts. Windows build ra ở target/release/, macOS universal ra ở
+      # target/universal-apple-darwin/release/ — include CẢ 2 (glob nào không khớp sẽ
+      # bỏ qua, miễn có ít nhất 1 file khớp là không lỗi).
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -149,10 +167,13 @@ jobs:
           if-no-files-found: error
           path: |
             src-tauri/target/release/multitool-pro*
+            src-tauri/target/universal-apple-darwin/release/multitool-pro*
             src-tauri/target/release/bundle/**
+            src-tauri/target/universal-apple-darwin/release/bundle/**
 
   # WHY: Khi push tag v* → gộp bundle của cả 2 nền tảng vào 1 GitHub Release (draft).
-  # Các file .sig (nếu có signing) cũng được đẩy lên để tauri-plugin-updater xác minh.
+  # Các file .sig (khi có signing) cũng được đẩy lên để tauri-plugin-updater xác minh.
+  # Draft để user kiểm tra rồi bấm Publish — tránh release vội bản hỏng.
   release:
     name: Publish Release
     needs: build
@@ -165,6 +186,8 @@ jobs:
           path: bundles
           merge-multiple: true
 
+      # WHY: Tạo Release DRAFT trước — latest.json ở bước sau cần biết tên asset đã
+      # đăng (URL cố định theo tag), nên tạo release trước rồi mới sinh latest.json.
       - name: Create GitHub Release (draft)
         uses: softprops/action-gh-release@v2
         with:
@@ -176,15 +199,22 @@ jobs:
             bundles/**/*.msi
             bundles/**/*.exe
             bundles/**/*.dmg
+            bundles/**/*.app.tar.gz
             bundles/**/*.sig
             bundles/**/multitool-pro
             bundles/**/multitool-pro.exe
 
-      # WHY: Tạo latest.json cho tauri-plugin-updater — chỉ khi có file .sig (nghĩa là
-      # đã cấu hình signing secrets). Bản mac dmg universal chạy cả Intel + Silicon nên
-      # gán cho cả 2 key darwin-x86_64 / darwin-aarch64. Nếu chưa có .sig thì bỏ qua.
+      # WHY: Tạo latest.json cho tauri-plugin-updater — bản tin auto-update mà app gọi
+      # qua endpoint trong tauri.conf.json. Chỉ tạo khi có file .sig (nghĩa là đã có
+      # signing secrets). Mapping platform chuẩn Tauri v2:
+      #   - windows-x86_64  -> NSIS `*-setup.exe` + signature `<name>.sig`
+      #   - macOS (universal) -> updater bundle `*.app.tar.gz` + `<name>.sig`; gán cho
+      #     cả darwin-x86_64 lẫn darwin-aarch64 vì bản universal chạy được cả 2 arch.
+      #   (KHÔNG dùng .dmg — Tauri v2 dùng .app.tar.gz cho updater, .dmg chỉ là bản tải tay)
       - name: Generate updater latest.json
         shell: bash
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -e
           if ! ls bundles/**/*.sig >/dev/null 2>&1; then
@@ -192,34 +222,36 @@ jobs:
             exit 0
           fi
           python3 - <<'EOF'
-          import glob, json, os, datetime
+          import glob, json, os, datetime, urllib.parse
           tag = os.environ["GITHUB_REF_NAME"]
+          repo = os.environ["GITHUB_REPOSITORY"]
           ver = tag.lstrip("v")
-          base = f"https://github.com/hanumin/multitool-pro/releases/download/{tag}"
+          base = f"https://github.com/{repo}/releases/download/{tag}"
           sig_map = {}
           for f in glob.glob("bundles/**/*.sig", recursive=True):
               with open(f) as fh:
                   sig_map[os.path.basename(f)] = fh.read().strip()
           platforms = {}
-          # windows-x86_64: bản setup (NSIS) là target updater của Windows
+          # Windows: NSIS setup.exe là target updater; sig tên <name>.sig
           for f in glob.glob("bundles/**/*-setup.exe", recursive=True):
               name = os.path.basename(f)
               sig = name + ".sig"
               if sig in sig_map:
-                  platforms["windows-x86_64"] = {"signature": sig_map[sig], "url": f"{base}/{name}"}
-          # macOS: dmg universal → chạy được cả Intel lẫn Silicon
-          for f in glob.glob("bundles/**/*.dmg", recursive=True):
+                  platforms["windows-x86_64"] = {
+                      "signature": sig_map[sig],
+                      "url": f"{base}/{urllib.parse.quote(name)}",
+                  }
+          # macOS: updater bundle là .app.tar.gz (không phải .dmg); universal → cả 2 arch
+          for f in glob.glob("bundles/**/*.app.tar.gz", recursive=True):
               name = os.path.basename(f)
               sig = name + ".sig"
               if sig in sig_map:
-                  entry = {"signature": sig_map[sig], "url": f"{base}/{name}"}
-                  if "universal" in name.lower():
-                      platforms["darwin-x86_64"] = entry
-                      platforms["darwin-aarch64"] = entry
-                  elif "x86_64" in name:
-                      platforms["darwin-x86_64"] = entry
-                  elif "aarch64" in name or "arm64" in name:
-                      platforms["darwin-aarch64"] = entry
+                  entry = {
+                      "signature": sig_map[sig],
+                      "url": f"{base}/{urllib.parse.quote(name)}",
+                  }
+                  platforms["darwin-x86_64"] = entry
+                  platforms["darwin-aarch64"] = entry
           manifest = {
               "version": ver,
               "notes": f"MultiTool Pro {ver}",
@@ -231,7 +263,7 @@ jobs:
           print(json.dumps(manifest, indent=2))
           EOF
 
-      - name: Upload latest.json
+      - name: Upload latest.json to Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}

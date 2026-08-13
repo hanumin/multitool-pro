@@ -166,7 +166,7 @@ function App() {
   const [openPrinter, setOpenPrinter] = useState<string | null>(null)
   const [statusText, setStatusText] = useState('Sẵn sàng')
   const [autostart, setAutostart] = useState(false)
-  const [appVersion, setAppVersion] = useState('1.9.10')
+  const [appVersion, setAppVersion] = useState('1.11.5')
   const [changelogOpen, setChangelogOpen] = useState(false)
   const [changelogAnim, setChangelogAnim] = useState<'enter' | 'exit'>('enter')
   const [aboutOpen, setAboutOpen] = useState(false)
@@ -396,20 +396,42 @@ function App() {
   }, [])
 
   // WHY: Kiểm tra bản cập nhật qua Tauri updater — nếu có, hỏi user rồi tải +
-  // cài + relaunch app (dynamic import để không bundle nặng khi chạy dev).
+  // cài + relaunch app. downloadAndInstall nhận callback event để hiển thị % tiến
+  // trình tải xuống thực tế trên statusText (thay vì chỉ báo "Đang tải..." mơ hồ).
+  // Dynamic import để không bundle nặng khi chạy dev.
   const checkUpdate = async () => {
+    setStatusText('Đang kiểm tra cập nhật...')
     try {
       const { check } = await import('@tauri-apps/plugin-updater')
       const { relaunch } = await import('@tauri-apps/plugin-process')
       const update = await check()
-      if (update) {
-        const ok = window.confirm(`Có bản cập nhật ${update.version}. Tải về và cài đặt?`)
-        if (ok) {
-          setStatusText('Đang tải bản cập nhật...')
-          await update.downloadAndInstall()
-          await relaunch()
+      if (!update) {
+        setStatusText(`Bạn đang dùng phiên bản mới nhất (v${appVersion})`)
+        return
+      }
+      const ok = window.confirm(`Có bản cập nhật mới v${update.version} (hiện tại v${appVersion}). Tải về và cài đặt ngay?`)
+      if (!ok) { setStatusText('Đã hủy cập nhật'); return }
+      let downloaded = 0
+      let contentLength = 0
+      setStatusText('Đang tải bản cập nhật...')
+      await update.downloadAndInstall((event) => {
+        switch (event.event) {
+          case 'Started':
+            contentLength = event.data.contentLength ?? 0
+            break
+          case 'Progress':
+            downloaded += event.data.chunkLength
+            if (contentLength > 0) {
+              const pct = Math.min(99, Math.round((downloaded / contentLength) * 100))
+              setStatusText(`Đang tải bản cập nhật... ${pct}%`)
+            }
+            break
+          case 'Finished':
+            setStatusText('Đã tải xong, đang cài đặt...')
+            break
         }
-      } else setStatusText('Bạn đang dùng phiên bản mới nhất')
+      })
+      await relaunch()
     } catch (e: any) { setStatusText(e?.message || 'Kiểm tra cập nhật thất bại') }
   }
 

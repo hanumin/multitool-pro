@@ -76,27 +76,20 @@ File `src-tauri/src/lib.rs` hàm `run()`:
 - **Edge case:** Khi chạy từ `npm run tauri dev`, `current_exe()` trả về đường dẫn trong `target/debug/`, cần verify vẫn tìm đúng project root.
 - **Test thủ công:** Chạy exe từ `release/`, check console output có `[backend] Flask started from ...` không.
 
-### 4. Auto-update infrastructure (đã built sẵn, chưa deploy)
+### 4. Auto-update infrastructure (ĐÃ TRIỂN KHAI ĐẦY ĐỦ)
 - `tauri-plugin-updater` đã đăng ký trong Rust, config trong `tauri.conf.json` trỏ tới GitHub Releases
-- Frontend có nút "Check updates" → gọi `check()` → `downloadAndInstall()` → `relaunch()`
-- Đã tạo signing keypair ở `~/.tauri/server-dashboard.key` (password: empty)
-- **Cần làm khi deploy:**
-  1. Push code lên GitHub repo `hanumin/multitool-pro`
-  2. Tạo GitHub Actions workflow: build khi push tag → upload `.msi` + `.msi.sig` + `.exe` + `.exe.sig` + `latest.json`
-  3. `latest.json` định dạng:
-     ```json
-     {
-       "version": "1.0.1",
-       "notes": "Update notes",
-       "pub_date": "2026-07-13T12:00:00Z",
-       "platforms": {
-         "windows-x86_64": {
-           "signature": "nội dung file .sig (base64)",
-           "url": "https://github.com/.../Server%20Dashboard_1.0.1_x64-setup.exe"
-         }
-       }
-     }
-     ```
+- Frontend có nút "Check updates" → gọi `check()` → `downloadAndInstall()` (có progress %) → `relaunch()`
+- Signing keypair ở `~/.tauri/server-dashboard.key` (password: **rỗng**), pubkey khớp `tauri.conf.json`
+- Workflow `.github/workflows/build.yml` (đa nền tảng Windows + macOS universal):
+  - Có secrets `TAURI_SIGNING_PRIVATE_KEY` (+ password nếu có) → bật `createUpdaterArtifacts` → Tauri tự ký installer + sinh `.sig`
+  - Push tag `v*` → tạo GitHub Release (draft) kèm installer + `latest.json` (Windows: `*-setup.exe`; macOS: `*.app.tar.gz` — không dùng .dmg cho updater)
+- **Đã xóa** workflow cũ `build-release.yml` (Windows-only, xung đột với build.yml khi cùng trigger tag `v*`)
+
+**Cách release bản mới:**
+  1. Bump version ở `package.json` + `src-tauri/tauri.conf.json` + `src-tauri/Cargo.toml` (khớp nhau)
+  2. Push commit → push tag `v<version>` (vd `v1.11.5`)
+  3. GitHub Actions build + tạo Release draft → kiểm tra rồi bấm Publish
+  4. App cài sẵn tự nhận bản mới qua endpoint `releases/latest/download/latest.json`
 
 ### 5. UX improvements
 - **Thiếu "Select Folder" button** (đã nói ở mục 2)
