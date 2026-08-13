@@ -238,7 +238,7 @@ jobs:
           # — thừa, gấp đôi dung lượng release, latest.json không trỏ vào chúng.
           files: |
             bundles/**/*.msi
-            bundles/**/*.exe
+            bundles/**/*-setup.exe
             bundles/**/*.dmg
             bundles/**/*.app.tar.gz
             bundles/**/*.sig
@@ -284,7 +284,15 @@ jobs:
               )
               return json.load(urllib.request.urlopen(req))
 
-          assets = api(f"releases/tags/{tag}/assets")
+          # WHY: Lấy assets qua release LIST (filter theo tag) thay vì
+          # GET /releases/tags/{tag}/assets — endpoint theo tag trả 404 khi release còn
+          # là DRAFT (GitHub chỉ resolve tag → release đã publish). Draft được tạo ở
+          # bước trước nên phải query danh sách rồi filter, không dùng tag endpoint.
+          releases = api("releases?per_page=100")
+          rel = next((r for r in releases if r.get("tag_name") == tag), None)
+          if not rel:
+              raise RuntimeError(f"Không tìm thấy release cho tag {tag} (draft chưa tạo?)")
+          assets = api(f"releases/{rel['id']}/assets")
           by_name = {a["name"]: a for a in assets}
 
           def sig_of(name):
