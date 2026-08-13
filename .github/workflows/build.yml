@@ -253,6 +253,7 @@ jobs:
         shell: bash
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           # WHY: Dùng find thay vì `ls bundles/**/*.sig` — bash mặc định KHÔNG bật
@@ -263,36 +264,55 @@ jobs:
             exit 0
           fi
           python3 - <<'EOF'
-          import glob, json, os, datetime, urllib.parse
-          tag = os.environ["GITHUB_REF_NAME"]
+          import json, os, datetime, urllib.parse, urllib.request
+          token = os.environ["GITHUB_TOKEN"]
           repo = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["GITHUB_REF_NAME"]
           ver = tag.lstrip("v")
           base = f"https://github.com/{repo}/releases/download/{tag}"
-          sig_map = {}
-          for f in glob.glob("bundles/**/*.sig", recursive=True):
-              with open(f) as fh:
-                  sig_map[os.path.basename(f)] = fh.read().strip()
+
+          def api(path):
+              # WHY: Gọi GitHub API — tên asset THẬT sau khi upload có thể khác tên file
+              # local (softprops/action-gh-release đổi space thành dấu chấm, vd
+              # "MultiTool Pro_...setup.exe" → "MultiTool.Pro_...setup.exe"). Dùng API là
+              # nguồn chân lý duy nhất để latest.json trỏ URL tải đúng, tránh 404.
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/{path}",
+                  headers={"Authorization": f"Bearer {token}", "User-Agent": "multitool-pro-ci",
+                           "Accept": "application/vnd.github+json"},
+              )
+              return json.load(urllib.request.urlopen(req))
+
+          assets = api(f"releases/tags/{tag}/assets")
+          by_name = {a["name"]: a for a in assets}
+
+          def sig_of(name):
+              # WHY: Đọc signature từ chính asset .sig đã upload (khớp tên thật), thay vì
+              # file local — tránh lệch tên space/dấu chấm giữa 2 nguồn.
+              a = by_name.get(name + ".sig")
+              if not a:
+                  return None
+              req = urllib.request.Request(
+                  a["url"],
+                  headers={"Authorization": f"Bearer {token}", "Accept": "application/octet-stream"},
+              )
+              return urllib.request.urlopen(req).read().decode().strip()
+
           platforms = {}
-          # Windows: NSIS setup.exe là target updater; sig tên <name>.sig
-          for f in glob.glob("bundles/**/*-setup.exe", recursive=True):
-              name = os.path.basename(f)
-              sig = name + ".sig"
-              if sig in sig_map:
-                  platforms["windows-x86_64"] = {
-                      "signature": sig_map[sig],
-                      "url": f"{base}/{urllib.parse.quote(name)}",
-                  }
+          # Windows: NSIS setup.exe là target updater
+          for name in by_name:
+              if name.endswith("-setup.exe"):
+                  sig = sig_of(name)
+                  if sig:
+                      platforms["windows-x86_64"] = {"signature": sig, "url": f"{base}/{urllib.parse.quote(name)}"}
           # macOS: updater bundle là .app.tar.gz (không phải .dmg); universal → cả 2 arch
-          for f in glob.glob("bundles/**/*.app.tar.gz", recursive=True):
-              name = os.path.basename(f)
-              sig = name + ".sig"
-              if sig in sig_map:
-                  entry = {
-                      "signature": sig_map[sig],
-                      "url": f"{base}/{urllib.parse.quote(name)}",
-                  }
-                  platforms["darwin-x86_64"] = entry
-                  platforms["darwin-aarch64"] = entry
+          for name in by_name:
+              if name.endswith(".app.tar.gz"):
+                  sig = sig_of(name)
+                  if sig:
+                      entry = {"signature": sig, "url": f"{base}/{urllib.parse.quote(name)}"}
+                      platforms["darwin-x86_64"] = entry
+                      platforms["darwin-aarch64"] = entry
           manifest = {
               "version": ver,
               "notes": f"MultiTool Pro {ver}",
