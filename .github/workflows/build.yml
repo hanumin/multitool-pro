@@ -7,15 +7,16 @@
 # ⚠️ GHÉP MAC INTEL + SILICON VÀO 1 BẢN:
 #   GitHub ĐÃ GỠ runner Intel (macos-13, cuối 2025) → không còn cách nào build riêng
 #   bản x86_64 trên runner GitHub. Giải pháp: 1 job macOS trên macos-14 (arm64) build
-#   binary UNIVERSAL2 (fat binary chứa cả 2 arch) — chạy được trên cả Mac Intel lẫn
-#   Mac Silicon. Backend PyInstaller dùng `--target-arch universal2` với Python
-#   universal2 từ python.org.
+#   backend 2 LẦN — một bản arm64 (native) + một bản x86_64 (chạy qua Rosetta 2) — rồi
+#   `lipo -create` gộp thành 1 fat binary chạy được trên cả 2 loại Mac. Rust/Tauri thì
+#   build target universal-apple-darwin (cơ chế sẵn có). KHÔNG dùng `--target-arch
+#   universal2` của PyInstaller vì nó đòi MỌI .so đều là fat binary — mà hầu hết wheel
+#   C-extension (markupsafe, psutil, flask…) chỉ có bản x86_64 / arm64 RIÊNG → luôn fail.
 #
 # ⚠️ HẠN CHẾ BẢN MAC (đã cố tình chọn):
 #   - psycopg2-binary (PostgreSQL) và mysql-connector-python (MySQL) đều có C extension
 #     và KHÔNG có wheel universal2 → cả 2 bị bỏ khỏi requirements-mac.txt → tab Cơ sở
-#     dữ liệu trên Mac sẽ báo lỗi driver khi kết nối (giao diện vẫn chạy). Muốn có
-#     Postgres/MySQL trên Mac phải build backend riêng cho từng arch rồi lipo (phức tạp).
+#     dữ liệu trên Mac sẽ báo lỗi driver khi kết nối (giao diện vẫn chạy).
 #   - Tab Âm thanh / Máy in / Tunnel đã bị ẩn trên Mac ở frontend (Windows-only).
 #
 # ⚠️ AUTO-UPDATE (đã triển khai đầy đủ ở workflow này):
@@ -52,16 +53,12 @@ jobs:
           - name: Windows x64
             os: windows-latest
             backend_bin: backend.exe
-            py_sep: ';'          # PyInstaller --add-data separator (Windows)
-            py_extra: '--collect-all pycaw --collect-all comtypes --hidden-import win32print --hidden-import win32com.client --hidden-import win32event --hidden-import pythoncom'
             reqs: backend/requirements.txt
             rust_targets: ''
             tauri_args: ''
           - name: macOS Universal (Intel + Silicon)
-            os: macos-14          # arm64 — build universal2 cho cả 2 arch
+            os: macos-14          # arm64 — build backend 2 arch + lipo cho cả 2 loại Mac
             backend_bin: backend
-            py_sep: ':'           # PyInstaller --add-data separator (macOS/Linux)
-            py_extra: '--target-arch universal2'
             reqs: backend/requirements-mac.txt
             rust_targets: 'aarch64-apple-darwin,x86_64-apple-darwin'
             tauri_args: '--target universal-apple-darwin'
@@ -78,7 +75,8 @@ jobs:
           cache: npm
 
       # WHY: Windows dùng Python từ setup-python; macOS cần Python UNIVERSAL2 từ
-      # python.org (bản pkg luôn là universal2) để PyInstaller build được fat binary.
+      # python.org (bản pkg chạy được cả 2 arch — arm64 native lẫn x86_64 qua Rosetta)
+      # để mỗi venv build được đúng arch của nó.
       - name: Setup Python (Windows)
         if: runner.os == 'Windows'
         uses: actions/setup-python@v5
@@ -93,6 +91,15 @@ jobs:
           sudo installer -pkg /tmp/python.pkg -target /
           /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 --version
 
+      # WHY: Build backend x86_64 trên runner arm64 cần Rosetta 2 (chạy binary Intel
+      # trên chip Apple Silicon). Runner GitHub đã cài sẵn; lệnh này chỉ đảm bảo chắc
+      # chắn có (idempotent, nhanh nếu đã cài).
+      - name: Ensure Rosetta 2 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          sudo softwareupdate --install-rosetta --agree-to-license || true
+          arch -x86_64 /usr/bin/true && echo "Rosetta x86_64 OK"
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -106,27 +113,58 @@ jobs:
       - name: Build frontend (dist)
         run: npm run build
 
-      # WHY: Python lệnh khác nhau giữa 2 OS (Windows: python; macOS: python.org pkg).
+      # WHY: Cài deps backend. Windows: 1 venv (setup-python) là đủ. macOS: phải tạo
+      # 2 venv RIÊNG từ Python universal2 — venv arm64 (native) và venv x86_64 (qua
+      # Rosetta) — vì pip tải wheel theo arch của trình thông dịch; không thể dùng chung
+      # 1 venv cho cả 2 arch (markupsafe/psutil… không có wheel universal2).
       - name: Install Python dependencies
         shell: bash
         run: |
-          PY="${{ runner.os == 'macOS' && '/Library/Frameworks/Python.framework/Versions/3.12/bin/python3' || 'python' }}"
-          "$PY" -m pip install -r ${{ matrix.reqs }}
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            PY="/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
+            "$PY" -m venv backend/venv-arm
+            "$PY" -m venv backend/venv-x86 --without-pip || true
+            arch -x86_64 "$PY" -m venv backend/venv-x86 --upgrade-deps 2>/dev/null || arch -x86_64 "$PY" -m venv backend/venv-x86
+            backend/venv-arm/bin/python -m pip install --upgrade pip
+            backend/venv-arm/bin/python -m pip install -r ${{ matrix.reqs }}
+            arch -x86_64 backend/venv-x86/bin/python -m pip install --upgrade pip
+            arch -x86_64 backend/venv-x86/bin/python -m pip install -r ${{ matrix.reqs }}
+          else
+            python -m pip install --upgrade pip
+            python -m pip install -r ${{ matrix.reqs }}
+          fi
 
       # WHY: Đóng gói backend thành 1 binary tự chứa (Flask + mọi dep + dist/).
-      # Trên macOS: --target-arch universal2 + Python universal2 → fat binary chạy cả
-      # Intel lẫn Silicon; không kéo pycaw/win32print (requirements-mac.txt) vì tab
-      # Âm thanh/Máy in đã bị ẩn trên Mac.
+      # Windows: 1 lần với pycaw/comtypes/win32print (tab Âm thanh/Máy in).
+      # macOS: build 2 lần (arm64 native + x86_64 qua Rosetta) rồi lipo gộp fat binary
+      # — KHÔNG dùng --target-arch universal2 vì đòi mọi .so fat (xem comment đầu file).
+      # Không kéo pycaw/win32print (requirements-mac.txt) vì tab Âm thanh/Máy in ẩn trên Mac.
       - name: Build backend with PyInstaller
         shell: bash
         run: |
-          PY="${{ runner.os == 'macOS' && '/Library/Frameworks/Python.framework/Versions/3.12/bin/python3' || 'python' }}"
-          "$PY" -m PyInstaller --noconfirm --clean --onefile --windowed --name backend \
-            --distpath backend/py-dist --workpath backend/py-build \
-            --add-data "dist${{ matrix.py_sep }}dist" \
-            ${{ matrix.py_extra }} \
-            --hidden-import psycopg2 --hidden-import mysql.connector \
-            backend/app.py
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            # arm64 build (native)
+            backend/venv-arm/bin/python -m PyInstaller --noconfirm --clean --onefile --windowed --name backend-arm \
+              --distpath backend/py-dist --workpath backend/py-build-arm \
+              --add-data "dist:dist" --target-arch arm64 \
+              backend/app.py
+            # x86_64 build (qua Rosetta)
+            arch -x86_64 backend/venv-x86/bin/python -m PyInstaller --noconfirm --clean --onefile --windowed --name backend-x86 \
+              --distpath backend/py-dist-x86 --workpath backend/py-build-x86 \
+              --add-data "dist:dist" --target-arch x86_64 \
+              backend/app.py
+            # Gộp 2 binary thành 1 fat binary tên 'backend'
+            lipo -create backend/py-dist/backend-arm backend/py-dist-x86/backend-x86 -output backend/py-dist/backend
+            lipo -info backend/py-dist/backend
+            file backend/py-dist/backend
+          else
+            python -m PyInstaller --noconfirm --clean --onefile --windowed --name backend \
+              --distpath backend/py-dist --workpath backend/py-build \
+              --add-data "dist;dist" \
+              --collect-all pycaw --collect-all comtypes --hidden-import win32print --hidden-import win32com.client --hidden-import win32event --hidden-import pythoncom \
+              --hidden-import psycopg2 --hidden-import mysql.connector \
+              backend/app.py
+          fi
 
       # WHY: Copy backend thật vào src-tauri/backend-embed/ — build.rs/include_bytes!
       # cần nó TRƯỚC khi cargo compile để nhúng vào binary Tauri.
