@@ -65,6 +65,20 @@ interface PendingSize {
 
 const CHANGELOGS: ChangelogEntry[] = [
   {
+    version: '1.11.5',
+    title: 'v1.11.5 - Auto-update, đa nền tảng & cải thiện UI',
+    items: [
+      'Hoàn thiện auto-update: installer được ký số trong CI, app tự nhận bản mới qua nút Kiểm tra cập nhật.',
+      'GitHub Actions build đa nền tảng: Windows + macOS Universal (chạy cả Mac Intel lẫn Silicon).',
+      'Bản Mac tự ẩn các module Windows-only (Âm thanh, Máy in, Tunnel) - giao diện gọn gàng, không crash.',
+      'Popup chọn kích thước cửa sổ: 7 mức từ 720p đến 1440p + cảnh báo khi lớn hơn màn hình.',
+      'Lưu và khôi phục vị trí + kích thước cửa sổ khi đóng/mở (kể cả trạng thái maximize).',
+      'Animation mượt cho card server, sidebar, titlebar, modal Settings/Changelog và statusText.',
+      'Sửa polling: tăng retry delay, hủy request chồng lấn, giãn thời gian tải ban đầu giữa các module.',
+      'Đổi label "Đang kết nối lại..." thành "Đang tải dữ liệu..." cho lần tải đầu tiên.'
+    ]
+  },
+  {
     version: '1.4.0',
     title: 'v1.4.0 - File Copier & Sửa lỗi',
     items: [
