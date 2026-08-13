@@ -31,6 +31,8 @@ cookies.txt
 .claude/
 .gitnexus/
 .freebuff/
+.agents/
+skills-lock.json
 
 # PyInstaller spec (sinh ra o project root khi build backend)
 backend.spec

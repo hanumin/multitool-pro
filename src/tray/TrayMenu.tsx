@@ -1,4 +1,7 @@
 import React, { useEffect, useState } from 'react';
+import { PLATFORM_MODULES } from '../types';
+import type { ModuleDef } from '../types';
+import { isMac } from '../utils/platform';
 
 interface ModuleItem {
   id: string;
@@ -158,6 +161,9 @@ export default function TrayMenu() {
     }
   };
 
+  // WHY: Chỉ giữ shortcut module khả dụng trên nền tảng hiện tại — trên Mac bỏ
+  // Máy in/Âm thanh/Tunnel (Windows-only).
+  const supportedIds = new Set<string>(PLATFORM_MODULES.map((m: ModuleDef) => m.id));
   const modules: ModuleItem[] = [
     {
       id: 'servers',
@@ -241,7 +247,7 @@ export default function TrayMenu() {
         </svg>
       ),
     },
-  ];
+  ].filter((mod) => supportedIds.has(mod.id));
 
   return (
     <div className="tray-card">
@@ -319,7 +325,8 @@ export default function TrayMenu() {
 
       {/* Utilities Section */}
       <div className="pt-2.5 mt-1 border-t border-white/10 shrink-0 flex flex-col gap-1">
-        {/* Toggle Widget Audio */}
+        {/* WHY: Widget Âm thanh chỉ hiển thị trên Windows (pycaw) — ẩn trên Mac/Linux */}
+        {!isMac && (
         <div
           onClick={handleToggleAudioWidget}
           className="tray-menu-item justify-between select-none"
@@ -336,6 +343,7 @@ export default function TrayMenu() {
             <div className="tray-toggle-thumb" />
           </div>
         </div>
+        )}
 
         {/* Cài đặt */}
         <button

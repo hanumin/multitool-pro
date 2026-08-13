@@ -1,22 +1,35 @@
 export type ModuleId = 'servers' | 'printers' | 'audio' | 'file-copier' | 'database' | 'tunnels' | 'logs'
 
+// WHY: Nền tảng mà module hỗ trợ — module Windows-only (Âm thanh pycaw, Máy in
+// win32print/EventLog/C#, Tunnel cloudflared.exe) khai báo ['windows']; bản build
+// Mac/Linux sẽ tự ẩn. Không khai báo = hỗ trợ mọi nền tảng.
+export type ModulePlatform = 'windows' | 'mac' | 'linux'
+
 export interface ModuleDef {
   id: ModuleId
   label: string
   icon: string
   description: string
   polls?: boolean // Module có polling nền không?
+  platforms?: ModulePlatform[]
 }
 
 export const MODULES: ModuleDef[] = [
   { id: 'servers', label: 'Máy chủ', icon: '🖥', description: 'Quản lý máy chủ dev', polls: true },
-  { id: 'printers', label: 'Máy in', icon: '🖨', description: 'Giám sát và quản lý máy in', polls: true },
-  { id: 'audio', label: 'Âm thanh', icon: '🎤', description: 'Giám sát mic & thiết bị âm thanh', polls: true },
+  { id: 'printers', label: 'Máy in', icon: '🖨', description: 'Giám sát và quản lý máy in', polls: true, platforms: ['windows'] },
+  { id: 'audio', label: 'Âm thanh', icon: '🎤', description: 'Giám sát mic & thiết bị âm thanh', polls: true, platforms: ['windows'] },
   { id: 'file-copier', label: 'Sao chép', icon: '📂', description: 'Sao chép file audio/video theo từ khóa' },
   { id: 'database', label: 'Cơ sở dữ liệu', icon: '🗄️', description: 'Quản lý PostgreSQL/MySQL' },
-  { id: 'tunnels', label: 'Tunnel', icon: '🌐', description: 'Quản lý Cloudflare Tunnel', polls: true },
+  { id: 'tunnels', label: 'Tunnel', icon: '🌐', description: 'Quản lý Cloudflare Tunnel', polls: true, platforms: ['windows'] },
   { id: 'logs', label: 'Nhật ký', icon: '📋', description: 'Xem log hệ thống & chẩn đoán', polls: true },
 ]
+
+// WHY: Danh sách module HIỂN THỊ trên nền tảng hiện tại — lọc từ MODULES theo
+// OS (windows/mac/linux). Dùng chung cho Sidebar, App (render + preload) và
+// LoadingScreen để 3 nơi luôn nhất quán.
+import { OS } from '../utils/platform'
+// WHY: OS 'other' (không nhận diện được) → hiện TẤT CẢ module (không ẩn gì, an toàn).
+export const PLATFORM_MODULES: ModuleDef[] = MODULES.filter(m => !m.platforms || (OS !== 'other' && m.platforms.includes(OS)))
 
 export interface Printer {
   name: string

@@ -1,18 +1,18 @@
 import { useEffect, useState, useRef, lazy, Suspense } from 'react'
 import Sidebar from './components/Sidebar'
 import AboutModal from './components/AboutModal'
-import { ModuleId, MODULES, type PreloadedData } from './types'
+import { ModuleId, MODULES, PLATFORM_MODULES, type PreloadedData } from './types'
 
-// WHY: Preload tất cả lazy-loaded components trước để tránh loading spinner khi chuyển tab.
-// Các module sẽ được import đồng thời trong LoadingScreen trước khi app chính hiển thị.
+// WHY: Preload các lazy-loaded components trước để tránh loading spinner khi chuyển tab.
+// Chỉ preload module KHẢ DỤNG trên nền tảng hiện tại (PLATFORM_MODULES) — bản Mac
+// không tải chunk Máy in/Âm thanh/Tunnel (Windows-only).
 const preloadModules = () => {
-  // Trigger dynamic imports để cache chunks
   import('./components/modules/ServersModule')
-  import('./components/modules/PrintersModule')
-  import('./components/modules/AudioModule')
+  if (PLATFORM_MODULES.some(m => m.id === 'printers')) import('./components/modules/PrintersModule')
+  if (PLATFORM_MODULES.some(m => m.id === 'audio')) import('./components/modules/AudioModule')
   import('./components/modules/FileCopierModule')
   import('./components/modules/DatabaseModule')
-  import('./components/modules/TunnelsModule')
+  if (PLATFORM_MODULES.some(m => m.id === 'tunnels')) import('./components/modules/TunnelsModule')
   import('./components/modules/LogModule')
   import('./components/SettingsModal')
 }
@@ -38,6 +38,29 @@ interface ChangelogEntry {
   version: string
   title: string
   items: string[]
+}
+
+// WHY: Các kích thước màn hình phổ biến cho popup Settings (titlebar) — dùng chung
+// cho menu chọn kích thước cửa sổ app. name = tên hiển thị, tag = nhãn phân loại
+// (dùng chuẩn "p" dễ hiểu: 720p/1080p/1440p — thay cho HD/WXGA khó nhớ), ratio = tỷ
+// lệ màn hình, w/h là logical size. 2K (2048×1080) nằm giữa Full HD và QHD.
+const SIZE_PRESETS: { name: string; tag: string; w: number; h: number; ratio: string }[] = [
+  { name: 'Nhỏ',        tag: '720p',  w: 1280, h: 720,  ratio: '16:9' },
+  { name: 'Phổ biến',   tag: '768p',  w: 1366, h: 768,  ratio: '16:9' },
+  { name: 'Trung bình', tag: '864p',  w: 1536, h: 864,  ratio: '16:9' },
+  { name: 'Lớn',        tag: '900p',  w: 1600, h: 900,  ratio: '16:9' },
+  { name: 'Full HD',    tag: '1080p', w: 1920, h: 1080, ratio: '16:9' },
+  { name: '2K',         tag: '2K',    w: 2048, h: 1080, ratio: '16:9' },
+  { name: 'QHD',        tag: '1440p', w: 2560, h: 1440, ratio: '16:9' },
+]
+
+interface PendingSize {
+  w: number
+  h: number
+  suggestW: number
+  suggestH: number
+  screenW: number
+  screenH: number
 }
 
 const CHANGELOGS: ChangelogEntry[] = [
@@ -130,6 +153,13 @@ function App() {
   const [preloadedData, setPreloadedData] = useState<PreloadedData>({})
   const { theme, toggle: toggleTheme } = useTheme()
   const [activeModule, setActiveModule] = useState<ModuleId>('servers')
+  // WHY: Nếu module đang chọn không khả dụng trên nền tảng này (vd mở app từ tray với
+  // tab Máy in trên Mac) → tự quay về tab Máy chủ, tránh render module trống/bị ẩn.
+  useEffect(() => {
+    if (!PLATFORM_MODULES.some(m => m.id === activeModule)) {
+      setActiveModule('servers')
+    }
+  }, [activeModule])
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   // WHY: Deep-link từ Windows toast (nút '⚡ Gán IP') — toast mở http://127.0.0.1:5050/?printer=NAME
   // → App chuyển ngay sang tab Máy in + PrintersModule tự mở card máy đó khi load xong.
@@ -143,6 +173,34 @@ function App() {
   const [aboutAnim, setAboutAnim] = useState<'enter' | 'exit'>('enter')
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsAnim, setSettingsAnim] = useState<'enter' | 'exit'>('enter')
+  // WHY: Popup chọn kích thước cửa sổ (titlebar) + cảnh báo khi chọn size lớn hơn màn hình.
+  const [sizeMenuOpen, setSizeMenuOpen] = useState(false)
+  const [pendingSize, setPendingSize] = useState<PendingSize | null>(null)
+  const sizeMenuRef = useRef<HTMLDivElement>(null)
+  // WHY: Kích thước cửa sổ hiện tại (theo logical size đã lưu/đã chọn) — để popup
+  // đánh dấu preset đang active. Khởi tạo từ sd-window-state để đúng ngay lần mở đầu;
+  // null = chưa từng đổi (đang dùng mặc định 1680×1000).
+  const [currentSize, setCurrentSize] = useState<{ w: number; h: number } | null>(() => {
+    try {
+      const raw = localStorage.getItem('sd-window-state')
+      if (raw) {
+        const p = JSON.parse(raw)
+        if (typeof p?.w === 'number' && typeof p?.h === 'number') return { w: p.w, h: p.h }
+      }
+    } catch {}
+    return null
+  })
+
+  // WHY: Đóng popup kích thước khi click bên ngoài.
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (sizeMenuRef.current && !sizeMenuRef.current.contains(e.target as Node)) {
+        setSizeMenuOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [])
   const [settingsRefresh, setSettingsRefresh] = useState(0)
   const [isMaximized, setIsMaximized] = useState(false)
   const [shuttingDown, setShuttingDown] = useState(false)
@@ -191,6 +249,134 @@ function App() {
         setIsMaximized(max)
       } catch {}
     })
+  }, [])
+
+  // WHY: Đánh dấu đã restore vị trí/kích thước xong — move listener dựa vào flag này
+  // để chỉ bắt đầu lưu vị trí SAU khi restore xong (tránh lưu nhầm vị trí mặc định).
+  // Đặt TRƯỚC 2 effect dưới vì cả 2 đều dùng nó.
+  const windowRestoredRef = useRef(false)
+
+  // WHY: Khôi phục trạng thái cửa sổ đã lưu khi mở app — ưu tiên (1) maximize nếu
+  // lần trước đóng maximize, (2) vị trí + kích thước (sd-window-state) nếu không.
+  // Validate số hợp lệ (tránh corrupt data crash setSize/setPosition/maximize).
+  useEffect(() => {
+    let saved: { w: number; h: number; x?: number; y?: number } | null = null
+    let savedMax = false
+    try {
+      // WHY: Migrate key cũ (sd-window-size, chỉ có w/h) từ build trước — người dùng
+      // đã chọn kích thước sẽ giữ được kích thước đó khi nâng cấp lên bản lưu vị trí.
+      let raw = localStorage.getItem('sd-window-state')
+      if (!raw) {
+        const old = localStorage.getItem('sd-window-size')
+        if (old) {
+          raw = old
+          localStorage.removeItem('sd-window-size')
+        }
+      }
+      if (raw) {
+        const p = JSON.parse(raw)
+        if (typeof p?.w === 'number' && typeof p?.h === 'number' && p.w >= 800 && p.h >= 500) {
+          saved = { w: p.w, h: p.h }
+          // WHY: Vị trí là optional — chỉ khôi phục nếu cả x lẫn y đều là số hợp lệ
+          // (có thể là window chưa từng bị kéo → chưa có position được lưu).
+          if (typeof p?.x === 'number' && typeof p?.y === 'number') {
+            saved.x = p.x
+            saved.y = p.y
+          }
+        }
+      }
+      // WHY: Trạng thái maximize lưu riêng (sd-window-maximized) — chạy trước size/vị
+      // trí: nếu user đóng khi đang maximize thì lần mở sau cũng maximize (không cần
+      // khôi phục vị trí lúc maximize vì đó là bounds màn hình, không phải ý user).
+      const maxRaw = localStorage.getItem('sd-window-maximized')
+      savedMax = maxRaw === 'true'
+    } catch {}
+    let cancelled = false
+    import('@tauri-apps/api/window').then(async ({ getCurrentWindow, LogicalSize, LogicalPosition }) => {
+      try {
+        const win = getCurrentWindow()
+        if (cancelled) return
+        if (await win.isMaximized()) {
+          // WHY: Window đã maximize sẵn (vd tauri.conf hoặc OS restore) → chỉ đồng bộ state.
+          setIsMaximized(true)
+          windowRestoredRef.current = true
+          return
+        }
+        if (savedMax) {
+          // WHY: maximize() sau đó setMaximized state để icon titlebar khớp.
+          await win.maximize()
+          setIsMaximized(true)
+          windowRestoredRef.current = true
+          return
+        }
+        if (saved) {
+          // WHY: setSize trước rồi setPosition sau — setPosition khi size đang nhỏ hơn
+          // thực tế có thể bị clamp bởi monitor bounds, nên resize đúng rồi mới đặt vị trí.
+          await win.setSize(new LogicalSize(saved.w, saved.h))
+          if (saved.x !== undefined && saved.y !== undefined) {
+            await win.setPosition(new LogicalPosition(saved.x, saved.y))
+          }
+        }
+        // WHY: Luôn set true dù có hay không có dữ liệu lưu — move listener chỉ lắng
+        // nghe khi flag true. Nếu không set ở nhánh không có saved, lần đầu dùng app
+        // user kéo cửa sổ sẽ KHÔNG bao giờ được lưu vị trí.
+        windowRestoredRef.current = true
+      } catch {}
+    })
+    return () => { cancelled = true }
+  }, [])
+
+  // WHY: Lưu vị trí cửa sổ mỗi khi user kéo — listener 'tauri://move' trả physical
+  // position, chia scaleFactor để lưu logical (đồng bộ với setPosition/LogicalPosition).
+  // Chỉ lưu sau khi effect khôi phục set windowRestoredRef = true (restore xong) —
+  // nếu không sẽ lưu nhầm vị trí mặc định vừa mở, ghi đè vị trí user đã lưu trước đó.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+    let disposed = false
+    import('@tauri-apps/api/window').then(async ({ getCurrentWindow }) => {
+      try {
+        const win = getCurrentWindow()
+        unlisten = await win.onMoved(async ({ payload }) => {
+          if (disposed || !windowRestoredRef.current) return
+          try {
+            const sf = await win.scaleFactor()
+            const x = Math.round(payload.x / sf)
+            const y = Math.round(payload.y / sf)
+            const size = await win.outerSize()
+            const w = Math.round(size.width / sf)
+            const h = Math.round(size.height / sf)
+            localStorage.setItem('sd-window-state', JSON.stringify({ w, h, x, y }))
+          } catch {}
+        })
+      } catch {}
+    })
+    return () => { disposed = true; unlisten?.() }
+  }, [])
+
+  // WHY: Lưu trạng thái maximize mỗi khi window đổi kích thước (tauri://resize) — bắt
+  // được MỌI cách maximize: nút phóng to, double-click titlebar, Win+↑, snap. Ngược lại
+  // nếu chỉ lưu trong toggleMaximize thì các cách trên sẽ không được lưu → mở lại app
+  // không restore maximize dù user vừa maximize bằng Win+↑.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+    let disposed = false
+    import('@tauri-apps/api/window').then(async ({ getCurrentWindow }) => {
+      try {
+        const win = getCurrentWindow()
+        unlisten = await win.onResized(async () => {
+          if (disposed || !windowRestoredRef.current) return
+          try {
+            const max = await win.isMaximized()
+            setIsMaximized(max)
+            localStorage.setItem('sd-window-maximized', max ? 'true' : 'false')
+            // WHY: Khi unmaximize (max=false), onResized cũng kích hoạt — không cần
+            // xử lý gì thêm vì size/position sau unmaximize sẽ được onMoved cập nhật
+            // nếu user kéo; còn nếu không kéo thì lần mở sau dùng size đã lưu.
+          } catch {}
+        })
+      } catch {}
+    })
+    return () => { disposed = true; unlisten?.() }
   }, [])
 
   // WHY: Deep-link từ Windows toast — đọc ?printer=NAME trong URL khi mở (nút 'Gán IP'
@@ -395,7 +581,8 @@ function App() {
   }
 
   // WHY: Toggle maximize/minimize window (custom title bar decorations: false)
-  // — cập nhật icon trạng thái sau khi toggle.
+  // — cập nhật icon trạng thái sau khi toggle. onResized listener (effect trên) sẽ
+  // bắt sự kiện resize và lưu sd-window-maximized — nên không cần lưu ở đây.
   const toggleMaximize = async () => {
     try {
       const { getCurrentWindow } = await import('@tauri-apps/api/window')
@@ -405,11 +592,96 @@ function App() {
   }
 
   // WHY: Nút X đóng window — app vẫn chạy ngầm ở system tray nếu enabled.
+  // Lưu trạng thái maximize hiện tại trước khi close (tray restore cũng cần đúng).
   const closeWindow = async () => {
     try {
       const { getCurrentWindow } = await import('@tauri-apps/api/window')
-      await getCurrentWindow().close()
+      const win = getCurrentWindow()
+      try {
+        const max = await win.isMaximized()
+        localStorage.setItem('sd-window-maximized', max ? 'true' : 'false')
+      } catch {}
+      await win.close()
     } catch {}
+  }
+
+  // WHY: Lấy kích thước logical của màn hình hiện tại (monitor.size / scaleFactor)
+  // để so sánh với preset — Tauri v2 trả physical size + scaleFactor riêng.
+  const getScreenLogicalSize = async (): Promise<{ width: number; height: number } | null> => {
+    try {
+      const { currentMonitor } = await import('@tauri-apps/api/window')
+      const monitor = await currentMonitor()
+      if (!monitor) return null
+      return {
+        width: Math.round(monitor.size.width / monitor.scaleFactor),
+        height: Math.round(monitor.size.height / monitor.scaleFactor),
+      }
+    } catch {
+      return null
+    }
+  }
+
+  // WHY: Áp dụng kích thước cửa sổ — nếu đang maximize thì unmaximize trước rồi
+  // mới setSize (setSize trên window maximized có thể không có hiệu lực).
+  // Lưu size + vị trí hiện tại vào localStorage (sd-window-state) để lần mở sau
+  // khôi phục đúng kích thước đã chọn này.
+  const applyWindowSize = async (w: number, h: number) => {
+    try {
+      const { getCurrentWindow, LogicalSize } = await import('@tauri-apps/api/window')
+      const win = getCurrentWindow()
+      if (await win.isMaximized()) await win.unmaximize()
+      await win.setSize(new LogicalSize(w, h))
+      setCurrentSize({ w, h })
+      try {
+        const pos = await win.outerPosition()
+        const sf = await win.scaleFactor()
+        localStorage.setItem('sd-window-state', JSON.stringify({
+          w,
+          h,
+          x: Math.round(pos.x / sf),
+          y: Math.round(pos.y / sf),
+        }))
+      } catch {}
+      setSizeMenuOpen(false)
+      setStatusText(`Kích thước cửa sổ: ${w} × ${h}`)
+    } catch {}
+  }
+
+  // WHY: Khôi phục kích thước + vị trí MẶC ĐỊNH (1680×1000, căn giữa như tauri.conf.json)
+  // — unmaximize trước, setSize, center() rồi XÓA sd-window-state để lần mở sau không
+  // bị restore lại vị trí cũ (nếu chỉ setSize mà không xóa, effect khôi phục sẽ tự
+  // set về vị trí user đã lưu trước đó → user tưởng "reset" nhưng không thay đổi).
+  const resetWindowSize = async () => {
+    try {
+      const { getCurrentWindow, LogicalSize } = await import('@tauri-apps/api/window')
+      const win = getCurrentWindow()
+      if (await win.isMaximized()) await win.unmaximize()
+      await win.setSize(new LogicalSize(1680, 1000))
+      await win.center()
+      setCurrentSize({ w: 1680, h: 1000 })
+      try {
+        localStorage.removeItem('sd-window-state')
+      } catch {}
+      setSizeMenuOpen(false)
+      setStatusText('Kích thước cửa sổ: mặc định 1680 × 1000')
+    } catch {}
+  }
+
+  // WHY: Xử lý chọn kích thước — nếu preset lớn hơn màn hình hiện tại thì hiện
+  // popup cảnh báo kèm gợi ý kích thước phù hợp nhất, nhưng vẫn cho user áp dụng.
+  const selectSize = async (w: number, h: number) => {
+    const screen = await getScreenLogicalSize()
+    if (screen && (w > screen.width || h > screen.height)) {
+      // WHY: Gợi ý = preset lớn nhất vừa màn hình (hoặc preset nhỏ nhất nếu màn hình quá bé).
+      const fitting = SIZE_PRESETS.filter(s => s.w <= screen.width && s.h <= screen.height)
+      const suggest = fitting.length > 0 ? fitting[fitting.length - 1] : SIZE_PRESETS[0]
+      // WHY: Đóng menu kích thước ngay khi hiện cảnh báo — tránh 2 popup chồng nhau
+      // (overlay cảnh báo phủ toàn màn hình nên menu sau lưng vẫn mở, gây khó hiểu).
+      setSizeMenuOpen(false)
+      setPendingSize({ w, h, suggestW: suggest.w, suggestH: suggest.h, screenW: screen.width, screenH: screen.height })
+    } else {
+      await applyWindowSize(w, h)
+    }
   }
 
   // WHY: Dừng toàn bộ — nút "Dừng tất cả" ở titlebar gọi hàm này.
@@ -570,6 +842,69 @@ function App() {
               )}
             </button>
             <div className="titlebar-separator" />
+            {/* WHY: Nút Settings kích thước cửa sổ — popup 7 kích thước phổ biến.
+                Nằm kế nút Thu gọn xuống khay; cảnh báo khi chọn size lớn hơn màn hình. */}
+            <div className="relative" ref={sizeMenuRef}>
+              <button onClick={() => setSizeMenuOpen(o => !o)}
+                className="titlebar-btn"
+                title="Kích thước cửa sổ"
+                aria-label="Chọn kích thước cửa sổ"
+                aria-expanded={sizeMenuOpen}>
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                  <rect x="1" y="1" width="10" height="10" rx="1.5" stroke="currentColor" strokeWidth="1.2" />
+                  <path d="M4.5 1v10M1 4.5h10" stroke="currentColor" strokeWidth="0.7" opacity="0.45" />
+                </svg>
+              </button>
+              {sizeMenuOpen && (
+                <div className="absolute right-0 top-full mt-1 w-64 rounded-xl border shadow-2xl p-1.5 backdrop-blur-xl animate-scale-in"
+                  style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border)', zIndex: 99999 }}>
+                  {/* WHY: Header 2 cột khớp với các option bên dưới — trái "Kích thước",
+                      phải "Thông tin" để người dùng biết cột nào hiển thị gì. */}
+                  <div className="grid grid-cols-[1fr_auto] gap-3 px-3 py-1.5 text-[8px] font-bold uppercase tracking-wider" style={{ color: 'var(--fg-dim)' }}>
+                    <span>Kích thước</span>
+                    <span className="pr-0.5">Thông tin</span>
+                  </div>
+                  {SIZE_PRESETS.map(s => {
+                    // WHY: Preset active = size đã lưu/chọn khớp chính xác — nhấn preset
+                    // cùng size với size hiện tại thì vẫn coi là active (check hiển thị).
+                    const active = !!currentSize && currentSize.w === s.w && currentSize.h === s.h
+                    return (
+                      <button key={s.name} onClick={() => selectSize(s.w, s.h)}
+                        className={`size-menu-item ${active ? 'size-menu-item-active' : ''}`}
+                        style={{ color: active ? '#34d399' : 'var(--fg-secondary)' }}>
+                        {/* Cột trái: check active + nhãn phân loại (HD/FHD/QHD) + tên kích thước */}
+                        <span className="flex items-center gap-1.5 min-w-0">
+                          {/* WHY: Check đánh dấu preset đang active — giữ chỗ trống
+                              (invisible) khi không active để các label không bị xê dịch. */}
+                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5}
+                            className={`shrink-0 ${active ? 'opacity-100' : 'opacity-0'}`}>
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                          </svg>
+                          <span className="text-[9px] font-bold px-1 py-px rounded shrink-0" style={{ color: '#34d399', backgroundColor: 'rgba(52,211,153,0.1)', border: '1px solid rgba(52,211,153,0.25)' }}>{s.tag}</span>
+                          <span className="truncate text-xs font-medium">{s.name}</span>
+                        </span>
+                        {/* Cột phải: kích thước px + tỷ lệ màn hình */}
+                        <span className="flex flex-col items-end shrink-0">
+                          <span className="font-mono text-[10px] font-semibold" style={{ color: active ? '#34d399' : 'var(--fg-secondary)' }}>{s.w} × {s.h}</span>
+                          <span className="text-[8px]" style={{ color: 'var(--fg-dim)' }}>{s.ratio}</span>
+                        </span>
+                      </button>
+                    )
+                  })}
+                  <div className="my-1 h-px" style={{ backgroundColor: 'var(--border)' }} />
+                  {/* WHY: Reset về 1680×1000 + căn giữa + xóa sd-window-state — khác màu
+                      (amber) để dễ phân biệt với các preset thường. */}
+                  <button onClick={resetWindowSize}
+                    className="w-full flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs transition-colors cursor-pointer border-0 hover:bg-amber-500/10"
+                    style={{ color: '#f59e0b' }}>
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h5M20 20v-5h-5M4 9a8 8 0 0114.9-2M20 15a8 8 0 01-14.9 2" />
+                    </svg>
+                    Khôi phục kích thước mặc định
+                  </button>
+                </div>
+              )}
+            </div>
             <button onClick={minimizeToTray} className="titlebar-btn titlebar-btn-tray" title="Thu gọn xuống khay">
               <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
                 <rect className="tray-bar" x="1" y="9.5" width="10" height="1.5" rx="0.75" fill="currentColor" />
@@ -633,15 +968,23 @@ function App() {
             <ServersModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'servers'} backgroundPolling={backgroundPolling.servers} logColors={logColors}
               onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, servers: enabled }))}
               onLogColorsChange={setLogColors} onOpenSettings={() => { setSettingsAnim('enter'); setSettingsOpen(true) }} preloadedData={preloadedData} />
-            <PrintersModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'printers'} backgroundPolling={backgroundPolling.printers}
-              onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, printers: enabled }))} preloadedData={preloadedData}
-              openPrinter={openPrinter} onOpenPrinterHandled={() => setOpenPrinter(null)} />
-            <AudioModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'audio'} backgroundPolling={backgroundPolling.audio}
-              onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, audio: enabled }))} preloadedData={preloadedData} />
+            {/* WHY: 3 module Windows-only (Máy in/Âm thanh/Tunnel) chỉ render trên nền tảng
+                hỗ trợ — trên Mac không mount để tránh gọi API backend Windows-only. */}
+            {PLATFORM_MODULES.some(m => m.id === 'printers') && (
+              <PrintersModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'printers'} backgroundPolling={backgroundPolling.printers}
+                onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, printers: enabled }))} preloadedData={preloadedData}
+                openPrinter={openPrinter} onOpenPrinterHandled={() => setOpenPrinter(null)} />
+            )}
+            {PLATFORM_MODULES.some(m => m.id === 'audio') && (
+              <AudioModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'audio'} backgroundPolling={backgroundPolling.audio}
+                onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, audio: enabled }))} preloadedData={preloadedData} />
+            )}
             <FileCopierModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'file-copier'} />
             <DatabaseModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'database'} preloadedData={preloadedData} />
-            <TunnelsModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'tunnels'} backgroundPolling={backgroundPolling.tunnels}
-              onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, tunnels: enabled }))} preloadedData={preloadedData} />
+            {PLATFORM_MODULES.some(m => m.id === 'tunnels') && (
+              <TunnelsModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'tunnels'} backgroundPolling={backgroundPolling.tunnels}
+                onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, tunnels: enabled }))} preloadedData={preloadedData} />
+            )}
             <LogModule theme={theme} setStatusText={setStatusText} inactive={activeModule !== 'logs'} backgroundPolling={backgroundPolling.logs} logColors={logColors}
               onBackgroundPollingChange={(enabled) => setBackgroundPolling(prev => ({ ...prev, logs: enabled }))} preloadedData={preloadedData} />
           </Suspense>
@@ -757,6 +1100,50 @@ function App() {
                 setTimeout(() => { setChangelogOpen(false); setChangelogAnim('enter') }, 250)
               }}
                 className="px-4 py-1.5 text-[12px] font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors cursor-pointer border-0">Đóng</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* WHY: Cảnh báo khi chọn kích thước cửa sổ lớn hơn màn hình hiện tại —
+          gợi ý kích thước phù hợp nhất nhưng vẫn cho phép user áp dụng size đã chọn. */}
+      {pendingSize && (
+        <div className="fixed inset-0 z-[100000] flex items-center justify-center bg-black/60 backdrop-blur-sm animate-modal-in"
+          onClick={e => { if (e.target === e.currentTarget) setPendingSize(null) }}>
+          <div className="w-full max-w-sm rounded-2xl border shadow-2xl p-5 animate-modal-content-in"
+            style={{ backgroundColor: 'var(--bg-card)', borderColor: 'var(--border)', color: 'var(--fg)' }}>
+            <div className="flex items-center gap-2.5 pb-3 border-b" style={{ borderColor: 'var(--border)' }}>
+              <div className="w-8 h-8 rounded-lg bg-amber-500/15 border border-amber-500/30 flex items-center justify-center text-amber-400 shrink-0">⚠️</div>
+              <div>
+                <h3 className="text-sm font-bold leading-tight">Kích thước lớn hơn màn hình</h3>
+                <p className="text-[10px] mt-0.5" style={{ color: 'var(--fg-muted)' }}>Một phần cửa sổ có thể bị cắt khỏi màn hình</p>
+              </div>
+            </div>
+            <div className="py-4 text-xs space-y-1.5" style={{ color: 'var(--fg-secondary)' }}>
+              <p>
+                Kích thước đã chọn: <b className="font-mono text-amber-400">{pendingSize.w} × {pendingSize.h}</b>
+              </p>
+              <p>
+                Màn hình hiện tại: <b className="font-mono">{pendingSize.screenW} × {pendingSize.screenH}</b>
+              </p>
+              <p className="pt-1 text-[11px]" style={{ color: 'var(--fg-dim)' }}>
+                💡 Gợi ý kích thước phù hợp: <b className="font-mono text-emerald-400">{pendingSize.suggestW} × {pendingSize.suggestH}</b>
+              </p>
+            </div>
+            <div className="flex gap-2 pt-3 border-t" style={{ borderColor: 'var(--border)' }}>
+              <button onClick={() => setPendingSize(null)}
+                className="px-3 py-1.5 text-xs font-semibold border rounded-xl transition-all active:scale-95 cursor-pointer hover:bg-white/10"
+                style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+                Hủy
+              </button>
+              <button onClick={() => { const s = pendingSize; setPendingSize(null); applyWindowSize(s.suggestW, s.suggestH) }}
+                className="flex-1 px-3 py-1.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl transition-all active:scale-95 cursor-pointer border-0 shadow-sm">
+                Dùng gợi ý {pendingSize.suggestW} × {pendingSize.suggestH}
+              </button>
+              <button onClick={() => { const s = pendingSize; setPendingSize(null); applyWindowSize(s.w, s.h) }}
+                className="flex-1 px-3 py-1.5 text-xs font-semibold bg-amber-500/15 text-amber-400 border border-amber-500/30 rounded-xl transition-all active:scale-95 cursor-pointer hover:bg-amber-500/25">
+                Vẫn áp dụng {pendingSize.w} × {pendingSize.h}
+              </button>
             </div>
           </div>
         </div>

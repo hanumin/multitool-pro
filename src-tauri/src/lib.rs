@@ -63,33 +63,61 @@ fn find_project_root() -> std::path::PathBuf {
         })
 }
 
-// WHY: Nhúng backend.exe (PyInstaller onefile — chứa Python runtime + Flask + mọi dep) vào
-// thẳng binary Tauri → portable exe khép kín 1 file duy nhất (không cần Python cài sẵn).
+// WHY: Nhúng backend (PyInstaller onefile — chứa Python runtime + Flask + mọi dep) vào
+// thẳng binary Tauri → portable khép kín 1 file duy nhất (không cần Python cài sẵn).
+// Tên file nhúng khác theo OS: Windows = backend.exe, macOS/Linux = backend (không đuôi).
 // include_bytes! yêu cầu file tồn tại LÚC COMPILE — build.rs tạo placeholder rỗng cho dev
-// build; bản thật được build-portable.ps1 (chạy PyInstaller) copy vào src-tauri/backend-embed/
+// build; bản thật được build script/CI (chạy PyInstaller) copy vào src-tauri/backend-embed/
 // TRƯỚC khi gọi tauri build. Dev build có placeholder rỗng → len nhỏ → fallback python.
+#[cfg(target_os = "windows")]
 static EMBEDDED_BACKEND: &[u8] = include_bytes!("../backend-embed/backend.exe");
+#[cfg(not(target_os = "windows"))]
+static EMBEDDED_BACKEND: &[u8] = include_bytes!("../backend-embed/backend");
 
-// WHY: Giải nén backend.exe nhúng ra %LOCALAPPDATA%/multitool-pro/backend/backend.exe — cache
-// CỐ ĐỊNH (không phải temp) để không ghi lại mỗi lần mở app; chỉ ghi khi file thiếu hoặc kích
-// thước khác (bản backend mới). Ghi temp rồi rename (atomic) tránh file nửa chừng khi đọc.
+// WHY: Tên file backend nhúng theo nền tảng — dùng chung cho ensure_embedded_backend
+// (đường dẫn giải nén) để không lệch với include_bytes! ở trên.
+fn embedded_backend_name() -> &'static str {
+    if cfg!(windows) { "backend.exe" } else { "backend" }
+}
+
+// WHY: Kiểm tra file nhúng có phải binary thật không (placeholder dev rỗng → bỏ qua).
+// Chấp nhận: PE (Windows "MZ"), Mach-O 64 thin (macOS 0xCFFAEDFE), Mach-O FAT/universal
+// (macOS 0xCAFEBABE / 0xBEBAFECA — bản universal2 chứa cả Intel + Silicon), ELF (Linux).
+fn is_plausible_backend(bytes: &[u8]) -> bool {
+    bytes.len() >= 1_000_000
+        && (bytes.starts_with(b"MZ")
+            || bytes.starts_with(&[0xCF, 0xFA, 0xED, 0xFE])
+            || bytes.starts_with(&[0xCA, 0xFE, 0xBA, 0xBE])
+            || bytes.starts_with(&[0xBE, 0xBA, 0xFE, 0xCA])
+            || bytes.starts_with(b"\x7fELF"))
+}
+
+// WHY: Giải nén backend nhúng ra cache CỐ ĐỊNH (không phải temp) để không ghi lại mỗi
+// lần mở app; chỉ ghi khi file thiếu hoặc kích thước khác (bản backend mới). Ghi temp
+// rồi rename (atomic) tránh file nửa chừng khi đọc. Thư mục theo OS: %LOCALAPPDATA% trên
+// Windows, $HOME trên macOS/Linux.
 fn ensure_embedded_backend() -> Option<std::path::PathBuf> {
-    // WHY: Placeholder dev = rỗng (0 byte) → bỏ qua. Backend thật luôn là PE (MZ) ≥ vài MB.
-    if EMBEDDED_BACKEND.len() < 1_000_000 || !EMBEDDED_BACKEND.starts_with(b"MZ") {
+    // WHY: Placeholder dev = rỗng (0 byte) → bỏ qua. Backend thật ≥ vài MB + magic đúng OS.
+    if !is_plausible_backend(EMBEDDED_BACKEND) {
         return None;
     }
+    #[cfg(target_os = "windows")]
     let base = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    #[cfg(not(target_os = "windows"))]
+    let base = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     let dir = base.join("multitool-pro").join("backend");
     std::fs::create_dir_all(&dir).ok()?;
-    let target = dir.join("backend.exe");
+    let target = dir.join(embedded_backend_name());
     let needs_write = !target.exists()
         || std::fs::metadata(&target)
             .map(|m| m.len() as usize != EMBEDDED_BACKEND.len())
             .unwrap_or(true);
     if needs_write {
-        let tmp = dir.join("backend.exe.new");
+        let tmp = dir.join(format!("{}.new", embedded_backend_name()));
         if std::fs::write(&tmp, EMBEDDED_BACKEND).is_err() {
             return None;
         }
@@ -142,8 +170,12 @@ fn build_backend_command(
 // WHY: Tìm Python interpreter - pythonw ẩn console, python hiện console.
 // Thử pythonw → python → py launcher → các đường dẫn phổ biến (gồm 3.13/3.14).
 fn find_python() -> Option<std::path::PathBuf> {
-    for name in ["pythonw", "python", "py"] {
-        if let Ok(path) = std::process::Command::new("where").arg(name).output() {
+    // WHY: Tìm lệnh theo OS — Windows dùng `where`, macOS/Linux dùng `which`; tên binary
+    // ưu tiên pythonw (ẩn console) trên Windows, python3 trên unix (không có pythonw).
+    let finder = if cfg!(windows) { "where" } else { "which" };
+    let names: &[&str] = if cfg!(windows) { &["pythonw", "python", "py"] } else { &["python3", "python"] };
+    for name in names {
+        if let Ok(path) = std::process::Command::new(finder).arg(name).output() {
             if path.status.success() {
                 let p = String::from_utf8_lossy(&path.stdout).trim().to_string();
                 if !p.is_empty() {

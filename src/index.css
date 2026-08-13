@@ -53,6 +53,7 @@
   --button-tunnel-hover: rgba(59,130,246,0.22);
   --accent-bar-running: #34d399;
   --accent-bar-stopped: #475569;
+  --card-border-running: rgba(52, 211, 153, 0.55);
 }
 
 [data-theme="light"] {
@@ -99,6 +100,7 @@
   --button-tunnel-hover: rgba(37,99,235,0.16);
   --accent-bar-running: #059669;
   --accent-bar-stopped: #cbd5e1;
+  --card-border-running: rgba(16, 185, 129, 0.45);
 }
 
 /* WHY: Định nghĩa hệ thống font chuẩn SaaS chuyên nghiệp (Inter + JetBrains Mono)
@@ -479,6 +481,16 @@ body {
   * {
     font-family: 'Inter', system-ui, -apple-system, sans-serif;
   }
+
+  /* WHY: Focus states — guideline Vercel: mọi interactive element cần visible focus.
+     :focus-visible chỉ hiện ring khi điều hướng bằng keyboard (không hiện khi click chuột).
+     Nằm trong base layer nên Tailwind utilities (vd focus:outline-none) vẫn ghi đè được. */
+  button:focus-visible,
+  select:focus-visible,
+  a:focus-visible {
+    outline: 2px solid rgba(52, 211, 153, 0.5);
+    outline-offset: 1px;
+  }
 }
 
 ::selection {
@@ -504,16 +516,6 @@ body {
   background: var(--border-hover);
 }
 
-@keyframes ping-slow {
-  0% { transform: scale(1); opacity: 1; }
-  50% { transform: scale(2.5); opacity: 0; }
-  100% { transform: scale(1); opacity: 0; }
-}
-
-.animate-ping-slow {
-  animation: ping-slow 2s cubic-bezier(0, 0, 0.2, 1) infinite;
-}
-
 @keyframes fade-in {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: translateY(0); }
@@ -533,13 +535,15 @@ body {
   animation: glow-pulse 0.4s ease-out;
 }
 
+/* WHY: badge-pop mềm hơn — scale tối đa 1.1 (trước là 1.3) để không tạo hiệu ứng tròn
+   tràn ra ngoài frame chứa badge. Vẫn giữ cảm giác pop khi trạng thái đổi. */
 @keyframes badge-pop {
-  0% { transform: scale(0); opacity: 0; }
-  50% { transform: scale(1.3); }
+  0% { transform: scale(0.85); opacity: 0; }
+  60% { transform: scale(1.1); }
   100% { transform: scale(1); opacity: 1; }
 }
 .animate-badge-pop {
-  animation: badge-pop 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+  animation: badge-pop 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
 @keyframes loading-bar-shimmer {
@@ -619,6 +623,18 @@ body {
   bottom: 100% !important;
   border-top-color: transparent !important;
   border-bottom-color: #334155 !important;
+}
+
+/* WHY: Tooltip neo bên phải — dùng cho phần tử gần mép phải (vd badge xung đột cổng),
+   tooltip mở rộng về bên trái để không tràn khỏi màn hình. Mũi tên lệch về phải. */
+.tooltip-right {
+  left: auto !important;
+  right: 0 !important;
+  transform: none !important;
+}
+
+.tooltip-right::after {
+  left: calc(100% - 16px) !important;
 }
 
 .group:hover .tooltip-text {
@@ -710,7 +726,7 @@ body {
   width: 10px;
   height: 10px;
   border-radius: 50%;
-  transition: all 0.15s ease;
+  transition: filter 0.15s ease, transform 0.15s ease;
 }
 
 .terminal-dot:hover {
@@ -742,7 +758,10 @@ body {
 }
 
 .terminal-tab {
-  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: opacity 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+              background-color 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+              color 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+              border-color 0.2s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .terminal-tab:hover {
@@ -785,7 +804,10 @@ body {
 
 /* ─── Toast Notifications ───────────────────────────────── */
 /* ─── Server Card Animations ─────────────────────────── */
-/* WHY: Card enter animation — staggered fade-in + slide-up */
+/* WHY: Card enter animation — staggered fade-in + slide-up.
+   to-frame dùng transform: none (thay vì translateY(0) scale(1)) để sau animation
+   card KHÔNG giữ stacking context (transform≠none tạo stacking context) —
+   nếu không tooltip con sẽ bị frame card khác che dù z-index rất cao. */
 @keyframes card-enter {
   from {
     opacity: 0;
@@ -793,7 +815,7 @@ body {
   }
   to {
     opacity: 1;
-    transform: translateY(0) scale(1);
+    transform: none;
   }
 }
 
@@ -801,9 +823,10 @@ body {
   animation: card-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
-/* WHY: Card hover — lift + glow border */
+/* WHY: Card hover — lift + glow border. Liệt kê property cụ thể (guideline: không transition: all) */
 .card-hover {
-  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1),
+              box-shadow 0.25s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .card-hover:hover {
@@ -994,6 +1017,56 @@ body {
   animation: scale-in 0.2s cubic-bezier(0.34, 1.56, 0.64, 1) backwards;
 }
 
+/* ─── Size Preset Menu Items (titlebar Settings popup) ── */
+/* WHY: Option kích thước cửa sổ — grid 2 cột (kích thước | thông tin). Hover dùng
+   var(--bg-card-hover) (đã định nghĩa cho cả 2 theme) + accent bar trái emerald
+   hiện ra để luôn thấy rõ đang hover option nào (trước đây hover:bg-white/5
+gần như vô hình trên theme sáng và quá nhạt trên theme tối). */
+.size-menu-item {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 0.75rem;
+  width: 100%;
+  padding: 0.4rem 0.6rem 0.4rem 0.75rem;
+  border-radius: 0.5rem;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  transition: background-color 0.15s ease, transform 0.15s ease;
+}
+
+/* WHY: Accent bar trái hiện khi hover/active — dùng ::before + scaleY để mượt,
+   không làm layout xê dịch khi xuất hiện. */
+.size-menu-item::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 3px;
+  height: 55%;
+  border-radius: 9999px;
+  background: linear-gradient(180deg, #34d399, #059669);
+  transform: translateY(-50%) scaleY(0);
+  transition: transform 0.15s ease;
+}
+
+.size-menu-item:hover,
+.size-menu-item-active {
+  background: var(--bg-card-hover);
+}
+
+.size-menu-item:hover::before,
+.size-menu-item-active::before {
+  transform: translateY(-50%) scaleY(1);
+}
+
+.size-menu-item:active {
+  transform: scale(0.98);
+}
+
 /* ─── Slide-Up for Mic Timer / Dashboard Items ─────────── */
 @keyframes slide-up {
   from {
@@ -1060,7 +1133,8 @@ body {
 
 /* WHY: Tunnel row hover — highlight + subtle scale */
 .tunnel-row-hover {
-  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: background-color 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+              backdrop-filter 0.2s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .tunnel-row-hover:hover {
@@ -1154,8 +1228,25 @@ body {
 
 /* ─── Server Cards ──────────────────────────────────── */
 .card-container {
+  position: relative;
   transition: box-shadow 0.35s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.35s cubic-bezier(0.16, 1, 0.3, 1), transform 0.25s ease;
   box-shadow: var(--card-shadow);
+}
+
+/* WHY: Fix tooltip bị frame khác đè — khi hover, nâng stacking context của CẢ CARD
+   (z-index 200) lên trên mọi sibling (card khác, log viewer). Tooltip con của card
+   (z-index 2147483647) nhờ đó luôn vẽ trên cùng — vì card hovered luôn là card
+   đang hiển thị tooltip. */
+.card-container:hover {
+  z-index: 200;
+}
+
+/* WHY: Nâng tiếp phần tử .group (nút chứa tooltip) khi hover (z-index 300) —
+   phủ mọi trường hợp tooltip ngoài card: banner detected, toolbar Cài đặt,
+   expand section… Nút là vị trí định vị (relative) của tooltip nên nâng nút
+   = nâng tooltip lên trên mọi sibling. */
+.group:hover {
+  z-index: 300;
 }
 
 .card-container:hover {
@@ -1164,8 +1255,10 @@ body {
   transform: translateY(-1px);
 }
 
+/* WHY: Card đang chạy — viền xanh lá đậm (thay thế accent bar gradient 3px đã bỏ),
+   nhìn rõ trạng thái running ngay từ viền frame */
 .card-running {
-  border-color: var(--badge-running-border) !important;
+  border-color: var(--card-border-running, rgba(52, 211, 153, 0.55)) !important;
 }
 
 .card-running:hover {
@@ -1194,24 +1287,6 @@ body {
   box-shadow: 0 0 24px rgba(16, 185, 129, 0.12), 0 0 60px rgba(16, 185, 129, 0.05), var(--card-shadow-hover) !important;
 }
 
-/* Top accent gradient bar for running projects */
-.card-accent-bar {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 3px;
-  border-radius: 12px 12px 0 0;
-  background: linear-gradient(90deg, #34d399, #22d3ee, #34d399);
-  background-size: 200% 100%;
-  animation: card-accent-shimmer 3s ease-in-out infinite;
-}
-
-@keyframes card-accent-shimmer {
-  0%, 100% { background-position: 0% 50%; }
-  50% { background-position: 100% 50%; }
-}
-
 /* Glass status badge */
 .status-badge {
   position: relative;
@@ -1224,7 +1299,7 @@ body {
   font-weight: 600;
   line-height: 1.4;
   backdrop-filter: blur(4px);
-  transition: all 0.2s ease;
+  transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
 }
 
 .status-badge-running {
@@ -1247,18 +1322,16 @@ body {
   position: relative;
 }
 
-.status-dot-running {
-  background: var(--badge-running-text);
-  box-shadow: 0 0 4px var(--badge-running-text);
+/* WHY: Dot trạng thái running — bỏ ping ring ::after (trước đây inset -3px + scale 2.5x
+   tạo vòng tròn tràn ra ngoài frame chứa). Thay bằng glow pulse nằm gọn trong dot. */
+@keyframes status-dot-glow {
+  0%, 100% { box-shadow: 0 0 3px var(--badge-running-text); }
+  50% { box-shadow: 0 0 6px var(--badge-running-text); }
 }
 
-.status-dot-running::after {
-  content: '';
-  position: absolute;
-  inset: -3px;
-  border-radius: 50%;
-  border: 1px solid var(--badge-running-text);
-  animation: ping-slow 2s cubic-bezier(0, 0, 0.2, 1) infinite;
+.status-dot-running {
+  background: var(--badge-running-text);
+  animation: status-dot-glow 2s ease-in-out infinite;
 }
 
 .status-dot-stopped {
@@ -1274,7 +1347,7 @@ body {
   border-radius: 6px;
   font-size: 0.625rem;
   font-weight: 500;
-  transition: all 0.15s ease;
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
   cursor: pointer;
   border: none;
 }
@@ -1306,7 +1379,7 @@ body {
   border-radius: 6px;
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.6875rem;
-  transition: all 0.2s ease;
+  transition: background-color 0.2s ease, border-color 0.2s ease;
   background: rgba(59,130,246,0.06);
   border: 1px solid rgba(59,130,246,0.15);
 }
@@ -1325,7 +1398,7 @@ body {
   border-radius: 8px;
   font-size: 0.75rem;
   font-weight: 600;
-  transition: all 0.15s ease;
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
   cursor: pointer;
   border: none;
   line-height: 1.4;
@@ -1398,6 +1471,8 @@ body {
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.6875rem;
   font-weight: 400;
+  /* WHY: tabular-nums — số thẳng hàng không nhảy khi cập nhật (guideline Vercel) */
+  font-variant-numeric: tabular-nums;
 }
 
 

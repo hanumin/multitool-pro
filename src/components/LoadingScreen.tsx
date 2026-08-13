@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef } from 'react'
 import { API, fetchWithRetry } from '../utils/apiFetch'
+import { PLATFORM_MODULES } from '../types'
 import type { PreloadedData } from '../types'
 
 interface PreloadStep {
@@ -85,6 +86,13 @@ const MODULE_APIS: ModuleApi[] = [
   { id: 'ready', label: 'Sẵn sàng', icon: '✨', fetch: async (): Promise<FetchResult> => ({ response: null, data: null }) },
 ]
 
+// WHY: Lọc các step preload theo nền tảng hiện tại — trên Mac bỏ Máy in/Âm thanh/
+// Tunnel (Windows-only) để không gọi API backend Windows-only (tránh lỗi + chờ timeout).
+// 'connecting'/'ready' luôn giữ.
+const VISIBLE_APIS: ModuleApi[] = MODULE_APIS.filter(m =>
+  m.id === 'connecting' || m.id === 'ready' || PLATFORM_MODULES.some(x => x.id === m.id)
+)
+
 // WHY: Component nhỏ để fetch version từ Tauri API dynamic.
 function AppVersion() {
   const [ver, setVer] = useState('')
@@ -101,7 +109,7 @@ function AppVersion() {
 // Gọi API THẬT cho từng module, không phải animation giả.
 export default function LoadingScreen({ onComplete }: Props) {
   const [steps, setSteps] = useState<PreloadStep[]>(
-    MODULE_APIS.map((m, i) => ({
+    VISIBLE_APIS.map((m, i) => ({
       id: m.id, label: m.label, icon: m.icon,
       progress: i === 0 ? 15 : 0,
       status: i === 0 ? 'loading' : 'waiting' as const,
@@ -152,7 +160,7 @@ export default function LoadingScreen({ onComplete }: Props) {
         
         // Update overall progress
         setOverallProgress(prev => {
-          const stepsTotal = MODULE_APIS.length
+          const stepsTotal = VISIBLE_APIS.length
           const stepValue = (current / 100) * (100 / stepsTotal)
           const baseValue = idx * (100 / stepsTotal)
           return Math.min(Math.round(baseValue + stepValue), 99)
@@ -196,7 +204,7 @@ export default function LoadingScreen({ onComplete }: Props) {
       // WHY: Fire tất cả API calls song song ngay từ đầu.
       // Khi mỗi promise resolve, step tương ứng được đánh dấu hoàn thành.
       // Data từ mỗi API response được flatten và collect vào preloadedData.
-      const promises = MODULE_APIS.map((mod, idx) => 
+      const promises = VISIBLE_APIS.map((mod, idx) => 
         (async () => {
           try {
             const result = await mod.fetch()
@@ -227,7 +235,7 @@ export default function LoadingScreen({ onComplete }: Props) {
       await animateProgress(0, 100, 200)
       setSteps(prev => prev.map((s, i) => i === 0 ? { ...s, status: 'done' as const, progress: 100 } : s))
 
-      for (let i = 1; i < MODULE_APIS.length - 1; i++) {
+      for (let i = 1; i < VISIBLE_APIS.length - 1; i++) {
         if (cancelled) return
         setCurrentStepIdx(i)
         setSteps(prev => prev.map((s, j) => j === i ? { ...s, status: 'loading' as const } : s))
@@ -255,9 +263,9 @@ export default function LoadingScreen({ onComplete }: Props) {
 
       // Final step: Ready
       if (cancelled) return
-      setCurrentStepIdx(MODULE_APIS.length - 1)
-      setSteps(prev => prev.map((s, i) => i === MODULE_APIS.length - 1 ? { ...s, status: 'loading' as const } : s))
-      await animateProgress(MODULE_APIS.length - 1, 100, 400)
+      setCurrentStepIdx(VISIBLE_APIS.length - 1)
+      setSteps(prev => prev.map((s, i) => i === VISIBLE_APIS.length - 1 ? { ...s, status: 'loading' as const } : s))
+      await animateProgress(VISIBLE_APIS.length - 1, 100, 400)
       
       const elapsed = Math.round((Date.now() - startedAt.current) / 100) / 10
       setShowTip(`✨ Đã sẵn sàng trong ${elapsed} giây`)

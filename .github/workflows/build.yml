@@ -1,0 +1,239 @@
+# WHY: Build đa nền tảng — Windows x64 + macOS (một bản universal2 chạy được cả Intel
+# lẫn Apple Silicon). Mỗi OS phải build trên chính runner của nó (Tauri/Apple không
+# hỗ trợ cross-compile). Backend Python được đóng gói bằng PyInstaller RIÊNG cho từng
+# OS rồi nhúng vào binary Tauri (src-tauri/backend-embed/) → app khép kín 1 file,
+# không cần cài Python trên máy người dùng.
+#
+# ⚠️ GHÉP MAC INTEL + SILICON VÀO 1 BẢN:
+#   GitHub ĐÃ GỠ runner Intel (macos-13, cuối 2025) → không còn cách nào build riêng
+#   bản x86_64 trên runner GitHub. Giải pháp: 1 job macOS trên macos-14 (arm64) build
+#   binary UNIVERSAL2 (fat binary chứa cả 2 arch) — chạy được trên cả Mac Intel lẫn
+#   Mac Silicon. Backend PyInstaller dùng `--target-arch universal2` với Python
+#   universal2 từ python.org.
+#
+# ⚠️ HẠN CHẾ BẢN MAC (đã cố tình chọn):
+#   - psycopg2-binary (PostgreSQL) KHÔNG có wheel universal2 → không nhúng vào backend
+#     Mac → tab Cơ sở dữ liệu kết nối Postgres sẽ báo lỗi trên Mac (MySQL vẫn dùng được
+#     vì mysql-connector-python là pure-Python). Muốn có Postgres trên Mac phải build
+#     backend riêng cho từng arch rồi lipo (phức tạp hơn nhiều).
+#   - Tab Âm thanh / Máy in / Tunnel đã bị ẩn trên Mac ở frontend (Windows-only).
+#
+# ⚠️ CẦN THIẾT TRƯỚC KHI DÙNG:
+#   1. Push repo này lên GitHub (repo hiện tại: NguyenThanhDat2410/multitool-pro).
+#   2. (Tùy chọn, cho auto-update) Tạo secrets:
+#      - TAURI_SIGNING_PRIVATE_KEY: nội dung file .key (npx tauri signer generate)
+#      - TAURI_SIGNING_PRIVATE_KEY_PASSWORD: mật khẩu key
+#   3. (Tùy chọn, cho Mac "sạch") Code-signing/notarization certs — nếu không có,
+#      app Mac vẫn chạy nhưng macOS báo "unidentified developer" (right-click → Open).
+
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            backend_bin: backend.exe
+            py_sep: ';'          # PyInstaller --add-data separator (Windows)
+            py_extra: '--collect-all pycaw --collect-all comtypes --hidden-import win32print --hidden-import win32com.client --hidden-import win32event --hidden-import pythoncom'
+            reqs: backend/requirements.txt
+            rust_targets: ''
+            tauri_args: ''
+          - name: macOS Universal (Intel + Silicon)
+            os: macos-14          # arm64 — build universal2 cho cả 2 arch
+            backend_bin: backend
+            py_sep: ':'           # PyInstaller --add-data separator (macOS/Linux)
+            py_extra: '--target-arch universal2'
+            reqs: backend/requirements-mac.txt
+            rust_targets: 'aarch64-apple-darwin,x86_64-apple-darwin'
+            tauri_args: '--target universal-apple-darwin'
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # WHY: Windows dùng Python từ setup-python; macOS cần Python UNIVERSAL2 từ
+      # python.org (bản pkg luôn là universal2) để PyInstaller build được fat binary.
+      - name: Setup Python (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install universal2 Python (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          curl -sSL -o /tmp/python.pkg \
+            "https://www.python.org/ftp/python/3.12.10/python-3.12.10-macos11.pkg"
+          sudo installer -pkg /tmp/python.pkg -target /
+          /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 --version
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # WHY: dist/ (SPA) cần tồn tại TRƯỚC PyInstaller vì được nhúng vào backend
+      # (--add-data) để backend phục vụ được giao diện.
+      - name: Build frontend (dist)
+        run: npm run build
+
+      # WHY: Python lệnh khác nhau giữa 2 OS (Windows: python; macOS: python.org pkg).
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          PY="${{ runner.os == 'macOS' && '/Library/Frameworks/Python.framework/Versions/3.12/bin/python3' || 'python' }}"
+          "$PY" -m pip install -r ${{ matrix.reqs }}
+
+      # WHY: Đóng gói backend thành 1 binary tự chứa (Flask + mọi dep + dist/).
+      # Trên macOS: --target-arch universal2 + Python universal2 → fat binary chạy cả
+      # Intel lẫn Silicon; không kéo pycaw/win32print (requirements-mac.txt) vì tab
+      # Âm thanh/Máy in đã bị ẩn trên Mac.
+      - name: Build backend with PyInstaller
+        shell: bash
+        run: |
+          PY="${{ runner.os == 'macOS' && '/Library/Frameworks/Python.framework/Versions/3.12/bin/python3' || 'python' }}"
+          "$PY" -m PyInstaller --noconfirm --clean --onefile --windowed --name backend \
+            --distpath backend/py-dist --workpath backend/py-build \
+            --add-data "dist${{ matrix.py_sep }}dist" \
+            ${{ matrix.py_extra }} \
+            --hidden-import psycopg2 --hidden-import mysql.connector \
+            backend/app.py
+
+      # WHY: Copy backend thật vào src-tauri/backend-embed/ — build.rs/include_bytes!
+      # cần nó TRƯỚC khi cargo compile để nhúng vào binary Tauri.
+      - name: Embed backend into Tauri source
+        shell: bash
+        run: |
+          mkdir -p src-tauri/backend-embed
+          cp "backend/py-dist/${{ matrix.backend_bin }}" "src-tauri/backend-embed/${{ matrix.backend_bin }}"
+          file "src-tauri/backend-embed/${{ matrix.backend_bin }}" 2>/dev/null || ls -la src-tauri/backend-embed/
+
+      # WHY: Tauri build ra bundle theo OS: Windows = .msi + .exe (NSIS), macOS =
+      # universal2 = .app + .dmg (chạy cả Intel + Silicon). Nếu có signing secrets,
+      # tauri tự tạo .sig cho auto-update.
+      - name: Build Tauri app (bundles)
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build ${{ matrix.tauri_args }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundles-${{ matrix.name }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/multitool-pro*
+            src-tauri/target/release/bundle/**
+
+  # WHY: Khi push tag v* → gộp bundle của cả 2 nền tảng vào 1 GitHub Release (draft).
+  # Các file .sig (nếu có signing) cũng được đẩy lên để tauri-plugin-updater xác minh.
+  release:
+    name: Publish Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all bundles
+        uses: actions/download-artifact@v4
+        with:
+          path: bundles
+          merge-multiple: true
+
+      - name: Create GitHub Release (draft)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: MultiTool Pro ${{ github.ref_name }}
+          draft: true
+          prerelease: false
+          files: |
+            bundles/**/*.msi
+            bundles/**/*.exe
+            bundles/**/*.dmg
+            bundles/**/*.sig
+            bundles/**/multitool-pro
+            bundles/**/multitool-pro.exe
+
+      # WHY: Tạo latest.json cho tauri-plugin-updater — chỉ khi có file .sig (nghĩa là
+      # đã cấu hình signing secrets). Bản mac dmg universal chạy cả Intel + Silicon nên
+      # gán cho cả 2 key darwin-x86_64 / darwin-aarch64. Nếu chưa có .sig thì bỏ qua.
+      - name: Generate updater latest.json
+        shell: bash
+        run: |
+          set -e
+          if ! ls bundles/**/*.sig >/dev/null 2>&1; then
+            echo "⚠️ Không có file .sig — bỏ qua latest.json (cần TAURI_SIGNING_PRIVATE_KEY)."
+            exit 0
+          fi
+          python3 - <<'EOF'
+          import glob, json, os, datetime
+          tag = os.environ["GITHUB_REF_NAME"]
+          ver = tag.lstrip("v")
+          base = f"https://github.com/NguyenThanhDat2410/multitool-pro/releases/download/{tag}"
+          sig_map = {}
+          for f in glob.glob("bundles/**/*.sig", recursive=True):
+              with open(f) as fh:
+                  sig_map[os.path.basename(f)] = fh.read().strip()
+          platforms = {}
+          # windows-x86_64: bản setup (NSIS) là target updater của Windows
+          for f in glob.glob("bundles/**/*-setup.exe", recursive=True):
+              name = os.path.basename(f)
+              sig = name + ".sig"
+              if sig in sig_map:
+                  platforms["windows-x86_64"] = {"signature": sig_map[sig], "url": f"{base}/{name}"}
+          # macOS: dmg universal → chạy được cả Intel lẫn Silicon
+          for f in glob.glob("bundles/**/*.dmg", recursive=True):
+              name = os.path.basename(f)
+              sig = name + ".sig"
+              if sig in sig_map:
+                  entry = {"signature": sig_map[sig], "url": f"{base}/{name}"}
+                  if "universal" in name.lower():
+                      platforms["darwin-x86_64"] = entry
+                      platforms["darwin-aarch64"] = entry
+                  elif "x86_64" in name:
+                      platforms["darwin-x86_64"] = entry
+                  elif "aarch64" in name or "arm64" in name:
+                      platforms["darwin-aarch64"] = entry
+          manifest = {
+              "version": ver,
+              "notes": f"MultiTool Pro {ver}",
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+              "platforms": platforms,
+          }
+          with open("latest.json", "w") as fh:
+              json.dump(manifest, fh, indent=2)
+          print(json.dumps(manifest, indent=2))
+          EOF
+
+      - name: Upload latest.json
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          files: latest.json

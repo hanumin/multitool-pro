@@ -360,7 +360,7 @@ export default function FileCopierModule({ theme, setStatusText, inactive }: Fil
               </div>
             ) : (
               logs.map((line, i) => (
-                <div key={i} className="whitespace-pre-wrap break-all" style={{ color: 'var(--fg-secondary)' }}>{line}</div>
+                <div key={i} className="whitespace-pre-wrap break-all animate-log-enter" style={{ color: 'var(--fg-secondary)' }}>{line}</div>
               ))
             )}
           </div>

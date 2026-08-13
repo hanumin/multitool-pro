@@ -421,15 +421,18 @@ export default function DatabaseModule({ theme, setStatusText, inactive, preload
       {/* Main content */}
       <div className="flex-1 flex flex-col min-w-0">
         {showConnectionForm ? (
-          <Suspense fallback={<div className="flex-1 flex items-center justify-center"><div className="animate-spin rounded-full h-5 w-5 border-b border-emerald-500" /></div>}>
-            <ConnectionForm
-              editConn={editConn}
-              setEditConn={setEditConn}
-              testing={testing}
-              onSave={testAndSaveConnection}
-              onCancel={() => setShowConnectionForm(false)}
-            />
-          </Suspense>
+          /* WHY: animate-page-enter — fade-in + slide-up khi mở form kết nối database */
+          <div className="flex-1 flex flex-col min-w-0 animate-page-enter">
+            <Suspense fallback={<div className="flex-1 flex items-center justify-center"><div className="animate-spin rounded-full h-5 w-5 border-b border-emerald-500" /></div>}>
+              <ConnectionForm
+                editConn={editConn}
+                setEditConn={setEditConn}
+                testing={testing}
+                onSave={testAndSaveConnection}
+                onCancel={() => setShowConnectionForm(false)}
+              />
+            </Suspense>
+          </div>
         ) : connectedDb ? (
           <div className="flex-1 flex flex-col min-w-0">
             {/* Toolbar */}

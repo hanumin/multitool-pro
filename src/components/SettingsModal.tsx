@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ModuleId, MODULES } from '../types'
+import { ModuleId, PLATFORM_MODULES } from '../types'
 import { type LogColors, DEFAULT_LOG_COLORS } from '../utils/logStyles'
 import { API, fetchWithRetry } from '../utils/apiFetch'
 
@@ -279,27 +279,29 @@ export default function SettingsModal({
       <div className={`w-full max-w-4xl h-[80vh] rounded-2xl shadow-2xl overflow-hidden flex flex-col border transition-all duration-200 ${animState === 'enter' ? 'animate-modal-content-in' : 'animate-modal-content-out'}`}
         style={{ backgroundColor: 'var(--bg)', borderColor: 'var(--border)', color: 'var(--fg)' }}>
         
-        {/* Compact & Professional Header (Yêu cầu 1) */}
-        <div className="flex items-center justify-between px-5 py-2.5 border-b shrink-0 bg-slate-900/70 backdrop-blur-md h-12"
-          style={{ borderColor: 'var(--border)' }}>
-          <div className="flex items-center gap-2.5">
-            <div className="w-7 h-7 rounded-lg bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400 font-bold text-sm shadow-sm">
-              ⚙️
+        {/* WHY: Header redesign — gradient accent bar 2px trên cùng + icon trong container
+            gradient + subtitle 2 dòng. Nổi bật hơn header phẳng trước đây. */}
+        <div className="relative shrink-0">
+          <div className="absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r from-emerald-500 via-teal-400 to-emerald-500" />
+          <div className="flex items-center justify-between px-5 py-3 border-b backdrop-blur-md"
+            style={{ borderColor: 'var(--border)', background: 'linear-gradient(180deg, rgba(52,211,153,0.08), transparent)' }}>
+            <div className="flex items-center gap-3">
+              <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-emerald-400/25 to-emerald-600/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400 shadow-sm shadow-emerald-500/10 shrink-0">
+                <span className="text-base">⚙️</span>
+              </div>
+              <div>
+                <h2 className="text-sm font-bold tracking-tight leading-tight" style={{ color: 'var(--fg)' }}>Cấu hình hệ thống</h2>
+                <p className="text-[10px] mt-0.5" style={{ color: 'var(--fg-muted)' }}>Quản lý máy chủ · cổng dịch vụ · màu sắc log</p>
+              </div>
             </div>
-            <div className="flex items-baseline gap-2">
-              <h2 className="text-sm font-bold tracking-tight" style={{ color: 'var(--fg)' }}>Cấu hình hệ thống</h2>
-              <span className="text-xs text-slate-400 font-normal hidden sm:inline">
-                · Quản lý máy chủ, cổng dịch vụ & giao diện log
-              </span>
-            </div>
+            <button onClick={onClose}
+              className="p-1.5 rounded-lg transition-all active:scale-95 hover:bg-white/10 border-0 cursor-pointer text-slate-400 hover:text-white focus-visible:ring-2 focus-visible:ring-emerald-500/50 focus-visible:outline-none"
+              aria-label="Đóng cửa sổ" title="Đóng cửa sổ">
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
           </div>
-          <button onClick={onClose}
-            className="p-1 rounded-lg transition-all active:scale-95 hover:bg-white/10 border-0 cursor-pointer text-slate-400 hover:text-white"
-            title="Đóng cửa sổ">
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          </button>
         </div>
 
         {/* Modal Main Content — Professional 2-Column Layout */}
@@ -308,30 +310,37 @@ export default function SettingsModal({
           <div className="w-56 border-r shrink-0 p-2.5 space-y-1 bg-slate-950/40 backdrop-blur-sm" style={{ borderColor: 'var(--border)' }}>
             <button
               onClick={() => setActiveTab('general')}
-              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-semibold transition-all cursor-pointer border-0 text-left ${
+              className={`relative w-full flex items-center gap-2.5 pl-4 pr-3 py-2.5 rounded-xl text-xs font-semibold transition-all cursor-pointer border-0 text-left ${
                 activeTab === 'general'
-                  ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 shadow-sm font-bold tracking-wide'
+                  ? 'bg-emerald-500/12 text-emerald-400'
                   : 'hover:bg-white/5 text-slate-400 hover:text-slate-200'
               }`}
             >
-              <span className="text-sm">🎛️</span>
-              <span>Cài đặt chung</span>
+              {/* WHY: Accent bar trái khi active — kiểu VSCode settings, dễ nhận tab đang chọn */}
+              {activeTab === 'general' && (
+                <span className="absolute left-0 top-1/2 -translate-y-1/2 w-0.5 h-5 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]" />
+              )}
+              <span className={`w-6 h-6 rounded-lg flex items-center justify-center text-sm shrink-0 transition-colors ${activeTab === 'general' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-white/5 text-slate-400'}`}>🎛️</span>
+              <span className="truncate">Cài đặt chung</span>
             </button>
 
             <button
               onClick={() => setActiveTab('projects')}
-              className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs font-semibold transition-all cursor-pointer border-0 text-left ${
+              className={`relative w-full flex items-center justify-between pl-4 pr-3 py-2.5 rounded-xl text-xs font-semibold transition-all cursor-pointer border-0 text-left ${
                 activeTab === 'projects'
-                  ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 shadow-sm font-bold tracking-wide'
+                  ? 'bg-emerald-500/12 text-emerald-400'
                   : 'hover:bg-white/5 text-slate-400 hover:text-slate-200'
               }`}
             >
+              {activeTab === 'projects' && (
+                <span className="absolute left-0 top-1/2 -translate-y-1/2 w-0.5 h-5 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]" />
+              )}
               <div className="flex items-center gap-2.5 truncate">
-                <span className="text-sm">🖥️</span>
+                <span className={`w-6 h-6 rounded-lg flex items-center justify-center text-sm shrink-0 transition-colors ${activeTab === 'projects' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-white/5 text-slate-400'}`}>🖥️</span>
                 <span className="truncate">Máy chủ ({projects.length})</span>
               </div>
               {projects.filter(p => runningStatus[p.name]).length > 0 && (
-                <span className="px-1.5 py-0.2 rounded-full text-[9px] font-bold bg-emerald-500 text-slate-950 shrink-0">
+                <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-emerald-500 text-slate-950 shrink-0">
                   {projects.filter(p => runningStatus[p.name]).length}
                 </span>
               )}
@@ -339,14 +348,17 @@ export default function SettingsModal({
 
             <button
               onClick={() => setActiveTab('logColors')}
-              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-semibold transition-all cursor-pointer border-0 text-left ${
+              className={`relative w-full flex items-center gap-2.5 pl-4 pr-3 py-2.5 rounded-xl text-xs font-semibold transition-all cursor-pointer border-0 text-left ${
                 activeTab === 'logColors'
-                  ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 shadow-sm font-bold tracking-wide'
+                  ? 'bg-emerald-500/12 text-emerald-400'
                   : 'hover:bg-white/5 text-slate-400 hover:text-slate-200'
               }`}
             >
-              <span className="text-sm">🎨</span>
-              <span>Màu sắc dòng log</span>
+              {activeTab === 'logColors' && (
+                <span className="absolute left-0 top-1/2 -translate-y-1/2 w-0.5 h-5 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]" />
+              )}
+              <span className={`w-6 h-6 rounded-lg flex items-center justify-center text-sm shrink-0 transition-colors ${activeTab === 'logColors' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-white/5 text-slate-400'}`}>🎨</span>
+              <span className="truncate">Màu sắc dòng log</span>
             </button>
           </div>
 
@@ -438,7 +450,9 @@ export default function SettingsModal({
                           </span>
                         </div>
                         <div className="space-y-2">
-                          {MODULES.filter(mod => mod.polls).map(mod => {
+                          {/* WHY: Chỉ liệt kê module khả dụng trên nền tảng hiện tại — trên Mac
+                              không hiện polling toggle cho Máy in/Âm thanh/Tunnel (đã ẩn). */}
+                          {PLATFORM_MODULES.filter(mod => mod.polls).map(mod => {
                             const isOn = backgroundPolling[mod.id]
                             return (
                               <div key={mod.id}
@@ -756,6 +770,19 @@ export default function SettingsModal({
               </>
             )}
           </div>
+        </div>
+
+        {/* WHY: Footer — hint lưu tự động + nút Đóng rõ ràng (bố cục modal hoàn chỉnh) */}
+        <div className="shrink-0 px-5 py-2.5 border-t flex items-center justify-between gap-3"
+          style={{ borderColor: 'var(--border)', background: 'var(--bg-card)' }}>
+          <span className="text-[10px] truncate" style={{ color: 'var(--fg-dim)' }}>
+            💡 Thay đổi được lưu khi bạn nhấn nút Lưu / Xác nhận tương ứng
+          </span>
+          <button onClick={onClose}
+            className="shrink-0 px-4 py-1.5 text-xs font-semibold border rounded-xl transition-all active:scale-95 cursor-pointer hover:bg-white/10 focus-visible:ring-2 focus-visible:ring-emerald-500/50 focus-visible:outline-none"
+            style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+            Đóng
+          </button>
         </div>
       </div>
     </div>

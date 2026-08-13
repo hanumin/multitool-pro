@@ -1,4 +1,4 @@
-import { ModuleId, MODULES, ModuleDef } from '../types'
+import { ModuleId, PLATFORM_MODULES, ModuleDef } from '../types'
 
 interface SidebarProps {
   activeModule: ModuleId
@@ -42,9 +42,10 @@ export default function Sidebar({ activeModule, onModuleChange, collapsed, onTog
         )}
       </div>
 
-      {/* Navigation items */}
+      {/* WHY: Chỉ hiển thị module khả dụng trên nền tảng hiện tại (PLATFORM_MODULES) —
+          trên Mac sẽ tự ẩn Máy in/Âm thanh/Tunnel (Windows-only). */}
       <nav className="flex-1 px-2 py-3 space-y-1 overflow-y-auto">
-        {MODULES.map((mod: ModuleDef, idx: number) => {
+        {PLATFORM_MODULES.map((mod: ModuleDef, idx: number) => {
           const isActive = activeModule === mod.id
           return (
             <button

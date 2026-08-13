@@ -5,6 +5,12 @@ import { getLineStyle, detectLevel, hexToRgba, type LogColors, DEFAULT_LOG_COLOR
 import { API, fetchWithRetry } from '../../utils/apiFetch'
 import { useToast } from '../../components/ToastManager'
 import type { PreloadedData } from '../../types'
+import { isMac } from '../../utils/platform'
+
+// WHY: Cloudflare Tunnel chỉ hỗ trợ Windows trong code hiện tại (backend tải
+// cloudflared-windows-amd64.exe + watchdog). Trên Mac ẩn toàn bộ UI tunnel
+// (toolbar, card) và bỏ polling — backend không bị gọi API tunnel nữa.
+const TUNNEL_SUPPORTED = !isMac
 
 const ansiConverter = new Convert({
   newline: false,
@@ -80,7 +86,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
   // WHY: Cleanup Env Editor close timer khi component unmount (phòng khi có refactor thành conditional mount).
   useEffect(() => () => { if (envCloseTimerRef.current) clearTimeout(envCloseTimerRef.current) }, [])
   const [batchLoading, setBatchLoading] = useState(false)
-  const [portConflicts, setPortConflicts] = useState<Record<number, string[]>>({})
+  const [portConflicts, setPortConflicts] = useState<Record<number, { pid: number; name: string; status: string }[]>>({})
   const [logSearch, setLogSearch] = useState('')
   const [logFilter, setLogFilter] = useState<string[]>(() => {
     try {
@@ -300,6 +306,28 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
     }
   }, [projects])
 
+  // WHY: Copy chi tiết xung đột cổng ra clipboard (project name/path/command +
+  // danh sách tiến trình chiếm giữ kèm PID/status) — để user gửi cho AI/model
+  // khi cần hỗ trợ debug dạng text đầy đủ.
+  const copyConflictDetails = async (name: string, port: number) => {
+    const proj = projects.find(p => p.name === name)
+    const procs = portConflicts[port] || []
+    const lines = [
+      `Xung đột cổng :${port} — project "${name}"`,
+      `- Đường dẫn: ${proj?.path || 'N/A'}`,
+      `- Lệnh chạy: ${proj?.command || 'N/A'}`,
+      `- Cổng đang bị ${procs.length} tiến trình chiếm giữ:`,
+      ...procs.map(c => `  • ${c.name} (PID ${c.pid}) — ${c.status || 'unknown'}`),
+    ].join('\n')
+    try {
+      await navigator.clipboard.writeText(lines)
+      setStatusText(`📋 Đã copy chi tiết xung đột :${port}`)
+      addToast({ type: 'success', title: '📋 Copy xung đột', message: `Đã copy chi tiết cổng :${port} (${procs.length} tiến trình)` })
+    } catch {
+      setStatusText('Không thể copy')
+    }
+  }
+
   // WHY: Fetch disk usage and npm scripts for each running project
   const fetchProjectExtras = useCallback(async () => {
     for (const p of projects) {
@@ -438,7 +466,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
   // giữa các bước. UI hiển thị spinner xuyên suốt.
   const installAndStartTunnel = useCallback(async (name: string) => {
     setTunnelLoading(l => ({ ...l, [name]: true }))
-    setStatusText('📥 Đang tải cloudflared...')
+    setStatusText('📥 Đang tải cloudflared…')
     try {
       const res = await fetchWithRetry(`${API}/api/projects/${encodeURIComponent(name)}/tunnel/install-and-start`, { method: 'POST' })
       const data = await res.json()
@@ -498,7 +526,8 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
     }
     valid.forEach(name => {
       fetchDiagnostics(name)
-      if (projectsRef.current.find(p => p.name === name)?.type !== 'custom') fetchTunnelStatus(name)
+      // WHY: Tunnel không hỗ trợ trên Mac (TUNNEL_SUPPORTED) → bỏ fetch trạng thái tunnel
+      if (TUNNEL_SUPPORTED && projectsRef.current.find(p => p.name === name)?.type !== 'custom') fetchTunnelStatus(name)
     })
     const interval = setInterval(() => {
       const stillValid = expandedProjects.filter(name => projectsRef.current.some(p => p.name === name))
@@ -508,7 +537,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
       }
       stillValid.forEach(name => fetchDiagnostics(name))
     }, 4000)
-    const tunnelInterval = setInterval(() => {
+    const tunnelInterval = TUNNEL_SUPPORTED ? setInterval(() => {
       const stillValid = expandedProjects.filter(name => projectsRef.current.some(p => p.name === name))
       if (stillValid.length !== expandedProjects.length) {
         setExpandedProjects(stillValid)
@@ -517,8 +546,8 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
       stillValid
         .filter(name => projectsRef.current.find(p => p.name === name)?.type !== 'custom')
         .forEach(name => fetchTunnelStatus(name))
-    }, 6000)
-    return () => { clearInterval(interval); clearInterval(tunnelInterval) }
+    }, 6000) : null
+    return () => { clearInterval(interval); if (tunnelInterval) clearInterval(tunnelInterval) }
   }, [expandedProjects, fetchDiagnostics, fetchTunnelStatus, inactive, backgroundPolling])
 
   // WHY: Track lần đầu auto-expand để tránh re-trigger mỗi 3s khi poll.
@@ -544,7 +573,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
       try {
         const { invoke } = await import('@tauri-apps/api/core')
         await invoke('update_tray_status', { running, total: data.length })
-      } catch {}      } catch { setStatusText('Đang tải dữ liệu...') }
+      } catch {}      } catch { setStatusText('Đang tải dữ liệu…') }
   }, [setStatusText])
 
   // WHY: Expose global functions for tray menu (Start All / Stop All)
@@ -692,15 +721,16 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
     pollAbortRef.current = new AbortController()
     fetchProjects()
     fetchLogs()
-    fetchAllTunnelStatuses()
+    // WHY: Tunnel không hỗ trợ trên Mac → bỏ fetch + interval tunnel status
+    if (TUNNEL_SUPPORTED) fetchAllTunnelStatuses()
     fetchDetected()
     const i1 = setInterval(fetchProjects, 5000)
     const i2 = setInterval(fetchLogs, 5000)
-    const i3 = setInterval(fetchAllTunnelStatuses, 10000)
+    const i3 = TUNNEL_SUPPORTED ? setInterval(fetchAllTunnelStatuses, 10000) : null
     const i4 = setInterval(fetchDetected, 10000)
     return () => {
       pollAbortRef.current?.abort()
-      clearInterval(i1); clearInterval(i2); clearInterval(i3); clearInterval(i4)
+      clearInterval(i1); clearInterval(i2); if (i3) clearInterval(i3); clearInterval(i4)
     }
   }, [fetchProjects, fetchLogs, fetchAllTunnelStatuses, fetchDetected, inactive, backgroundPolling])
 
@@ -722,18 +752,22 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
   }, [tunnelStates, setStatusText])
 
   useEffect(() => {
+    // WHY: Chỉ scroll container LOG (terminal-body), KHÔNG dùng scrollIntoView —
+    // scrollIntoView cuộn CẢ container module (App.tsx overflow-y-auto) xuống đáy
+    // làm ẩn toolbar Bật tất cả/Tắt tất cả mỗi khi log cập nhật (2s/lần).
+    // scrollTop/scrollTo chỉ tác động lên chính container log.
     const current = logEndRef.current
     if (!current) return
     const container = current.parentElement
     if (!container) return
     const tabChanged = prevTabRef.current !== activeTab
     prevTabRef.current = activeTab
-    if (tabChanged) current.scrollIntoView({ behavior: 'smooth' })
-    else {
+    if (tabChanged) {
+      container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' })
+    } else {
       const isAtBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 50
       if (isAtBottom) {
-        // WHY: Instant scroll cho log realtime để user không bị giật khi đọc
-        current.scrollIntoView({ behavior: 'instant' })
+        container.scrollTop = container.scrollHeight
       }
     }
   }, [logs, activeTab])
@@ -838,7 +872,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ fileName: envFileName, content: envContent })
       })
-      if (res.ok) { setStatusText(`Saved ${envFileName}`); setEnvEditingProject(null); addToast({ type: 'success', title: '💾 Lưu .env', message: `Đã lưu ${envFileName}` }) }
+      if (res.ok) { setStatusText(`Saved ${envFileName}`); handleCloseEnvEditor(); addToast({ type: 'success', title: '💾 Lưu .env', message: `Đã lưu ${envFileName}` }) }
       else { const e = await res.json(); setStatusText(e.error || 'Thất bại'); addToast({ type: 'error', title: '💾 Lưu .env thất bại', message: e.error || 'Lỗi không xác định' }) }
     } catch { setStatusText('Mất kết nối'); addToast({ type: 'error', title: '🔌 Mất kết nối', message: 'Không thể kết nối tới backend' }) }
     finally { setEnvSaving(false) }
@@ -925,7 +959,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
       const { save } = await import('@tauri-apps/plugin-dialog')
       const selectedPath = await save({ title: 'Export Server Logs', defaultPath: defaultName, filters: [{ name: exportFormat.toUpperCase(), extensions: [fileExt] }] })
       if (!selectedPath) { setStatusText('Đã hủy xuất'); return }
-      setStatusText('Đang lưu...')
+      setStatusText('Đang lưu…')
       const res = await fetchWithRetry(`${API}/api/logs/save-to-file`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: selectedPath, content }) })
       setStatusText(res.ok ? `Đã xuất ra ${selectedPath.split(/[\\/]/).pop()}` : (await res.json()).error || 'Thất bại')
     } catch (err: any) { setStatusText(err?.message || 'Export error') }
@@ -1012,7 +1046,9 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
             </svg>
             Tắt tất cả
           </button>
-          {/* Batch Tunnel Actions */}
+          {/* WHY: Nút tunnel hàng loạt chỉ hiển thị trên Windows (TUNNEL_SUPPORTED) */}
+          {TUNNEL_SUPPORTED && (
+          <>
           <div className="w-px h-5 bg-white/10 mx-1" />
           <button onClick={startAllTunnels} disabled={batchTunnelLoading}
             className="px-2.5 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer disabled:opacity-30 active:scale-95 bg-sky-500/15 text-sky-400 hover:bg-sky-500/25 ring-1 ring-sky-500/20 border-0 flex items-center gap-1">
@@ -1028,10 +1064,12 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
             </svg>
             Tắt tunnel
           </button>
+          </>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <span className="text-xs" style={{ color: 'var(--fg-dim)' }}>{projects.filter(p => p.running).length}/{projects.length} đang chạy</span>
-          {(() => {
+          {TUNNEL_SUPPORTED && (() => {
             const activeTunnels = Object.values(tunnelStates).filter(s => s?.status === 'active').length
             const totalTunnels = Object.keys(tunnelStates).length
             const totalRestarts = Object.values(tunnelStates).reduce((sum, s) => sum + (s?.watchdog_restart_count || 0), 0)
@@ -1075,31 +1113,63 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
       </div>
       {/* Detected servers banner — dev-server đang chạy nhưng chưa được cấu hình */}
       {detectedServers.length > 0 && (
-        <div className="mx-4 mt-2 rounded-xl border px-3 py-2"
-          style={{ borderColor: 'var(--card-border)', background: 'var(--card-bg)', boxShadow: '0 0 12px rgba(245,158,11,0.06)' }}>
-          <div className="flex items-center justify-between mb-1.5">
-            <span className="text-xs font-semibold" style={{ color: '#fbbf24' }}>
-              📡 Phát hiện {detectedServers.length} server đang chạy chưa được cấu hình
+        <div className="mx-4 mt-2 rounded-xl border overflow-hidden animate-card-enter"
+          style={{ borderColor: 'rgba(245,158,11,0.25)', background: 'var(--card-bg)', boxShadow: '0 4px 20px rgba(245,158,11,0.07)' }}>
+          {/* Header: icon radar + title + nút ẩn */}
+          <div className="flex items-center justify-between px-3 py-2 border-b"
+            style={{ borderColor: 'var(--border)', background: 'linear-gradient(90deg, rgba(245,158,11,0.09), transparent)' }}>
+            <span className="text-xs font-semibold flex items-center gap-1.5" style={{ color: '#fbbf24' }}>
+              <svg className="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v3m0 12v3m9-9h-3M6 12H3m14.364-5.364l-2.121 2.121M8.757 15.243l-2.121 2.121m12.728 0l-2.121-2.121M8.757 8.757L6.636 6.636M12 12m-3 0a3 3 0 106 0 3 3 0 10-6 0" />
+              </svg>
+              Phát hiện {detectedServers.length} server đang chạy chưa được cấu hình
             </span>
             <button onClick={() => setDetectedServers([])}
-              className="text-[10px] border-0 bg-transparent cursor-pointer hover:text-white"
-              style={{ color: 'var(--fg-dim)' }}>ẩn</button>
+              className="group relative text-[10px] px-1.5 py-0.5 rounded border-0 bg-transparent cursor-pointer hover:bg-white/5 transition-colors"
+              style={{ color: 'var(--fg-dim)' }}>
+              ✕ Ẩn banner
+              <span className="tooltip-text tooltip-below z-[999999]">Ẩn banner này (không xóa server khỏi hệ thống)</span>
+            </button>
           </div>
-          <div className="flex flex-col gap-1">
+          {/* WHY: Danh sách server phát hiện — grid 3 cột cố định (port | thông tin/trạng thái |
+              nút thêm) để port dài/ngắn không làm các label lệch qua lại; mọi cột canh trái. */}
+          <div className="flex flex-col divide-y divide-white/5">
             {detectedServers.map(d => (
-              <div key={d.port} className="flex items-center justify-between gap-2 text-xs">
-                <div className="min-w-0 flex-1 flex items-center">
-                  <span className="font-mono text-emerald-400 shrink-0">:{d.port}</span>
-                  <span className="ml-1.5 truncate" style={{ color: 'var(--fg)' }}>{d.name}</span>
+              <div key={d.port} className="grid grid-cols-[88px_1fr_auto] items-center gap-3 px-3 py-2 transition-colors hover:bg-white/[0.03]">
+                {/* Cột 1: Port — width cố định, canh trái */}
+                <div className="flex items-center">
+                  <span className="inline-flex items-center px-2 py-0.5 rounded font-mono text-[10px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                    :{d.port}
+                  </span>
+                </div>
+                {/* WHY: Cột 2 — label "Đang chạy" xanh lá đặt TRƯỚC tên server (đồng bộ
+                    với nút trạng thái trên card), rồi tới tên + framework, canh trái. */}
+                <div className="min-w-0 flex items-center gap-2">
+                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[9px] font-bold tracking-wide shrink-0 bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 shadow-sm shadow-emerald-500/10">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                    Đang chạy
+                  </span>
+                  <span className="truncate text-xs font-medium" style={{ color: 'var(--fg)' }}>{d.name}</span>
                   {d.framework && (
-                    <span className="ml-1.5 text-[10px] shrink-0" style={{ color: '#fbbf24' }}>⚡{d.framework}</span>
+                    <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 shrink-0">
+                      ⚡ {d.framework}
+                    </span>
                   )}
                 </div>
-                <button onClick={() => addDetectedServer(d)} disabled={addingDetected[d.port]}
-                  className="shrink-0 px-2 py-1 rounded-lg text-[10px] font-semibold border cursor-pointer disabled:opacity-50"
-                  style={{ color: '#34d399', borderColor: 'rgba(52,211,153,0.3)', background: 'rgba(52,211,153,0.1)' }}>
-                  {addingDetected[d.port] ? 'Đang thêm...' : '+ Thêm'}
-                </button>
+                {/* Cột 3: Nút thêm — canh phải */}
+                <div className="flex justify-end">
+                  <button onClick={() => addDetectedServer(d)} disabled={addingDetected[d.port]}
+                    className="group relative px-2.5 py-1 rounded-lg text-[10px] font-semibold border transition-all active:scale-95 cursor-pointer disabled:opacity-50 hover:brightness-110"
+                    style={{ color: '#34d399', borderColor: 'rgba(52,211,153,0.3)', background: 'rgba(52,211,153,0.1)' }}>
+                    {addingDetected[d.port] ? (
+                      <span className="inline-flex items-center gap-1">
+                        <div className="animate-spin rounded-full h-2.5 w-2.5 border-b border-current" />
+                        Đang thêm…
+                      </span>
+                    ) : '+ Thêm vào cấu hình'}
+                    <span className="tooltip-text tooltip-below z-[999999]">Thêm {d.name} vào danh sách server để quản lý (start/stop/tunnel/log)</span>
+                  </button>
+                </div>
               </div>
             ))}
           </div>
@@ -1115,17 +1185,28 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                 background: 'var(--card-bg)',
                 borderColor: 'var(--card-border)',
                 animationDelay: `${idx * 0.05}s`,
-                zIndex: isCardActive ? 99999 : 1,
+                // WHY: zIndex chỉ set khi popover active — nếu luôn set 1 thì card tạo stacking
+                // context, tooltip con (dù z-index 2147483647) bị card khác đè lên.
+                zIndex: isCardActive ? 99999 : undefined,
                 position: 'relative'
               }}>
-              {p.running && <div className="card-accent-bar" />}
               <div className="p-3.5">
                 {/* Card Header: Icon, Name, Status Badge, Port Badge, Info Button (i), Action Icons */}
                 <div className="flex items-center justify-between gap-2">
                   <div className="min-w-0 flex-1 flex items-center gap-2 flex-wrap">
-                    <div className="w-6 h-6 rounded-md bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center shrink-0">
+                    <div className="w-6 h-6 rounded-md bg-gradient-to-br from-emerald-400/25 to-emerald-600/15 border border-emerald-500/25 flex items-center justify-center shrink-0 shadow-sm shadow-emerald-500/10">
                       <span className="text-xs">⚡</span>
                     </div>
+                    {/* WHY: Trạng thái chạy/tắt đặt TRƯỚC tên server, dạng nút — xanh lá khi chạy, xám khi tắt
+                        (thay status-badge cũ sau port badge). key force remount → animate-badge-pop cả 2 chiều. */}
+                    <span key={p.running ? 'running' : 'stopped'} className={`animate-badge-pop inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[9px] font-bold tracking-wide shrink-0 cursor-default select-none ${
+                      p.running
+                        ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 shadow-sm shadow-emerald-500/10'
+                        : 'bg-slate-500/10 text-slate-400 border border-slate-500/25'
+                    }`}>
+                      <span className={`status-dot ${p.running ? 'status-dot-running' : 'status-dot-stopped'}`} />
+                      {p.running ? 'Đang chạy' : 'Đã tắt'}
+                    </span>
                     <h2 className="text-sm font-bold tracking-tight truncate" style={{ color: 'var(--fg)' }}>{p.name}</h2>
                     {p.type === 'custom' && (
                       <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-bold" style={{ color: '#38bdf8', backgroundColor: 'rgba(56,189,248,0.1)', border: '1px solid rgba(56,189,248,0.25)' }}>
@@ -1137,10 +1218,6 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                         :{p.port}
                       </span>
                     )}
-                    <span className={`status-badge ${p.running ? 'status-badge-running animate-badge-pop' : 'status-badge-stopped'}`}>
-                      <span className={`status-dot ${p.running ? 'status-dot-running' : 'status-dot-stopped'}`} />
-                      {p.running ? 'ĐANG CHẠY' : 'ĐÃ DỪNG'}
-                    </span>
                   </div>
                   <div className="flex items-center gap-1 shrink-0">
                     {/* Nút (i) xem thông tin máy chủ — Yêu cầu 1: Đặt popover hiển thị sát nút (i) */}
@@ -1150,16 +1227,17 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                           e.stopPropagation()
                           setActiveInfoTooltip(prev => prev === `${p.name}-server` ? null : `${p.name}-server`)
                         }}
-                        className={`p-1.5 rounded-lg transition-all border-0 cursor-pointer flex items-center justify-center ${
+                        aria-label="Xem thông tin máy chủ (RAM, CPU, uptime)"
+                        className={`p-1.5 rounded-lg transition-all border-0 cursor-pointer flex items-center justify-center group relative focus-visible:ring-2 focus-visible:ring-sky-500/50 focus-visible:outline-none ${
                           activeInfoTooltip === `${p.name}-server`
                             ? 'bg-sky-500/25 text-sky-400 ring-1 ring-sky-500/50 scale-105'
                             : 'hover:bg-sky-500/10 text-sky-400/80 hover:text-sky-400'
                         }`}
-                        title="Nhấn để xem thông tin máy chủ"
                       >
-                        <svg className="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor">
+                        <svg aria-hidden="true" className="w-3.5 h-3.5" viewBox="0 0 20 20" fill="currentColor">
                           <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
                         </svg>
+                        <span className="tooltip-text tooltip-below z-[999999]">Xem thông tin máy chủ (RAM, CPU, uptime)</span>
                       </button>
 
                       {/* Popover thông tin máy chủ hiển thị sát nút (i) */}
@@ -1195,20 +1273,20 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                             </div>
                             <div className="flex items-center justify-between">
                               <span style={{ color: 'var(--fg-dim)' }}>💾 Bộ nhớ (RAM):</span>
-                              <span className="font-mono">{diagnostics[p.name]?.memory ? `${(diagnostics[p.name].memory / 1024 / 1024).toFixed(1)} MB` : p.running ? '...' : 'N/A'}</span>
+                              <span className="font-mono">{diagnostics[p.name]?.memory ? `${(diagnostics[p.name].memory / 1024 / 1024).toFixed(1)} MB` : p.running ? '…' : 'N/A'}</span>
                             </div>
                             <div className="flex items-center justify-between">
                               <span style={{ color: 'var(--fg-dim)' }}>💻 CPU Usage:</span>
-                              <span className="font-mono">{diagnostics[p.name]?.cpu !== undefined ? `${diagnostics[p.name].cpu}%` : p.running ? '...' : '-'}</span>
+                              <span className="font-mono">{diagnostics[p.name]?.cpu !== undefined ? `${diagnostics[p.name].cpu}%` : p.running ? '…' : '-'}</span>
                             </div>
                             <div className="flex items-center justify-between">
                               <span style={{ color: 'var(--fg-dim)' }}>⏱️ Thời gian chạy:</span>
-                              <span className="font-mono text-emerald-400">{diagnostics[p.name]?.uptime || (p.running ? '...' : '-')}</span>
+                              <span className="font-mono text-emerald-400">{diagnostics[p.name]?.uptime || (p.running ? '…' : '-')}</span>
                             </div>
                             {p.type !== 'custom' && (
                               <div className="flex items-center justify-between">
                                 <span style={{ color: 'var(--fg-dim)' }}>🟢 Node & npm:</span>
-                                <span className="font-mono text-[11px] text-slate-300">{diagnostics[p.name]?.env?.node || '...'} {diagnostics[p.name]?.env?.npm ? `(npm ${diagnostics[p.name].env.npm})` : ''}</span>
+                                <span className="font-mono text-[11px] text-slate-300">{diagnostics[p.name]?.env?.node || '…'} {diagnostics[p.name]?.env?.npm ? `(npm ${diagnostics[p.name].env.npm})` : ''}</span>
                               </div>
                             )}
                             {p.type !== 'custom' && diagnostics[p.name]?.git && (
@@ -1227,11 +1305,12 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                     {/* Quick Browser Open */}
                     {p.running && !!p.port && (
                       <button onClick={() => openBrowser(`http://localhost:${p.port}`)}
-                        className="p-1 rounded-lg hover:bg-blue-500/15 text-blue-400 transition-colors border-0 cursor-pointer"
-                        title="Mở trình duyệt">
-                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        aria-label="Mở server trong trình duyệt"
+                        className="p-1 rounded-lg hover:bg-blue-500/15 text-blue-400 transition-colors border-0 cursor-pointer group relative focus-visible:ring-2 focus-visible:ring-blue-500/50 focus-visible:outline-none">
+                        <svg aria-hidden="true" className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                           <path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
                         </svg>
+                        <span className="tooltip-text tooltip-below z-[999999]">Mở server trong trình duyệt</span>
                       </button>
                     )}
 
@@ -1251,61 +1330,76 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                         } catch { setStatusText('Failed to open explorer') }
                       }
                     }}
-                      className="p-1 rounded-lg hover:bg-black/10 dark:hover:bg-white/10 text-slate-400 hover:text-slate-200 transition-colors border-0 cursor-pointer"
-                      title="Mở trong File Explorer">
+                      aria-label="Mở thư mục project trong File Explorer"
+                      className="p-1 rounded-lg hover:bg-black/10 dark:hover:bg-white/10 text-slate-400 hover:text-slate-200 transition-colors border-0 cursor-pointer group relative focus-visible:ring-2 focus-visible:ring-slate-400/50 focus-visible:outline-none">
                       📁
+                      <span className="tooltip-text tooltip-below z-[999999]">Mở thư mục project trong File Explorer</span>
                     </button>
 
                     {/* Quick npm Scripts — chỉ cho project Node.js */}
                     {p.type !== 'custom' && projectScripts[p.name] && projectScripts[p.name].length > 0 && (
-                      <select id={`script-select-${p.name}`} name="runScript" onChange={async e => {
-                        const script = e.target.value
-                        if (!script) return
-                        try {
-                          await fetchWithRetry(`${API}/api/projects/${encodeURIComponent(p.name)}/run-script`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ script })
-                          })
-                          setStatusText(`Running ${script} for ${p.name}`)
-                          setActiveTab(p.name)
-                          await fetchProjects()
-                        } catch { setStatusText('Failed to run script') }
-                        e.target.value = ''
-                      }}
-                        className="px-1 py-0.5 text-[9px] rounded border cursor-pointer bg-slate-800 text-slate-300 border-slate-700">
-                        <option value="">⚡ Script</option>
-                        {projectScripts[p.name].filter(s => ['build','lint','test','typecheck','format','preview'].includes(s)).map(s => (
-                          <option key={s} value={s}>{s}</option>
-                        ))}
-                      </select>
+                      <div className="relative group shrink-0">
+                        <select id={`script-select-${p.name}`} name="runScript" onChange={async e => {
+                          const script = e.target.value
+                          if (!script) return
+                          try {
+                            await fetchWithRetry(`${API}/api/projects/${encodeURIComponent(p.name)}/run-script`, {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({ script })
+                            })
+                            setStatusText(`Running ${script} for ${p.name}`)
+                            setActiveTab(p.name)
+                            await fetchProjects()
+                          } catch { setStatusText('Failed to run script') }
+                          e.target.value = ''
+                        }}
+                          className="px-1 py-0.5 text-[9px] rounded border cursor-pointer bg-slate-800 text-slate-300 border-slate-700">
+                          <option value="">⚡ Script</option>
+                          {projectScripts[p.name].filter(s => ['build','lint','test','typecheck','format','preview'].includes(s)).map(s => (
+                            <option key={s} value={s}>{s}</option>
+                          ))}
+                        </select>
+                        <span className="tooltip-text tooltip-below z-[999999]">Chạy npm script (build, lint, test...)</span>
+                      </div>
                     )}
 
                     {/* Nút Chevron thu gọn / mở rộng */}
                     <button onClick={() => setExpandedProjects(prev => prev.includes(p.name) ? prev.filter(n => n !== p.name) : [...prev, p.name])}
-                      className="p-1 rounded-lg hover:bg-black/10 dark:hover:bg-white/10 transition-colors shrink-0 border-0 group/chevron cursor-pointer"
-                      style={{ color: 'var(--fg-muted)' }} title="Mở rộng chi tiết">
-                      <svg className={`w-3.5 h-3.5 chevron-icon ${expandedProjects.includes(p.name) ? 'rotated' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      aria-label="Mở rộng hoặc thu gọn chi tiết"
+                      className="p-1 rounded-lg hover:bg-black/10 dark:hover:bg-white/10 transition-colors shrink-0 border-0 group cursor-pointer relative focus-visible:ring-2 focus-visible:ring-emerald-500/50 focus-visible:outline-none"
+                      style={{ color: 'var(--fg-muted)' }}>
+                      <svg aria-hidden="true" className={`w-3.5 h-3.5 chevron-icon ${expandedProjects.includes(p.name) ? 'rotated' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                         <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" />
                       </svg>
+                      <span className="tooltip-text tooltip-below z-[999999]">Mở rộng / thu gọn chi tiết</span>
                     </button>
                   </div>
                 </div>
 
                 {/* Sub-header: Path info */}
-                <p className="text-[10.5px] mt-1 truncate font-mono text-slate-400/90">{p.path}</p>
+                <p className="text-[10.5px] mt-1 font-mono text-slate-400/90 flex items-center gap-1 min-w-0">
+                  <svg aria-hidden="true" className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 12.75V12A2.25 2.25 0 014.5 9.75h15A2.25 2.25 0 0121.75 12v.75m-8.69-6.44l-2.12-2.12a1.5 1.5 0 00-1.061-.44H4.5A2.25 2.25 0 002.25 6v12a2.25 2.25 0 002.25 2.25h15A2.25 2.25 0 0021.75 18V9a2.25 2.25 0 00-2.25-2.25h-5.379a1.5 1.5 0 01-1.06-.44z" />
+                  </svg>
+                  <span className="truncate">{p.path}</span>
+                </p>
 
                 {/* Expand Section */}
                 <div className={`expand-section ${expandedProjects.includes(p.name) ? 'expand-open' : ''}`}>
                   <div className="expand-inner">
                     <div className="mt-2.5 pt-2.5 border-t border-dashed" style={{ borderColor: 'var(--border)' }}>
-                      <div className="diag-grid">
-                        <div className="diag-item expand-stagger-item"><span className="diag-label">Bộ nhớ:</span> <span className="diag-value">{diagnostics[p.name]?.memory ? `${(diagnostics[p.name].memory / 1024 / 1024).toFixed(1)} MB` : p.running ? '...' : 'Không hoạt động'}</span></div>
-                        <div className="diag-item expand-stagger-item"><span className="diag-label">CPU:</span> <span className="diag-value">{diagnostics[p.name]?.cpu !== undefined ? `${diagnostics[p.name].cpu}%` : p.running ? '...' : '-'}</span></div>
-                        <div className="diag-item expand-stagger-item"><span className="diag-label">Uptime:</span> <span className="diag-value" style={{ color: diagnostics[p.name]?.uptime_seconds > 3600 ? '#22c55e' : undefined }}>{diagnostics[p.name]?.uptime || (p.running ? '...' : '-')}</span></div>
-                        {p.type !== 'custom' && (
-                          <div className="diag-item expand-stagger-item"><span className="diag-label">Node:</span> <span className="diag-value">{diagnostics[p.name]?.env?.node || '...'} {diagnostics[p.name]?.env?.npm ? `(npm ${diagnostics[p.name].env.npm})` : ''}</span></div>
-                        )}
+                      {/* WHY: Frame thông số — hover hiện tooltip giải thích bên dưới */}
+                      <div className="group relative">
+                        <div className="diag-grid">
+                          <div className="diag-item expand-stagger-item"><span className="diag-label">Bộ nhớ:</span> <span className="diag-value">{diagnostics[p.name]?.memory ? `${(diagnostics[p.name].memory / 1024 / 1024).toFixed(1)} MB` : p.running ? '…' : 'Không hoạt động'}</span></div>
+                          <div className="diag-item expand-stagger-item"><span className="diag-label">CPU:</span> <span className="diag-value">{diagnostics[p.name]?.cpu !== undefined ? `${diagnostics[p.name].cpu}%` : p.running ? '…' : '-'}</span></div>
+                          <div className="diag-item expand-stagger-item"><span className="diag-label">Uptime:</span> <span className="diag-value" style={{ color: diagnostics[p.name]?.uptime_seconds > 3600 ? '#22c55e' : undefined }}>{diagnostics[p.name]?.uptime || (p.running ? '…' : '-')}</span></div>
+                          {p.type !== 'custom' && (
+                            <div className="diag-item expand-stagger-item"><span className="diag-label">Node:</span> <span className="diag-value">{diagnostics[p.name]?.env?.node || '…'} {diagnostics[p.name]?.env?.npm ? `(npm ${diagnostics[p.name].env.npm})` : ''}</span></div>
+                          )}
+                        </div>
+                        <span className="tooltip-text tooltip-below z-[999999]">Thông số thời gian thực của server (RAM, CPU, uptime, Node)</span>
                       </div>
                     {p.type !== 'custom' && diagnostics[p.name]?.git && (
                       <div className="flex items-center gap-2 flex-wrap mt-2">
@@ -1319,8 +1413,11 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                     {/* Quick Actions Row — chỉ cho project Node.js */}
                     {p.type !== 'custom' && (
                       <div className="flex items-center gap-1.5 pt-1 flex-wrap">
-                      <button onClick={() => openEnvEditor(p.name)} className="px-2 py-1 text-[10px] font-semibold rounded border transition-colors active:scale-95 cursor-pointer"
-                        style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>📝 Sửa .env</button>
+                      <button onClick={() => openEnvEditor(p.name)} className="px-2 py-1 text-[10px] font-semibold rounded border transition-colors active:scale-95 cursor-pointer group relative"
+                        style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+                        📝 Sửa .env
+                        <span className="tooltip-text tooltip-below z-[999999]">Chỉnh sửa file .env (biến môi trường)</span>
+                      </button>
                       {/* Quick SSL */}
                       <button onClick={async () => {
                         try {
@@ -1331,15 +1428,19 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                           else setStatusText(`❌ ${data.error}`)
                         } catch { setStatusText('Lỗi tạo chứng chỉ SSL') }
                       }}
-                        className="px-2 py-1 text-[10px] font-semibold rounded border transition-colors active:scale-95 cursor-pointer"
-                        style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>🔒 SSL</button>
+                        className="px-2 py-1 text-[10px] font-semibold rounded border transition-colors active:scale-95 cursor-pointer group relative"
+                        style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+                        🔒 SSL
+                        <span className="tooltip-text tooltip-below z-[999999]">Tạo chứng chỉ SSL tự ký cho project</span>
+                      </button>
                       </div>
                     )}
-                    {/* Cloudflare Tunnel — chỉ cho project Node.js */}
-                    {p.type !== 'custom' && (
+                    {/* Cloudflare Tunnel — chỉ cho project Node.js + nền tảng hỗ trợ (TUNNEL_SUPPORTED) */}
+                    {TUNNEL_SUPPORTED && p.type !== 'custom' && (
                     <div className="pt-2 border-t border-dashed" style={{ borderColor: 'var(--border)' }}>
                       <div className="flex items-center gap-1.5 mb-1.5 relative">
-                        <span className="text-xs font-semibold" style={{ color: 'var(--fg-muted)' }}>🌐 Cloudflare Tunnel</span>
+                        {/* WHY: Màu chữ chính (var(--fg)) thay vì xám mờ — label nổi bật, đọc rõ */}
+                        <span className="text-xs font-semibold" style={{ color: 'var(--fg)' }}>🌐 Cloudflare Tunnel</span>
                         {/* Icon (i) nhấn để hiện tooltip thay vì hover — hiển thị sát icon */}
                         <div className="relative">
                           <button
@@ -1347,9 +1448,10 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                               e.stopPropagation()
                               setActiveInfoTooltip(prev => prev === `${p.name}-tunnel` ? null : `${p.name}-tunnel`)
                             }}
-                            className="p-0.5 rounded hover:bg-white/10 transition-colors border-0 cursor-pointer inline-flex items-center justify-center text-slate-400 hover:text-sky-400"
+                            aria-label="Giải thích về Cloudflare Tunnel"
+                            className="p-0.5 rounded hover:bg-white/10 transition-colors border-0 cursor-pointer inline-flex items-center justify-center text-slate-400 hover:text-sky-400 focus-visible:ring-2 focus-visible:ring-sky-500/50 focus-visible:outline-none"
                           >
-                            <svg className="w-3 h-3" viewBox="0 0 16 16" fill="currentColor">
+                            <svg aria-hidden="true" className="w-3 h-3" viewBox="0 0 16 16" fill="currentColor">
                               <path d="M8 1a7 7 0 110 14A7 7 0 018 1zm0 1.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM8.75 11v-4.5h-1.5V11h1.5zM8 5.25a.75.75 0 100-1.5.75.75 0 000 1.5z"/>
                             </svg>
                           </button>
@@ -1387,25 +1489,34 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                         const ts = tunnelStates[p.name]
                         if (ts?.status === 'active' && ts?.url) {
                           return (
-                            <div className="flex items-center gap-1.5 flex-wrap">
-                              <a href={ts.url} target="_blank" rel="noopener noreferrer" className="tunnel-url-link truncate max-w-[180px]">
-                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
-                                {ts.url.replace('https://', '')}
-                              </a>
+                            <div className="flex items-center gap-1.5">
+                              {/* WHY: URL chiếm toàn bộ chiều ngang còn lại (flex-1 min-w-0) —
+                                  các nút Copy/Mở/Dừng nằm về bên phải, cách cạnh card 1 khoảng nhỏ.
+                                  Tooltip đặt ở wrapper (không có overflow:hidden) để không bị truncate clip. */}
+                              <div className="group relative flex-1 min-w-0">
+                                <a href={ts.url} target="_blank" rel="noopener noreferrer" className="tunnel-url-link truncate w-full" title={ts.url}>
+                                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
+                                  {ts.url.replace('https://', '')}
+                                </a>
+                                <span className="tooltip-text tooltip-below z-[999999]">URL tunnel công khai — click để mở</span>
+                              </div>
                               <button onClick={() => {
                                 navigator.clipboard.writeText(ts.url!)
                                 setStatusText('📋 Đã copy URL')
                               }}
-                                className="tunnel-pill tunnel-pill-active">
+                                className="tunnel-pill tunnel-pill-active group relative">
                                 📋 Copy
+                                <span className="tooltip-text tooltip-below z-[999999]">Sao chép URL tunnel</span>
                               </button>
                               <button onClick={() => openBrowser(ts.url!)}
-                                className="tunnel-pill" style={{ background: 'var(--button-tunnel-bg)', color: 'var(--button-tunnel-text)', border: '1px solid var(--button-tunnel-border)' }}>
+                                className="tunnel-pill group relative" style={{ background: 'var(--button-tunnel-bg)', color: 'var(--button-tunnel-text)', border: '1px solid var(--button-tunnel-border)' }}>
                                 🔗 Mở
+                                <span className="tooltip-text tooltip-below z-[999999]">Mở URL tunnel trong trình duyệt</span>
                               </button>
                               <button onClick={() => stopTunnel(p.name)} disabled={tunnelLoading[p.name]}
-                                className="tunnel-pill" style={{ color: '#ef4444', border: '1px solid rgba(239,68,68,0.3)' }}>
+                                className="tunnel-pill group relative" style={{ color: '#ef4444', border: '1px solid rgba(239,68,68,0.3)' }}>
                                 {tunnelLoading[p.name] ? '⏳' : '⏹ Dừng'}
+                                <span className="tooltip-text tooltip-below z-[999999]">Dừng tunnel</span>
                               </button>
                             </div>
                           )
@@ -1417,52 +1528,55 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                           {tunnelStates[p.name]?.cloudflared_installed === false ? (
                             <button onClick={() => installAndStartTunnel(p.name)}
                               disabled={!p.running || tunnelLoading[p.name] || installingCloudflared}
-                              className="px-2 py-1 text-[10px] font-semibold rounded border transition-all active:scale-95 cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed flex items-center gap-1"
+                              className="px-2 py-1 text-[10px] font-semibold rounded border transition-all active:scale-95 cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed flex items-center gap-1 group relative"
                               style={{
                                 backgroundColor: p.running ? 'rgba(16,185,129,0.15)' : 'var(--input-bg)',
                                 borderColor: p.running ? 'rgba(16,185,129,0.3)' : 'var(--border)',
                                 color: p.running ? '#34d399' : 'var(--fg-dim)'
                               }}>
                               {installingCloudflared || tunnelLoading[p.name] ? (
-                                <><div className="animate-spin rounded-full h-2 w-2 border-b border-current" /> Đang tải & kết nối...</>
+                                <><div className="animate-spin rounded-full h-2 w-2 border-b border-current" /> Đang tải & kết nối…</>
                               ) : (
                                 <><svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                                   <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                                 </svg>
                                 📥 Cài & Mở tunnel</>
                               )}
+                              <span className="tooltip-text tooltip-below z-[999999]">Cài cloudflared rồi mở tunnel công khai</span>
                             </button>
                           ) : tunnelStates[p.name]?.status === 'connecting' ? (
                             <div className="flex items-center gap-1.5">
                               <div className="animate-spin rounded-full h-2.5 w-2.5 border-b border-amber-400" />
-                              <span className="text-[10px]" style={{ color: 'var(--fg-dim)' }}>Đang kết nối Cloudflare...</span>
+                              <span className="text-[10px]" style={{ color: 'var(--fg-dim)' }}>Đang kết nối Cloudflare…</span>
                             </div>
                           ) : tunnelStates[p.name]?.status === 'error' ? (
                             <div className="flex items-center gap-1.5 flex-wrap">
                               <span className="text-[10px]" style={{ color: '#ef4444' }}>{tunnelStates[p.name]?.error || 'Lỗi không xác định'}</span>
                               <button onClick={() => startTunnel(p.name)} disabled={tunnelLoading[p.name]}
-                                className="px-1.5 py-0.5 text-[10px] font-semibold rounded border transition-colors active:scale-95 cursor-pointer disabled:opacity-30"
+                                className="px-1.5 py-0.5 text-[10px] font-semibold rounded border transition-colors active:scale-95 cursor-pointer disabled:opacity-30 group relative"
                                 style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
-                                {tunnelLoading[p.name] ? '...' : '🔄 Thử lại'}
+                                {tunnelLoading[p.name] ? '…' : '🔄 Thử lại'}
+                                <span className="tooltip-text tooltip-below z-[999999]">Thử kết nối lại tunnel</span>
                               </button>
                             </div>
                           ) : (
                             <button onClick={() => startTunnel(p.name)}
                               disabled={!p.running || tunnelLoading[p.name]}
-                              className="px-2 py-1 text-[10px] font-semibold rounded border transition-colors active:scale-95 cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed flex items-center gap-1"
+                              className="px-2 py-1 text-[10px] font-semibold rounded border transition-colors active:scale-95 cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed flex items-center gap-1 group relative"
                               style={{
                                 backgroundColor: p.running ? 'rgba(59,130,246,0.1)' : 'var(--input-bg)',
                                 borderColor: p.running ? 'rgba(59,130,246,0.25)' : 'var(--border)',
                                 color: p.running ? '#60a5fa' : 'var(--fg-dim)'
                               }}>
                               {tunnelLoading[p.name] ? (
-                                <><div className="animate-spin rounded-full h-2 w-2 border-b border-current" /> Đang kết nối...</>
+                                <><div className="animate-spin rounded-full h-2 w-2 border-b border-current" /> Đang kết nối…</>
                               ) : (
                                 <><svg className="w-2.5 h-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                                   <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
                                 </svg>
                                 Tunnel công khai</>
                               )}
+                              <span className="tooltip-text tooltip-below z-[999999]">Mở Cloudflare Tunnel công khai — chia sẻ server ra internet</span>
                             </button>
                           )}
                         </div>
@@ -1477,9 +1591,10 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                                 e.stopPropagation()
                                 setActiveInfoTooltip(prev => prev === `${p.name}-watchdog` ? null : `${p.name}-watchdog`)
                               }}
-                              className="p-0.5 rounded hover:bg-white/10 transition-colors border-0 cursor-pointer inline-flex items-center justify-center text-slate-400 hover:text-sky-400"
+                              aria-label="Giải thích về watchdog tự khởi động lại"
+                              className="p-0.5 rounded hover:bg-white/10 transition-colors border-0 cursor-pointer inline-flex items-center justify-center text-slate-400 hover:text-sky-400 focus-visible:ring-2 focus-visible:ring-sky-500/50 focus-visible:outline-none"
                             >
-                              <svg className="w-3 h-3" viewBox="0 0 16 16" fill="currentColor">
+                              <svg aria-hidden="true" className="w-3 h-3" viewBox="0 0 16 16" fill="currentColor">
                                 <path d="M8 1a7 7 0 110 14A7 7 0 018 1zm0 1.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM8.75 11v-4.5h-1.5V11h1.5zM8 5.25a.75.75 0 100-1.5.75.75 0 000 1.5z"/>
                               </svg>
                             </button>
@@ -1497,7 +1612,8 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                             )}
                           </div>
 
-                          <label className="relative inline-flex items-center cursor-pointer">
+                          <label className="relative inline-flex items-center cursor-pointer group">
+                            <span className="tooltip-text tooltip-below z-[999999]">Bật/tắt watchdog tự khởi động lại tunnel khi bị ngắt</span>
                             <input id={`watchdog-${p.name}`} name="watchdog" type="checkbox"
                               checked={tunnelStates[p.name]?.watchdog_enabled || false}
                               onChange={e => toggleWatchdog(p.name, e.target.checked)}
@@ -1542,11 +1658,31 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
               {/* Bottom Toolbar & Action buttons — Yêu cầu 2: rounded-b-2xl để bo tròn 2 góc dưới sạch sẽ */}
               <div className="flex items-center justify-between gap-2 px-3.5 py-2 border-t rounded-b-2xl" style={{ borderColor: 'var(--border)', backgroundColor: 'rgba(0,0,0,0.08)' }}>
                 <div className="flex items-center gap-1.5 flex-wrap min-w-0">
-                  {/* Port Conflict Badge */}
+                  {/* WHY: Port Conflict Badge — cổng đang bị tiến trình khác chiếm.
+                      Tooltip liệt kê chi tiết process (name + PID + status) chiếm cổng. */}
                   {portConflicts[p.port] && portConflicts[p.port].length > 0 && (
-                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[8px] font-semibold bg-red-500/15 text-red-400 ring-1 ring-red-500/20">
-                      ⚔️ Conflict
-                    </span>
+                    <>
+                      <span className="relative group inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[8px] font-semibold bg-red-500/15 text-red-400 ring-1 ring-red-500/20 cursor-help">
+                        <svg className="w-2.5 h-2.5 shrink-0" viewBox="0 0 20 20" fill="currentColor">
+                          <path fillRule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 6a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 6zm0 9a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
+                        </svg>
+                        Xung đột cổng :{p.port}
+                        <span className="tooltip-text tooltip-below tooltip-right z-[999999]" style={{ maxWidth: 340, whiteSpace: 'normal' }}>
+                          Cổng <b>:{p.port}</b> của project này đang bị tiến trình khác chiếm giữ — server có thể không khởi động được.
+                          <br />Chiếm bởi: {portConflicts[p.port].map(c => `${c.name} (PID ${c.pid})`).join(', ')}
+                        </span>
+                      </span>
+                      {/* WHY: Nút copy chi tiết xung đột — copy text đầy đủ để gửi cho AI/model */}
+                      <button onClick={() => copyConflictDetails(p.name, p.port)}
+                        aria-label="Sao chép chi tiết xung đột cổng"
+                        className="group relative inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[8px] font-semibold bg-red-500/10 text-red-400 ring-1 ring-red-500/20 hover:bg-red-500/20 transition-colors cursor-pointer border-0 focus-visible:ring-2 focus-visible:ring-red-500/50 focus-visible:outline-none">
+                        <svg aria-hidden="true" className="w-2.5 h-2.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                        </svg>
+                        Copy
+                        <span className="tooltip-text tooltip-below z-[999999]">Sao chép chi tiết xung đột (port, tiến trình, PID) để gửi cho AI/model</span>
+                      </button>
+                    </>
                   )}
                   {/* Disk Usage Badge */}
                   {p.type !== 'custom' && diskSizes[p.name]?.node_modules && (
@@ -1558,18 +1694,11 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                       📦 {diskSizes[p.name].node_modules}MB
                     </span>
                   )}
-                  {/* Compact Tunnel URL Badge */}
-                  {(() => {
+                  {/* WHY: Bỏ compact tunnel URL badge ở toolbar — URL chỉ hiển thị trong expand section,
+                      giữ lại trạng thái connecting/error khi card đang thu gọn. Chỉ hiển thị trên Windows. */}
+                  {TUNNEL_SUPPORTED && (() => {
                     const ts = tunnelStates[p.name]
                     if (!ts) return null
-                    if (ts.status === 'active' && ts.url) {
-                      return (
-                        <span className="tunnel-url-link inline-flex items-center gap-1 px-1.5 py-0.5 text-[9px] max-w-[180px]">
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
-                          {ts.url.replace('https://', '').replace('/','')}
-                        </span>
-                      )
-                    }
                     if (ts.status === 'connecting') {
                       return (
                         <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-medium" style={{ color: '#fbbf24', background: 'rgba(251,191,36,0.08)', border: '1px solid rgba(251,191,36,0.2)' }}>
@@ -1593,8 +1722,9 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                 {/* Start / Stop / Clean Action Controls */}
                 <div className="flex gap-1.5 items-center shrink-0">
                   <button onClick={() => act(p.name, 'start')} disabled={p.running || loading[p.name]}
-                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition-all disabled:opacity-20 disabled:cursor-not-allowed active:scale-95 cursor-pointer border-0 shadow-sm"
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition-all disabled:opacity-20 disabled:cursor-not-allowed active:scale-95 cursor-pointer border-0 shadow-sm group relative"
                     style={{ backgroundColor: 'var(--button-start-bg)', color: 'var(--button-start-text)', border: '1px solid var(--button-start-border)' }}>
+                    <span className="tooltip-text tooltip-below z-[999999]">Bắt đầu server</span>
                     {loading[p.name] ? (
                       <div className="animate-spin rounded-full h-3 w-3 border-b border-current" />
                     ) : (
@@ -1607,8 +1737,9 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                     )}
                   </button>
                   <button onClick={() => act(p.name, 'stop')} disabled={!p.running || loading[p.name]}
-                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition-all disabled:opacity-20 disabled:cursor-not-allowed active:scale-95 cursor-pointer border-0 shadow-sm"
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition-all disabled:opacity-20 disabled:cursor-not-allowed active:scale-95 cursor-pointer border-0 shadow-sm group relative"
                     style={{ backgroundColor: 'var(--button-stop-bg)', color: 'var(--button-stop-text)', border: '1px solid var(--button-stop-border)' }}>
+                    <span className="tooltip-text tooltip-below z-[999999]">Dừng server</span>
                     {loading[p.name] ? (
                       <div className="animate-spin rounded-full h-3 w-3 border-b border-current" />
                     ) : (
@@ -1621,7 +1752,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                     )}
                   </button>
                   {p.type !== 'custom' && (
-                    <div className="relative">
+                    <div className="relative group">
                       <select id={`clean-select-${p.name}`} name="cleanType" onChange={e => { const v = e.target.value as 'basic' | 'deep' | 'nuke'; if (v) { cleanProject(p.name, v); e.target.value = '' } }}
                         disabled={clearing[p.name]}
                         className="px-2 py-1 rounded-lg cursor-pointer border transition-all disabled:opacity-30 text-[11px] appearance-none"
@@ -1631,6 +1762,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                         <option value="deep">Build sâu</option>
                         <option value="nuke">Xóa sạch</option>
                       </select>
+                      <span className="tooltip-text tooltip-below z-[999999]">Dọn dẹp cache / build của project (Cache, Build sâu, Xóa sạch)</span>
                     </div>
                   )}
                 </div>
@@ -1873,7 +2005,7 @@ export default function ServersModule({ theme, setStatusText, inactive, backgrou
                 style={{ backgroundColor: 'var(--input-bg)', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>Hủy</button>
               <button onClick={saveEnvFile} disabled={envSaving}
                 className="px-4 py-1.5 text-xs font-medium bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors active:scale-95 cursor-pointer disabled:opacity-50 border-0">
-                {envSaving ? 'Saving...' : 'Lưu tập tin'}
+                {envSaving ? 'Saving…' : 'Lưu tập tin'}
               </button>
             </div>
           </div>

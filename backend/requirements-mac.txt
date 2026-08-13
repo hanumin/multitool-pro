@@ -1,0 +1,16 @@
+# WHY: Dependencies cho build macOS — bỏ pywin32 (win32print/pythoncom) và pycaw
+# (Windows Core Audio) vì không có bản cho macOS. Tab Máy in/Âm thanh đã bị ẩn trên
+# Mac ở frontend, backend chỉ cần deps chung để boot + phục vụ Máy chủ/Database/
+# Sao chép/Nhật ký. Giữ version khớp requirements.txt (bản Windows).
+#
+# ⚠️ KHÔNG có psycopg2-binary (PostgreSQL): wheel của nó chỉ có x86_64 / arm64 RIÊNG
+# (không universal2) → PyInstaller --target-arch universal2 sẽ FAIL. Bỏ nó để bản
+# universal2 build được; hậu quả: kết nối Postgres trên Mac báo lỗi (MySQL vẫn chạy
+# vì mysql-connector-python là pure-Python). Muốn Postgres trên Mac: build backend
+# riêng từng arch rồi lipo (xem comment workflow).
+flask>=3.0
+flask-cors>=4.0
+psutil>=7.0
+requests>=2.32
+mysql-connector-python>=9.0
+pyinstaller>=6.0

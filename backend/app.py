@@ -1,6 +1,13 @@
 import json, os, subprocess, sys, time, threading, signal, shutil, re, contextlib, queue, gc
 import psutil
-import pythoncom
+# WHY: pythoncom (thuộc pywin32) chỉ tồn tại trên Windows — import có điều kiện để
+# backend BOOT được trên macOS/Linux (bản Mac đã ẩn tab Máy in nên các hàm dùng
+# pythoncom không bao giờ được gọi; nếu lỡ gọi thì None → lỗi trong try, trả về error
+# thay vì crash toàn backend lúc khởi động).
+try:
+    import pythoncom
+except ImportError:
+    pythoncom = None
 from pathlib import Path
 from flask import Flask, jsonify, request, Response, send_from_directory
 from flask_cors import CORS
