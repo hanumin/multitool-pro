@@ -105,7 +105,7 @@ pip install pyinstaller
 
 ### Cách 1: Cài đặt từ file build (Khuyên dùng)
 
-Tải file `.msi` hoặc `.exe` từ [Releases](https://github.com/NguyenThanhDat2410/multitool-pro/releases) và chạy.
+Tải file `.msi` hoặc `.exe` từ [Releases](https://github.com/hanumin/multitool-pro/releases) và chạy.
 
 > ✅ Bản build mới **đóng gói cả backend Python** — người dùng cuối **không cần cài Python hay thư viện**. App chạy khép kín, backend tự giải nén và chạy ngầm ở `%LOCALAPPDATA%\multitool-pro\`.
 
@@ -117,7 +117,7 @@ File cài đặt sẽ tự động:
 
 ```bash
 # Clone repo
-git clone https://github.com/NguyenThanhDat2410/multitool-pro.git
+git clone https://github.com/hanumin/multitool-pro.git
 cd multitool-pro
 
 # Cài đặt frontend
@@ -407,10 +407,10 @@ Dự án được phân phối dưới giấy phép **MIT**.
 ---
 
 <div align="center">
-  <p>Built with ❤️ by <a href="https://github.com/NguyenThanhDat2410">NguyenThanhDat2410</a></p>
+  <p>Built with ❤️ by <a href="https://github.com/hanumin">hanumin</a></p>
   <p>
-    <a href="https://github.com/NguyenThanhDat2410/multitool-pro/issues">Báo cáo lỗi</a>
+    <a href="https://github.com/hanumin/multitool-pro/issues">Báo cáo lỗi</a>
     ·
-    <a href="https://github.com/NguyenThanhDat2410/multitool-pro/issues">Đề xuất tính năng</a>
+    <a href="https://github.com/hanumin/multitool-pro/issues">Đề xuất tính năng</a>
   </p>
 </div>

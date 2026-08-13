@@ -81,7 +81,7 @@ File `src-tauri/src/lib.rs` hàm `run()`:
 - Frontend có nút "Check updates" → gọi `check()` → `downloadAndInstall()` → `relaunch()`
 - Đã tạo signing keypair ở `~/.tauri/server-dashboard.key` (password: empty)
 - **Cần làm khi deploy:**
-  1. Push code lên GitHub repo `NguyenThanhDat2410/server-dashboard`
+  1. Push code lên GitHub repo `hanumin/multitool-pro`
   2. Tạo GitHub Actions workflow: build khi push tag → upload `.msi` + `.msi.sig` + `.exe` + `.exe.sig` + `latest.json`
   3. `latest.json` định dạng:
      ```json

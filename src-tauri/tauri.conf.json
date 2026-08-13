@@ -50,7 +50,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/NguyenThanhDat2410/multitool-pro/releases/latest/download/latest.json"
+        "https://github.com/hanumin/multitool-pro/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIwQUJBRkNCRTFBNUM4QzkKUldUSnlLWGh5NitySU9EZ3I1NTZUOE9VOTNraUJyREF4YnhlNnUwUnUxYnJoQWhHSXlBcmxVRnEK",
       "dialog": true

@@ -19,7 +19,7 @@
 #   - Tab Âm thanh / Máy in / Tunnel đã bị ẩn trên Mac ở frontend (Windows-only).
 #
 # ⚠️ CẦN THIẾT TRƯỚC KHI DÙNG:
-#   1. Push repo này lên GitHub (repo hiện tại: NguyenThanhDat2410/multitool-pro).
+#   1. Push repo này lên GitHub (repo hiện tại: hanumin/multitool-pro).
 #   2. (Tùy chọn, cho auto-update) Tạo secrets:
 #      - TAURI_SIGNING_PRIVATE_KEY: nội dung file .key (npx tauri signer generate)
 #      - TAURI_SIGNING_PRIVATE_KEY_PASSWORD: mật khẩu key
@@ -195,7 +195,7 @@ jobs:
           import glob, json, os, datetime
           tag = os.environ["GITHUB_REF_NAME"]
           ver = tag.lstrip("v")
-          base = f"https://github.com/NguyenThanhDat2410/multitool-pro/releases/download/{tag}"
+          base = f"https://github.com/hanumin/multitool-pro/releases/download/{tag}"
           sig_map = {}
           for f in glob.glob("bundles/**/*.sig", recursive=True):
               with open(f) as fh:
