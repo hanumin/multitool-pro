@@ -31,6 +31,7 @@ import { type LogColors, DEFAULT_LOG_COLORS } from './utils/logStyles'
 import { API, fetchWithRetry } from './utils/apiFetch'
 import { openAudioWidget, closeAudioWidget, toggleAudioWidget, subscribeAudioWidget } from './utils/audioWidget'
 import { invoke } from '@tauri-apps/api/core'
+import UpdateModal, { type UpdatePhase, type UpdateInfo } from './components/UpdateModal'
 
 type Theme = 'dark' | 'light'
 
@@ -183,6 +184,17 @@ function App() {
   const [appVersion, setAppVersion] = useState('1.11.5')
   const [changelogOpen, setChangelogOpen] = useState(false)
   const [changelogAnim, setChangelogAnim] = useState<'enter' | 'exit'>('enter')
+  // WHY: Popup auto-update chuyên nghiệp — thay cho window.confirm cũ. Một popup duy
+  // nhất xử lý cả kiểm tra lẫn cài đặt (chuẩn update dialog quốc tế). phase = trạng
+  // thái hiện tại, update = thông tin bản mới từ Tauri updater, progress = tiến trình
+  // tải thực tế, error = message khi lỗi.
+  const [updateOpen, setUpdateOpen] = useState(false)
+  const [updateAnim, setUpdateAnim] = useState<'enter' | 'exit'>('enter')
+  const [updatePhase, setUpdatePhase] = useState<UpdatePhase>('checking')
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
+  const [updateProgress, setUpdateProgress] = useState({ percent: 0, downloaded: 0, total: 0 })
+  const [updateError, setUpdateError] = useState<string | undefined>(undefined)
+  const updateBusyRef = useRef(false)
   const [aboutOpen, setAboutOpen] = useState(false)
   const [aboutAnim, setAboutAnim] = useState<'enter' | 'exit'>('enter')
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -409,44 +421,117 @@ function App() {
     } catch {}
   }, [])
 
-  // WHY: Kiểm tra bản cập nhật qua Tauri updater — nếu có, hỏi user rồi tải +
-  // cài + relaunch app. downloadAndInstall nhận callback event để hiển thị % tiến
-  // trình tải xuống thực tế trên statusText (thay vì chỉ báo "Đang tải..." mơ hồ).
-  // Dynamic import để không bundle nặng khi chạy dev.
+  // WHY: Tự động kiểm tra cập nhật khi khởi động (chuẩn app desktop: VS Code, Discord
+  // tự check sau khi mở) — nếu có bản mới, mở popup để user quyết định (không tự cài
+  // đè — luôn để user chọn "Cập nhật ngay" / "Để sau"). Trì hoãn 2.5s để app load
+  // xong giao diện trước, tránh popup đè lúc khởi động. Chỉ chạy trong Tauri runtime.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      import('@tauri-apps/plugin-updater').then(({ check }) => check()).then((update) => {
+        if (update) checkUpdate()
+      }).catch(() => {})
+    }, 2500)
+    return () => clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // WHY: Đóng popup update với animation fade-out rồi reset phase về checking cho
+  // lần mở sau (tránh giữ trạng thái cũ khi mở lại popup mới).
+  const closeUpdateModal = () => {
+    setUpdateAnim('exit')
+    setTimeout(() => {
+      setUpdateOpen(false)
+      setUpdateAnim('enter')
+      setUpdatePhase('checking')
+      setUpdateInfo(null)
+      setUpdateError(undefined)
+    }, 250)
+  }
+
+  // WHY: Mở popup + kiểm tra bản cập nhật qua Tauri updater. Đây là điểm vào duy
+  // nhất (nút footer, tray menu, auto-check). Chuẩn thiết kế update dialog: hiện
+  // trạng thái checking ngay, nếu có bản mới → available (hiện version + nút Cập
+  // nhật ngay/Để sau), không có → latest, lỗi → error (nút Thử lại). Dynamic import
+  // để không bundle nặng khi chạy dev.
   const checkUpdate = async () => {
+    if (updateBusyRef.current) return
+    updateBusyRef.current = true
+    setUpdateError(undefined)
+    setUpdateInfo(null)
+    setUpdatePhase('checking')
+    setUpdateOpen(true)
+    setUpdateAnim('enter')
     setStatusText('Đang kiểm tra cập nhật...')
+    try {
+      const { check } = await import('@tauri-apps/plugin-updater')
+      const update = await check()
+      if (!update) {
+        setUpdatePhase('latest')
+        setStatusText(`Bạn đang dùng phiên bản mới nhất (v${appVersion})`)
+        return
+      }
+      setUpdateInfo({ version: update.version, date: update.date, body: update.body })
+      setUpdatePhase('available')
+      setStatusText(`Có bản cập nhật mới v${update.version}`)
+    } catch (e: any) {
+      setUpdateError(e?.message || 'Không thể kết nối tới máy chủ cập nhật')
+      setUpdatePhase('error')
+      setStatusText('Kiểm tra cập nhật thất bại')
+    } finally {
+      updateBusyRef.current = false
+    }
+  }
+
+  // WHY: Tải + cài bản cập nhật. Hiển thị progress thực tế (%, dung lượng đã tải /
+  // tổng) trên popup, chuyển sang installing (user thấy rõ app sắp khởi động lại)
+  // rồi relaunch. downloadAndInstall trên Windows NSIS tải xong → installer chạy
+  // khi app thoát → relaunch() tự đóng app + mở bản mới.
+  const installUpdate = async () => {
+    if (updateBusyRef.current || !updateInfo) return
+    updateBusyRef.current = true
+    setUpdatePhase('downloading')
+    setUpdateProgress({ percent: 0, downloaded: 0, total: 0 })
+    setStatusText('Đang tải bản cập nhật...')
     try {
       const { check } = await import('@tauri-apps/plugin-updater')
       const { relaunch } = await import('@tauri-apps/plugin-process')
       const update = await check()
-      if (!update) {
-        setStatusText(`Bạn đang dùng phiên bản mới nhất (v${appVersion})`)
-        return
-      }
-      const ok = window.confirm(`Có bản cập nhật mới v${update.version} (hiện tại v${appVersion}). Tải về và cài đặt ngay?`)
-      if (!ok) { setStatusText('Đã hủy cập nhật'); return }
+      if (!update) throw new Error('Không tìm thấy bản cập nhật sau khi tải')
       let downloaded = 0
       let contentLength = 0
-      setStatusText('Đang tải bản cập nhật...')
       await update.downloadAndInstall((event) => {
         switch (event.event) {
           case 'Started':
             contentLength = event.data.contentLength ?? 0
+            setUpdateProgress(p => ({ ...p, total: contentLength }))
             break
           case 'Progress':
             downloaded += event.data.chunkLength
             if (contentLength > 0) {
               const pct = Math.min(99, Math.round((downloaded / contentLength) * 100))
+              setUpdateProgress({ percent: pct, downloaded, total: contentLength })
               setStatusText(`Đang tải bản cập nhật... ${pct}%`)
             }
             break
           case 'Finished':
-            setStatusText('Đã tải xong, đang cài đặt...')
+            setUpdateProgress(p => ({ ...p, percent: 100 }))
             break
         }
       })
+      // WHY: Hiện trạng thái "Đang cài đặt..." ngắn (~1.2s) để user thấy rõ app sắp
+      // đóng + khởi động lại, thay vì app tắt đột ngột (chuẩn UX update của VS Code/
+      // Discord).
+      setUpdatePhase('installing')
+      setStatusText('Đang cài đặt bản cập nhật...')
+      await new Promise(r => setTimeout(r, 1200))
       await relaunch()
-    } catch (e: any) { setStatusText(e?.message || 'Kiểm tra cập nhật thất bại') }
+    } catch (e: any) {
+      setUpdateError(e?.message || 'Tải bản cập nhật thất bại')
+      setUpdatePhase('error')
+      setStatusText('Cập nhật thất bại')
+    } finally {
+      updateBusyRef.current = false
+    }
   }
 
   // WHY: Đăng ký các hàm toàn cục window để System Tray Context Menu gọi từ Rust/Tauri
@@ -1094,6 +1179,25 @@ function App() {
         onClose={() => {
           setAboutAnim('exit')
           setTimeout(() => { setAboutOpen(false); setAboutAnim('enter') }, 250)
+        }}
+      />
+
+      {/* Update Modal — popup auto-update (kiểm tra + cài đặt) */}
+      <UpdateModal
+        open={updateOpen}
+        animState={updateAnim}
+        phase={updatePhase}
+        currentVersion={appVersion}
+        update={updateInfo}
+        progress={updateProgress}
+        error={updateError}
+        onClose={closeUpdateModal}
+        onInstall={installUpdate}
+        onRetry={checkUpdate}
+        onViewChangelog={() => {
+          closeUpdateModal()
+          setChangelogOpen(true)
+          setChangelogAnim('enter')
         }}
       />
 
