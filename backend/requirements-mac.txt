@@ -3,14 +3,14 @@
 # Mac ở frontend, backend chỉ cần deps chung để boot + phục vụ Máy chủ/Database/
 # Sao chép/Nhật ký. Giữ version khớp requirements.txt (bản Windows).
 #
-# ⚠️ KHÔNG có psycopg2-binary (PostgreSQL): wheel của nó chỉ có x86_64 / arm64 RIÊNG
-# (không universal2) → PyInstaller --target-arch universal2 sẽ FAIL. Bỏ nó để bản
-# universal2 build được; hậu quả: kết nối Postgres trên Mac báo lỗi (MySQL vẫn chạy
-# vì mysql-connector-python là pure-Python). Muốn Postgres trên Mac: build backend
-# riêng từng arch rồi lipo (xem comment workflow).
+# ⚠️ KHÔNG có psycopg2-binary (PostgreSQL) và mysql-connector-python (MySQL): cả 2 đều
+# có C extension (.so) và wheel của chúng chỉ có x86_64 / arm64 RIÊNG (không có bản
+# universal2) → PyInstaller --target-arch universal2 sẽ FAIL "not a fat binary". Bỏ cả
+# 2 để bản universal2 build được; hậu quả: tab Cơ sở dữ liệu trên Mac sẽ báo lỗi
+# "driver không khả dụng" khi kết nối (giao diện vẫn hoạt động bình thường). Muốn có
+# Postgres/MySQL trên Mac: build backend riêng từng arch rồi lipo (xem comment workflow).
 flask>=3.0
 flask-cors>=4.0
 psutil>=7.0
 requests>=2.32
-mysql-connector-python>=9.0
 pyinstaller>=6.0

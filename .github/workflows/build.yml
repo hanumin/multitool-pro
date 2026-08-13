@@ -12,10 +12,10 @@
 #   universal2 từ python.org.
 #
 # ⚠️ HẠN CHẾ BẢN MAC (đã cố tình chọn):
-#   - psycopg2-binary (PostgreSQL) KHÔNG có wheel universal2 → không nhúng vào backend
-#     Mac → tab Cơ sở dữ liệu kết nối Postgres sẽ báo lỗi trên Mac (MySQL vẫn dùng được
-#     vì mysql-connector-python là pure-Python). Muốn có Postgres trên Mac phải build
-#     backend riêng cho từng arch rồi lipo (phức tạp hơn nhiều).
+#   - psycopg2-binary (PostgreSQL) và mysql-connector-python (MySQL) đều có C extension
+#     và KHÔNG có wheel universal2 → cả 2 bị bỏ khỏi requirements-mac.txt → tab Cơ sở
+#     dữ liệu trên Mac sẽ báo lỗi driver khi kết nối (giao diện vẫn chạy). Muốn có
+#     Postgres/MySQL trên Mac phải build backend riêng cho từng arch rồi lipo (phức tạp).
 #   - Tab Âm thanh / Máy in / Tunnel đã bị ẩn trên Mac ở frontend (Windows-only).
 #
 # ⚠️ AUTO-UPDATE (đã triển khai đầy đủ ở workflow này):

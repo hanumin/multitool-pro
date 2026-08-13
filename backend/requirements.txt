@@ -6,3 +6,4 @@ requests>=2.32
 psycopg2-binary>=2.9
 mysql-connector-python>=9.0
 pycaw>=2025.10
+pyinstaller>=6.0
