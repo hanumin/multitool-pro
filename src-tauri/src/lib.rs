@@ -607,7 +607,7 @@ pub fn run() {
             // kiểm tra /api/preload mỗi 5s, tự restart backend nếu chết/treo 3 lần liên
             // tiếp (~15s). Giúp app tự phục hồi thay vì chỉ hiển thị nút "Khởi động lại".
             start_backend_watchdog(app.handle().clone());
-            let _tray_window = tauri::WebviewWindowBuilder::new(
+            let tray_window_builder = tauri::WebviewWindowBuilder::new(
                 app,
                 "tray_menu",
                 tauri::WebviewUrl::App("tray.html".into()),
@@ -615,12 +615,15 @@ pub fn run() {
             .title("MultiTool Pro Menu")
             .inner_size(320.0, 490.0)
             .decorations(false)
-            .transparent(true)
             .always_on_top(true)
             .resizable(false)
-            .skip_taskbar(true)
-            .visible(false)
-            .build()?;
+            .skip_taskbar(true);
+            // WHY: Nền trong suốt chỉ hỗ trợ trên Windows (API transparent của Tauri
+            // không tồn tại trên macOS/Linux — compile error nếu gọi). Bản Mac build
+            // nền đục bình thường, vẫn đủ đẹp cho menu tray.
+            #[cfg(target_os = "windows")]
+            let tray_window_builder = tray_window_builder.transparent(true);
+            let _tray_window = tray_window_builder.visible(false).build()?;
 
             let mut tray_builder = TrayIconBuilder::with_id("main_tray");
             if let Some(icon) = app.default_window_icon().cloned() {
