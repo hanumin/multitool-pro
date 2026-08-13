@@ -66,6 +66,18 @@ interface PendingSize {
 
 const CHANGELOGS: ChangelogEntry[] = [
   {
+    version: '1.11.6',
+    title: 'v1.11.6 - Popup cập nhật chuyên nghiệp & Sửa chữa',
+    items: [
+      'Popup auto-update mới: 1 popup xử lý cả kiểm tra lẫn cài đặt với trạng thái rõ ràng (đang kiểm tra, có bản mới, đang tải %, đang cài đặt, hoàn tất, lỗi).',
+      'Popup nổi không nền mờ — nhìn rõ app bên dưới khi cập nhật.',
+      'Tính năng Sửa chữa (Repair): tải lại đúng phiên bản hiện tại rồi cài đè — khôi phục file hỏng/mất mà không cần nâng cấp.',
+      'Hiện progress tải thực tế (%, dung lượng đã tải/tổng) + release notes mở rộng ngay trong popup.',
+      'Tự động kiểm tra cập nhật khi khởi động — chỉ hiện popup khi có bản mới (không làm phiền).',
+      'Release GitHub gọn hơn: chỉ giữ installer (.msi/.exe/.dmg/.app.tar.gz) + signature, bỏ raw binaries thừa.',
+    ]
+  },
+  {
     version: '1.11.5',
     title: 'v1.11.5 - Auto-update, đa nền tảng & cải thiện UI',
     items: [
@@ -181,7 +193,7 @@ function App() {
   const [openPrinter, setOpenPrinter] = useState<string | null>(null)
   const [statusText, setStatusText] = useState('Sẵn sàng')
   const [autostart, setAutostart] = useState(false)
-  const [appVersion, setAppVersion] = useState('1.11.5')
+  const [appVersion, setAppVersion] = useState('1.11.6')
   const [changelogOpen, setChangelogOpen] = useState(false)
   const [changelogAnim, setChangelogAnim] = useState<'enter' | 'exit'>('enter')
   // WHY: Popup auto-update chuyên nghiệp — thay cho window.confirm cũ. Một popup duy
@@ -550,6 +562,49 @@ function App() {
       setUpdateError(e?.message || 'Tải bản cập nhật thất bại')
       setUpdatePhase('error')
       setStatusText('Cập nhật thất bại')
+    } finally {
+      updateBusyRef.current = false
+    }
+  }
+
+  // WHY: Sửa chữa (repair) bản cài đặt — tải lại ĐÚNG phiên bản hiện tại rồi cài
+  // đè (khôi phục file hỏng/mất). Gọi command Rust repair_update vì plugin JS check()
+  // không trả về bản có version BẰNG hiện tại (mặc định chỉ nhận bản cao hơn, kể cả
+  // allowDowngrades cũng loại version bằng). Rust dùng version_comparator == để lấy
+  // đúng bản đang chạy từ latest.json, emit repair-progress/repair-done.
+  const repairUpdate = async () => {
+    if (updateBusyRef.current) return
+    updateBusyRef.current = true
+    setUpdatePhase('repairing')
+    setUpdateProgress({ percent: 0, downloaded: 0, total: 0 })
+    setStatusText('Đang sửa chữa bản cài đặt...')
+    try {
+      const { invoke } = await import('@tauri-apps/api/core')
+      const { listen } = await import('@tauri-apps/api/event')
+      // WHY: Listen progress trước khi invoke để không bỏ lỡ event đầu tiên (Rust emit
+      // ngay khi chunk đầu tải xong). unlisten ngay sau khi xong để tránh leak listener.
+      const unlistenProgress = await listen<{ downloaded: number; total: number }>('repair-progress', (e) => {
+        const { downloaded, total } = e.payload
+        if (total > 0) {
+          const pct = Math.min(99, Math.round((downloaded / total) * 100))
+          setUpdateProgress({ percent: pct, downloaded, total })
+          setStatusText(`Đang sửa chữa... ${pct}%`)
+        }
+      })
+      await invoke('repair_update')
+      await new Promise(r => setTimeout(r, 300))
+      await unlistenProgress()
+      // WHY: Hiện trạng thái "Đang cài đặt..." ngắn (~1.2s) để user thấy rõ app sắp
+      // đóng + khởi động lại (chuẩn UX update của VS Code/Discord).
+      setUpdatePhase('installing')
+      setStatusText('Đang cài đặt bản sửa chữa...')
+      await new Promise(r => setTimeout(r, 1200))
+      const { relaunch } = await import('@tauri-apps/plugin-process')
+      await relaunch()
+    } catch (e: any) {
+      setUpdateError(e?.message || 'Sửa chữa thất bại')
+      setUpdatePhase('error')
+      setStatusText('Sửa chữa thất bại')
     } finally {
       updateBusyRef.current = false
     }
@@ -1214,6 +1269,7 @@ function App() {
         error={updateError}
         onClose={closeUpdateModal}
         onInstall={installUpdate}
+        onRepair={repairUpdate}
         onRetry={checkUpdate}
         onViewChangelog={() => {
           closeUpdateModal()

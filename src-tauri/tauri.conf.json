@@ -1,6 +1,6 @@
 {
   "productName": "MultiTool Pro",
-  "version": "1.11.5",
+  "version": "1.11.6",
   "identifier": "com.multitoolpro.desktop",
   "build": {
     "frontendDist": "../dist",

@@ -12,6 +12,7 @@ export type UpdatePhase =
   | 'done'
   | 'latest'
   | 'error'
+  | 'repairing'
 
 export interface UpdateInfo {
   version: string
@@ -29,6 +30,7 @@ interface UpdateModalProps {
   error?: string
   onClose: () => void
   onInstall: () => void
+  onRepair: () => void
   onRetry: () => void
   onViewChangelog: () => void
 }
@@ -40,7 +42,7 @@ interface UpdateModalProps {
 // Màu slate cố định (không theo theme) để popup hệ thống luôn nhất quán + nổi bật.
 export default function UpdateModal({
   open, animState, phase, currentVersion, update, progress, error,
-  onClose, onInstall, onRetry, onViewChangelog,
+  onClose, onInstall, onRepair, onRetry, onViewChangelog,
 }: UpdateModalProps) {
   // WHY: Tab changelog trong popup — bấm "Có gì mới" mở rộng xem chi tiết ngay
   // trong popup (không phải mở modal khác chồng lên).
@@ -159,6 +161,31 @@ export default function UpdateModal({
           </div>
         )
 
+      // WHY: Phase sửa chữa (repair) — hiển thị tiến trình tải lại bản hiện tại giống
+      // downloading (%, dung lượng) nhưng icon + mô tả riêng để user phân biệt "đang
+      // sửa chữa" (khôi phục bản đang chạy) với "đang cập nhật" (lên bản mới).
+      case 'repairing': {
+        const pct = Math.min(100, progress.percent)
+        return (
+          <div className="space-y-4">
+            <div className="flex items-center gap-3.5">
+              <div className="w-12 h-12 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center mb-1 shrink-0">
+                <div className="w-5 h-5 border-[3px] border-amber-400/20 border-t-amber-400 rounded-full animate-spin" />
+              </div>
+              <div>
+                <p className="text-sm font-bold text-white">Đang sửa chữa bản cài đặt</p>
+                <p className="text-xs text-slate-400 mt-0.5">Tải lại {fmtBytes(progress.downloaded)} / {fmtBytes(progress.total)}</p>
+              </div>
+            </div>
+            <div className="h-2.5 rounded-full bg-slate-800 overflow-hidden">
+              <div className="h-full rounded-full bg-gradient-to-r from-amber-500 to-orange-400 transition-all duration-300"
+                style={{ width: `${pct}%` }} />
+            </div>
+            <p className="text-[11px] font-mono text-amber-400 text-right">{pct}%</p>
+          </div>
+        )
+      }
+
       case 'done':
         return (
           <div className="flex flex-col items-center py-6 text-center">
@@ -206,6 +233,20 @@ export default function UpdateModal({
             </button>
           </div>
         )
+      case 'latest':
+        return (
+          <div className="flex gap-2.5">
+            <button onClick={onRepair}
+              className="flex-[1.2] px-4 py-2 text-xs font-bold bg-amber-600 hover:bg-amber-500 text-white rounded-xl transition-all active:scale-95 cursor-pointer border-0 shadow-md shadow-amber-500/20 flex items-center justify-center gap-1.5">
+              🔧 Sửa chữa
+            </button>
+            <button onClick={onClose}
+              className="flex-1 px-4 py-2 text-xs font-semibold border rounded-xl transition-all active:scale-95 cursor-pointer hover:bg-slate-800"
+              style={{ backgroundColor: 'transparent', borderColor: 'var(--border)', color: 'var(--fg-secondary)' }}>
+              Đóng
+            </button>
+          </div>
+        )
       case 'error':
         return (
           <div className="flex gap-2.5">
@@ -221,7 +262,6 @@ export default function UpdateModal({
           </div>
         )
       case 'done':
-      case 'latest':
         return (
           <button onClick={onClose}
             className="flex-1 px-4 py-2 text-xs font-bold bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl transition-all active:scale-95 cursor-pointer border-0 shadow-md shadow-emerald-500/20">
@@ -241,14 +281,17 @@ export default function UpdateModal({
     }
   }
 
-  // WHY: Trong lúc tải/cài đặt không cho đóng popup (chuẩn update flow) — tránh user
-  // đóng giữa chừng làm hỏng quá trình cài. Nút × và backdrop click vẫn hoạt động ở
-  // các phase khác.
-  const dismissible = !['downloading', 'installing'].includes(phase)
+  // WHY: Trong lúc tải/cài đặt/repair không cho đóng popup (chuẩn update flow) —
+  // tránh user đóng giữa chừng làm hỏng quá trình cài. Nút × và backdrop click vẫn
+  // hoạt động ở các phase khác.
+  const dismissible = !['downloading', 'installing', 'repairing'].includes(phase)
 
   return (
     <div
-      className={`fixed inset-0 z-[100000] flex items-center justify-center bg-black/65 backdrop-blur-md p-4 ${
+      // WHY: Không dùng nền mờ (backdrop blur / overlay tối) — user yêu cầu popup nổi
+      // trực tiếp, nhìn rõ app bên dưới. Overlay chỉ trong suốt, dùng để bắt click
+      // bên ngoài đóng popup (click-outside) ở các phase có thể đóng.
+      className={`fixed inset-0 z-[100000] flex items-center justify-center p-4 ${
         animState === 'enter' ? 'animate-modal-in' : 'animate-modal-out'
       }`}
       onClick={e => {

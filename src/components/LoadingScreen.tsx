@@ -99,7 +99,7 @@ function AppVersion() {
   useEffect(() => {
     import('@tauri-apps/api/app')
       .then(m => m.getVersion().then(setVer))
-      .catch(() => setVer('1.11.5'))
+      .catch(() => setVer('1.11.6'))
   }, [])
   return <>{ver ? `v${ver}` : ''}</>
 }

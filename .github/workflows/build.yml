@@ -233,14 +233,15 @@ jobs:
           name: MultiTool Pro ${{ github.ref_name }}
           draft: true
           prerelease: false
+          # WHY: Chỉ upload file NGƯỜI DÙNG cần: installer (msi/setup.exe), bản tải tay
+          # (dmg/app.tar.gz) + signature. KHÔNG upload raw binaries (multitool-pro[.exe])
+          # — thừa, gấp đôi dung lượng release, latest.json không trỏ vào chúng.
           files: |
             bundles/**/*.msi
             bundles/**/*.exe
             bundles/**/*.dmg
             bundles/**/*.app.tar.gz
             bundles/**/*.sig
-            bundles/**/multitool-pro
-            bundles/**/multitool-pro.exe
 
       # WHY: Tạo latest.json cho tauri-plugin-updater — bản tin auto-update mà app gọi
       # qua endpoint trong tauri.conf.json. Chỉ tạo khi có file .sig (nghĩa là đã có

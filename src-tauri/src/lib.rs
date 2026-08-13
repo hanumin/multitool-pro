@@ -338,6 +338,46 @@ fn set_backend_watchdog(enabled: bool) {
     println!("[backend-watchdog] {}", if enabled { "ENABLED" } else { "DISABLED (manual stop)" });
 }
 
+// WHY: Sửa chữa (repair) bản cài đặt — tải lại ĐÚNG phiên bản hiện tại rồi cài đè
+// lên (khôi phục file hỏng/mất). Khác với check() mặc định của plugin (chỉ chấp nhận
+// bản CAO HƠN — version bằng → trả null), repair dùng version_comparator cho phép
+// `update.version == current` để tải lại chính bản đang chạy. Chạy trong Rust vì
+// allowDowngrades của JS dùng comparator `!=` (vẫn loại version bằng) — không đáp
+// ứng được repair cùng version. Emit progress events để popup hiển thị % tải thực tế.
+#[tauri::command]
+async fn repair_update(app: tauri::AppHandle, window: tauri::WebviewWindow) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+    // WHY: version_comparator cho phép version BẰNG bản hiện tại — mặc định (và cả
+    // allowDowngrades) đều loại version bằng nên không tải lại được bản đang chạy.
+    // So sánh == là đúng nghĩa "tải lại bản hiện tại" (không phải downgrade).
+    let updater = app
+        .updater_builder()
+        .version_comparator(|current, update| update.version == current)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let update = updater.check().await.map_err(|e| e.to_string())?;
+    let Some(update) = update else {
+        return Err("Không tìm thấy bản cập nhật để sửa chữa trên GitHub".into());
+    };
+    // WHY: download_and_install tải + verify signature + cài đè. Callback on_chunk
+    // emit progress cho frontend (popup hiện % thực tế). Sau khi xong emit repair-done
+    // để frontend chuyển trạng thái và tự relaunch (user thấy rõ app sắp khởi động lại).
+    update
+        .download_and_install(
+            |downloaded, total| {
+                let _ = window.emit(
+                    "repair-progress",
+                    serde_json::json!({ "downloaded": downloaded, "total": total.unwrap_or(0) }),
+                );
+            },
+            || {},
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = window.emit("repair-done", ());
+    Ok(())
+}
+
 #[tauri::command]
 fn get_backend_url() -> String {
     "http://127.0.0.1:5050".into()
@@ -515,7 +555,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_positioner::init())
         .manage(FlaskProcess(Mutex::new(flask)))
-        .invoke_handler(tauri::generate_handler![get_backend_url, update_tray_status, quit_app, check_backend_health, restart_backend, set_backend_watchdog])
+        .invoke_handler(tauri::generate_handler![get_backend_url, update_tray_status, quit_app, check_backend_health, restart_backend, set_backend_watchdog, repair_update])
         .setup(|app| {
             // WHY: Bắt đầu phiên log SẠCH — đổi tên debug.log phiên trước thành
             // debug.log.old (tab Nhật ký chỉ đọc debug.log nên hiện log mới từ đầu).

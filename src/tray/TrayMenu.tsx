@@ -260,7 +260,7 @@ export default function TrayMenu() {
           <div>
             <div className="flex items-center gap-1.5 leading-none">
               <span className="text-xs font-bold tracking-tight text-white">MultiTool Pro</span>
-              <span className="text-[10px] font-medium px-1 py-0.5 rounded bg-emerald-500/20 text-emerald-300">v1.11.5</span>
+              <span className="text-[10px] font-medium px-1 py-0.5 rounded bg-emerald-500/20 text-emerald-300">v1.11.6</span>
             </div>
           </div>
         </div>
