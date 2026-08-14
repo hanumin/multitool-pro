@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { getSupabase } from '../lib/supabase'
+import { emojiFallbackFor, safeAvatarBg, resolveCodexUrl, DEFAULT_AVATAR_BG } from '../lib/avatars'
+import AvatarPickerDialog from './AvatarPickerDialog'
 import type { User } from '@supabase/supabase-js'
 
 interface UserMenuProps {
@@ -11,56 +13,11 @@ interface UserMenuProps {
 interface ProfileInfo {
   displayName: string
   email: string
+  // WHY: Giá trị avatar THÔ từ DB (emoji / `codex:<slug>` / URL) — cần để truyền lại
+  // cho popup đổi avatar khởi tạo lựa chọn đúng (không phải URL đã resolve).
+  rawAvatar: string | null
   avatarUrl: string | null
   avatarEmoji: string | null
-}
-
-// WHY: Base URL của thư viện linh vật Codex Pets tự-host trên Cloudflare R2 của
-// project english-topics (bucket `site-assets-english4tumi`, prefix `codex-pet-avatar`).
-// Đồng bộ với hằng số NEXT_PUBLIC_CODEX_PETS_BASE_URL bên web — KHÔNG hardcode đổi
-// chỗ khác nếu domain thay đổi, chỉ cần sửa ở đây.
-const CODEX_PETS_BASE_URL = 'https://site-assets-english4tumi.luongphamhanhnguyen.com/codex-pet-avatar'
-
-// WHY: Ánh xạ slug ngắn legacy → slug chuẩn của repo awesome-codex-pet (giống web).
-// owl/dino đã bị gỡ khỏi upstream nên trỏ slug "chết" → ảnh 404 → img onError
-// fallback về emoji (🦉/🦖) thay vì khung vỡ.
-const CODEX_LEGACY_SLUGS: Record<string, string> = {
-  cat: 'salary-cat--zuochunjie',
-  dog: 'corgi-companion--cxian0928-afk',
-  fox: 'jesse-the-fox--itjesse',
-  owl: 'owl--legeling',
-  dino: 'dino--legeling',
-}
-
-// WHY: Resolve chuỗi `codex:<slug>` → URL ảnh R2 (webp động idle — giống user menu
-// bên web). R2 keys đều chữ thường nên lowercase toàn bộ slug; trả '' nếu slug rỗng.
-function resolveCodexUrl(value: string): string {
-  const rawSlug = value.slice('codex:'.length).trim().toLowerCase()
-  if (!rawSlug) return ''
-  const targetSlug = CODEX_LEGACY_SLUGS[rawSlug] || rawSlug
-  return `${CODEX_PETS_BASE_URL}/${targetSlug}/webp/idle.webp`
-}
-
-// WHY: Emoji fallback theo từ khóa slug khi ảnh Codex 404 (đồng bộ logic web —
-// getEmojiFallback): nhìn slug chứa con gì thì hiện emoji con đó, mặc định 👤.
-function emojiFallbackFor(value: string | null | undefined): string {
-  const lower = (value ?? '').toLowerCase()
-  if (lower.includes('cat')) return '🐱'
-  if (lower.includes('dog')) return '🐶'
-  if (lower.includes('fox')) return '🦊'
-  if (lower.includes('owl')) return '🦉'
-  if (lower.includes('dino')) return '🦖'
-  if (lower.includes('bear')) return '🐻'
-  if (lower.includes('panda')) return '🐼'
-  if (lower.includes('frog')) return '🐸'
-  if (lower.includes('duck')) return '🦆'
-  if (lower.includes('bunny') || lower.includes('rabbit')) return '🐰'
-  if (lower.includes('penguin')) return '🐧'
-  if (lower.includes('dragon')) return '🐉'
-  if (lower.includes('lion')) return '🦁'
-  if (lower.includes('tiger')) return '🐯'
-  if (lower.includes('monkey')) return '🐒'
-  return '👤'
 }
 
 // WHY: Tên hiển thị ưu tiên dữ liệu từ bảng user_profiles (english-topics), sau đó
@@ -124,18 +81,21 @@ export default function UserMenu({ collapsed, user, onSignOut }: UserMenuProps) 
   // WHY: Ảnh avatar lỗi (vd slug codex:owl/dino đã bị gỡ upstream → 404) → fallback
   // về emoji theo từ khóa slug thay vì hiện khung ảnh vỡ (giống web getEmojiFallback).
   const [avatarError, setAvatarError] = useState(false)
+  // WHY: Màu nền avatar lấy từ user_settings.settings_json.avatar_bg (bên web cũng
+  // đọc/ghi cột này) — dùng cho vòng tròn emoji; safeAvatarBg chặn class lạ từ DB.
+  const [avatarBg, setAvatarBg] = useState<string>(DEFAULT_AVATAR_BG)
+  // WHY: Popup đổi avatar — mở khi bấm vào vòng avatar hoặc mục "Đổi avatar" trong
+  // dropdown. Popup tự lưu về Supabase rồi báo qua onSaved để refresh sidebar.
+  const [pickerOpen, setPickerOpen] = useState(false)
 
-  // WHY: Lấy thông tin profile (best-effort) khi mount — nếu bảng user_profiles không
-  // tồn tại hoặc RLS chặn thì fallback về user_metadata + email. Không gây crash.
-  useEffect(() => {
-    let disposed = false
-    // WHY: Reset cờ lỗi ảnh mỗi khi (re)load profile (vd đăng xuất → đăng nhập user
-    // khác) — không để ảnh lỗi của user cũ ảnh hưởng avatar mới.
+  // WHY: Tải profile + màu nền avatar (best-effort) — tách thành hàm để gọi lại sau
+  // khi đổi avatar xong (refresh sidebar) và khi user thay đổi. Không gây crash nếu
+  // bảng chưa tồn tại hoặc RLS chặn (fallback user_metadata + email).
+  const loadProfile = () => {
     setAvatarError(false)
     ;(async () => {
       try {
         const supabase = getSupabase()
-        const name = resolveDisplayName(null, user)
         let p: any = null
         if (user) {
           const { data } = await supabase
@@ -144,29 +104,42 @@ export default function UserMenu({ collapsed, user, onSignOut }: UserMenuProps) 
             .eq('id', user.id)
             .maybeSingle()
           p = data ?? null
+          // WHY: Lấy màu nền avatar (best-effort) — settings_json.avatar_bg.
+          try {
+            const { data: settings } = await supabase
+              .from('user_settings')
+              .select('settings_json')
+              .eq('user_id', user.id)
+              .maybeSingle()
+            const bg = (settings?.settings_json as Record<string, unknown> | null)?.avatar_bg
+            if (typeof bg === 'string') setAvatarBg(safeAvatarBg(bg))
+          } catch {
+            // WHY: user_settings không tồn tại/RLS chặn → giữ màu mặc định.
+          }
         }
-        if (disposed) return
         const displayName = resolveDisplayName(p, user)
         const avatar = resolveAvatar(p, user, displayName)
         setProfile({
           displayName,
           email: user?.email ?? '',
+          rawAvatar: typeof p?.avatar_emoji === 'string' && p.avatar_emoji.trim() ? p.avatar_emoji : null,
           avatarUrl: avatar.type === 'url' ? avatar.value : avatar.type === 'dicebear' ? avatar.value : null,
           avatarEmoji: avatar.type === 'emoji' ? avatar.value : null,
         })
       } catch {
-        if (!disposed) {
-          setProfile({
-            displayName: resolveDisplayName(null, user),
-            email: user?.email ?? '',
-            avatarUrl: user?.user_metadata?.avatar_url || null,
-            avatarEmoji: null,
-          })
-        }
+        setProfile({
+          displayName: resolveDisplayName(null, user),
+          email: user?.email ?? '',
+          rawAvatar: null,
+          avatarUrl: user?.user_metadata?.avatar_url || null,
+          avatarEmoji: null,
+        })
       }
     })()
-    return () => { disposed = true }
-  }, [user])
+  }
+
+  // WHY: Load profile khi mount + mỗi khi user đổi (vd đăng nhập tài khoản khác).
+  useEffect(() => { loadProfile() }, [user])
 
   // WHY: Đóng menu khi click bên ngoài (chuẩn dropdown) — tránh menu dính mở.
   useEffect(() => {
@@ -213,18 +186,43 @@ export default function UserMenu({ collapsed, user, onSignOut }: UserMenuProps) 
     }
   }
 
-  const avatarNode = profile?.avatarUrl && !avatarError ? (
-    <img
-      src={profile.avatarUrl}
-      alt={displayName}
-      className="w-8 h-8 rounded-full object-cover shrink-0 bg-emerald-500/20"
-      draggable={false}
-      onError={() => setAvatarError(true)}
-    />
-  ) : (
-    <div className="w-8 h-8 rounded-full bg-gradient-to-br from-emerald-400 to-emerald-600 flex items-center justify-center text-sm shrink-0">
-      {profile?.avatarEmoji ?? emojiFallbackFor(profile?.avatarUrl) }
-    </div>
+  // WHY: Vòng avatar — NHẤN VÀO mở popup đổi avatar (span onClick + stopPropagation
+  // để không bật dropdown bên ngoài). Ảnh (codex/URL) phủ nền emerald mờ; emoji hiển
+  // thị trên màu nền avatar_bg đã chọn (safeAvatarBg). Hover hiện vòng ring + icon
+  // camera nhỏ gợi ý "bấm để đổi".
+  const avatarNode = (
+    <span
+      role="button"
+      tabIndex={0}
+      onClick={e => { e.stopPropagation(); setPickerOpen(true) }}
+      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.stopPropagation(); setPickerOpen(true) } }}
+      className={`relative w-8 h-8 rounded-full shrink-0 cursor-pointer transition-all duration-200 group/avatar ${
+        !avatarError && profile?.avatarUrl ? '' : avatarBg
+      } ${menuOpen ? '' : 'hover:ring-2 hover:ring-emerald-400/70'}`}
+      title="Đổi avatar"
+      aria-label="Đổi avatar"
+    >
+      {!avatarError && profile?.avatarUrl ? (
+        <img
+          src={profile.avatarUrl}
+          alt={displayName}
+          className="w-8 h-8 rounded-full object-cover shrink-0 bg-emerald-500/20"
+          draggable={false}
+          onError={() => setAvatarError(true)}
+        />
+      ) : (
+        <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm ${avatarBg}`}>
+          {profile?.avatarEmoji ?? emojiFallbackFor(profile?.rawAvatar)}
+        </div>
+      )}
+      {/* WHY: Icon camera nhỏ góc phải dưới khi hover — gợi ý có thể đổi avatar. */}
+      <span className="absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 rounded-full bg-emerald-500 border border-white/20 flex items-center justify-center opacity-0 group-hover/avatar:opacity-100 transition-opacity">
+        <svg width="7" height="7" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth={3}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z" />
+          <circle cx="12" cy="13" r="4" />
+        </svg>
+      </span>
+    </span>
   )
 
   return (
@@ -272,6 +270,19 @@ export default function UserMenu({ collapsed, user, onSignOut }: UserMenuProps) 
               <div className="text-xs font-semibold truncate" style={{ color: 'var(--fg)' }}>{displayName}</div>
               <div className="text-[10px] truncate mt-0.5" style={{ color: 'var(--fg-dim)' }}>{email}</div>
             </div>
+            {/* WHY: Mục "Đổi avatar" trong dropdown — mở cùng popup đổi avatar (cách
+                thứ 2 ngoài bấm trực tiếp vào vòng avatar). */}
+            <button
+              onClick={() => { setMenuOpen(false); setPickerOpen(true) }}
+              className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer border-0 text-left hover:bg-black/5 dark:hover:bg-white/5"
+              style={{ color: 'var(--fg-secondary)' }}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+                <path strokeLinecap="round" strokeLinejoin="round" d="M21 10v6M18 13h6" />
+              </svg>
+              Đổi avatar
+            </button>
             <button
               onClick={() => { setMenuOpen(false); setPwError(null); setPwMessage(null); setPwOpen(true) }}
               className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs font-medium transition-colors cursor-pointer border-0 text-left hover:bg-black/5 dark:hover:bg-white/5"
@@ -295,6 +306,17 @@ export default function UserMenu({ collapsed, user, onSignOut }: UserMenuProps) 
           </div>
         )}
       </div>
+
+      {/* WHY: Popup đổi avatar — mở bằng cách bấm vòng avatar hoặc mục "Đổi avatar".
+          Sau khi lưu (onSaved) → load lại profile + màu nền để sidebar cập nhật ngay. */}
+      <AvatarPickerDialog
+        open={pickerOpen}
+        userId={user?.id ?? ''}
+        currentValue={profile?.rawAvatar ?? null}
+        currentBg={avatarBg}
+        onClose={() => setPickerOpen(false)}
+        onSaved={() => { setPickerOpen(false); loadProfile() }}
+      />
 
       {/* WHY: Modal đổi mật khẩu — nền tối nhẹ (không blur) để popup nổi rõ, click nền
           đóng. Form đơn giản: mật khẩu mới + xác nhận (updateUser không cần mật khẩu

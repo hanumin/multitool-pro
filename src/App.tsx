@@ -69,6 +69,16 @@ interface PendingSize {
 
 const CHANGELOGS: ChangelogEntry[] = [
   {
+    version: '1.11.7',
+    title: 'v1.11.7 - Đổi avatar từ sidebar & sửa màn hình login',
+    items: [
+      'Nhấn vào avatar ở góc dưới sidebar (hoặc mục Đổi avatar) → popup đổi avatar: chọn linh vật Codex Pets (thư viện tự-host trên R2), emoji hoặc dán link ảnh tùy chỉnh.',
+      'Chọn màu nền đại diện (12 mẫu) — lưu cùng avatar, đồng bộ với web english-topics (avatar đổi ở đâu hiện ở đó).',
+      'Sửa avatar linh vật Codex trước đây hiện dạng text codex:xxx — giờ resolve sang ảnh động đúng từ thư viện.',
+      'Màn hình login: đưa tiêu đề & mô tả lại gần nhau, giữ khoảng cách đến cụm tính năng — bố cục panel trái cân đối hơn.',
+    ]
+  },
+  {
     version: '1.11.6',
     title: 'v1.11.6 - Popup cập nhật chuyên nghiệp & Sửa chữa',
     items: [
@@ -200,7 +210,7 @@ function App() {
   const [openPrinter, setOpenPrinter] = useState<string | null>(null)
   const [statusText, setStatusText] = useState('Sẵn sàng')
   const [autostart, setAutostart] = useState(false)
-  const [appVersion, setAppVersion] = useState('1.11.6')
+  const [appVersion, setAppVersion] = useState('1.11.7')
   const [changelogOpen, setChangelogOpen] = useState(false)
   const [changelogAnim, setChangelogAnim] = useState<'enter' | 'exit'>('enter')
   // WHY: Popup auto-update chuyên nghiệp — thay cho window.confirm cũ. Một popup duy

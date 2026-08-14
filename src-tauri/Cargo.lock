@@ -2155,7 +2155,7 @@ dependencies = [
 
 [[package]]
 name = "multitool-pro"
-version = "1.11.6"
+version = "1.11.7"
 dependencies = [
  "chrono",
  "reqwest 0.12.28",
