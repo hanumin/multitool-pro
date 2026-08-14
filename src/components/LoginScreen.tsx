@@ -2,6 +2,7 @@ import { useState, useRef } from 'react'
 import Particles, { ParticlesProvider } from '@tsparticles/react'
 import { loadSlim } from '@tsparticles/slim'
 import type { ISourceOptions } from '@tsparticles/engine'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getSupabase } from '../lib/supabase'
 import type { Session } from '@supabase/supabase-js'
 
@@ -121,16 +122,7 @@ const openExternal = async (url: string) => {
   window.open(url, '_blank')
 }
 
-// WHY: Cache promise getCurrentWindow — gọi dynamic import 1 lần, các lần kéo sau
-// dùng lại instance sẵn (startDragging phải được gọi ngay trong sự kiện mousedown,
-// cache giúp giảm độ trễ lần đầu).
-let dragWindowPromise: Promise<{ startDragging: () => Promise<void> }> | null = null
-const getDragWindow = () => {
-  if (!dragWindowPromise) {
-    dragWindowPromise = import('@tauri-apps/api/window').then(m => m.getCurrentWindow()) as Promise<{ startDragging: () => Promise<void> }>
-  }
-  return dragWindowPromise
-}
+
 
 // WHY: Màn hình đăng nhập dùng Supabase Auth CHUNG của hệ sinh thái — tài khoản do
 // trang luongphamhanhnguyen.com quản lý, mọi app (MultiTool Pro, web tiếng Anh...)
@@ -178,12 +170,16 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
   const isValidEmail = (e: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)
 
   // WHY: Nhấn GIỮ chuột phải ở BẤT KỲ ĐÂU trên màn hình login → kéo cửa sổ đi chỗ
-  // khác (Tauri startDragging — OS tự xử lý việc kéo, không cần theo dõi mousemove).
-  // Cửa sổ decorations:false không có titlebar nên không kéo được như bình thường.
+  // khác. Gọi getCurrentWindow().startDragging() ĐỒNG BỘ trong mousedown (Windows yêu
+  // cầu gọi ngay trong event handler, async sẽ fail) — module import tĩnh an toàn ở
+  // browser dev (chỉ CALLING mới cần Tauri runtime, đã try/catch). Permission
+  // core:window:allow-start-dragging đã thêm vào capabilities/default.json.
   const handleRootMouseDown = (e: React.MouseEvent) => {
     if (e.button !== 2) return
     e.preventDefault()
-    getDragWindow().then(w => w.startDragging()).catch(() => {})
+    try {
+      getCurrentWindow().startDragging().catch(() => {})
+    } catch {}
   }
 
   // WHY: Click vào NỀN (gồm cả canvas tsParticles — child của .login-bg) → tạo vòng
