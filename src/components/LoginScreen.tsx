@@ -368,8 +368,13 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
             lg:self-stretch + justify-between → panel trải ĐÚNG bằng chiều cao frame
             đăng nhập (các mục dàn đều: logo trên, mô tả giữa, tính năng dưới), tiêu đề
             MultiTool Pro vẫn thẳng hàng cạnh trên của card. */}
-        <div className="hidden lg:flex flex-col flex-1 min-w-0 lg:self-stretch lg:justify-between">
-          <div className="flex items-center gap-3 mb-5">
+        <div className="hidden lg:flex flex-col flex-1 min-w-0 lg:self-stretch">
+          {/* WHY: Tiêu đề + mô tả đặt SÁT nhau (mt-4 = 16px) theo yêu cầu — trước đây
+              justify-between dàn 3 khối làm tiêu đề cách xa mô tả. Khoảng cách mô tả
+              → cụm tính năng giữ nguyên (~mb-12 = 48px); phần dư còn lại của chiều cao
+              panel được hấp thụ BÊN TRONG grid tính năng (lg:flex-1 + lg:content-between)
+              nên cụm tính năng vẫn trải đều theo chiều cao frame đăng nhập. */}
+          <div className="flex items-center gap-3">
             <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-emerald-400 to-emerald-600 flex items-center justify-center text-2xl shadow-lg shadow-emerald-500/25 shrink-0">
               🛠️
             </div>
@@ -381,14 +386,16 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
             </div>
           </div>
 
-          <p className="text-[13px] leading-relaxed text-slate-300 mb-6">
+          <p className="text-[13px] leading-relaxed text-slate-300 mt-4 mb-12">
             Một phần mềm duy nhất để quản lý toàn bộ dịch vụ trong hệ sinh thái —
             từ máy chủ, tunnel, cơ sở dữ liệu đến giám sát máy in, âm thanh và nhật ký.
           </p>
 
           {/* WHY: Grid 2 cột liệt kê tính năng — mỗi mục icon + tiêu đề + mô tả ngắn.
-              (2 cột để vừa với chiều rộng panel khi giảm container xuống max-w-6xl). */}
-          <div className="grid grid-cols-2 gap-x-8 gap-y-7">
+              (2 cột để vừa với chiều rộng panel khi giảm container xuống max-w-6xl).
+              lg:flex-1 + lg:content-between → grid chiếm nốt chiều cao còn lại của
+              panel và dàn đều các hàng (giữ panel trải bằng chiều cao frame login). */}
+          <div className="grid grid-cols-2 gap-x-8 gap-y-7 lg:flex-1 lg:content-between">
             {FEATURES.map(f => (
               <div key={f.title} className="flex items-start gap-3">
                 <span className="w-9 h-9 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-lg shrink-0">

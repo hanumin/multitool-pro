@@ -15,6 +15,54 @@ interface ProfileInfo {
   avatarEmoji: string | null
 }
 
+// WHY: Base URL của thư viện linh vật Codex Pets tự-host trên Cloudflare R2 của
+// project english-topics (bucket `site-assets-english4tumi`, prefix `codex-pet-avatar`).
+// Đồng bộ với hằng số NEXT_PUBLIC_CODEX_PETS_BASE_URL bên web — KHÔNG hardcode đổi
+// chỗ khác nếu domain thay đổi, chỉ cần sửa ở đây.
+const CODEX_PETS_BASE_URL = 'https://site-assets-english4tumi.luongphamhanhnguyen.com/codex-pet-avatar'
+
+// WHY: Ánh xạ slug ngắn legacy → slug chuẩn của repo awesome-codex-pet (giống web).
+// owl/dino đã bị gỡ khỏi upstream nên trỏ slug "chết" → ảnh 404 → img onError
+// fallback về emoji (🦉/🦖) thay vì khung vỡ.
+const CODEX_LEGACY_SLUGS: Record<string, string> = {
+  cat: 'salary-cat--zuochunjie',
+  dog: 'corgi-companion--cxian0928-afk',
+  fox: 'jesse-the-fox--itjesse',
+  owl: 'owl--legeling',
+  dino: 'dino--legeling',
+}
+
+// WHY: Resolve chuỗi `codex:<slug>` → URL ảnh R2 (webp động idle — giống user menu
+// bên web). R2 keys đều chữ thường nên lowercase toàn bộ slug; trả '' nếu slug rỗng.
+function resolveCodexUrl(value: string): string {
+  const rawSlug = value.slice('codex:'.length).trim().toLowerCase()
+  if (!rawSlug) return ''
+  const targetSlug = CODEX_LEGACY_SLUGS[rawSlug] || rawSlug
+  return `${CODEX_PETS_BASE_URL}/${targetSlug}/webp/idle.webp`
+}
+
+// WHY: Emoji fallback theo từ khóa slug khi ảnh Codex 404 (đồng bộ logic web —
+// getEmojiFallback): nhìn slug chứa con gì thì hiện emoji con đó, mặc định 👤.
+function emojiFallbackFor(value: string | null | undefined): string {
+  const lower = (value ?? '').toLowerCase()
+  if (lower.includes('cat')) return '🐱'
+  if (lower.includes('dog')) return '🐶'
+  if (lower.includes('fox')) return '🦊'
+  if (lower.includes('owl')) return '🦉'
+  if (lower.includes('dino')) return '🦖'
+  if (lower.includes('bear')) return '🐻'
+  if (lower.includes('panda')) return '🐼'
+  if (lower.includes('frog')) return '🐸'
+  if (lower.includes('duck')) return '🦆'
+  if (lower.includes('bunny') || lower.includes('rabbit')) return '🐰'
+  if (lower.includes('penguin')) return '🐧'
+  if (lower.includes('dragon')) return '🐉'
+  if (lower.includes('lion')) return '🦁'
+  if (lower.includes('tiger')) return '🐯'
+  if (lower.includes('monkey')) return '🐒'
+  return '👤'
+}
+
 // WHY: Tên hiển thị ưu tiên dữ liệu từ bảng user_profiles (english-topics), sau đó
 // user_metadata (vd OAuth Google trả full_name), cuối cùng fallback phần trước @
 // của email — chuẩn fallback của các app (Discord/GitHub hiện tên, không có thì email).
@@ -27,15 +75,27 @@ function resolveDisplayName(profile: any, user: User | null): string {
 }
 
 // WHY: Avatar ưu tiên URL thật (user_profiles.avatar_url / user_metadata.avatar_url
-// từ OAuth), rồi avatar_emoji (nếu user đặt emoji), cuối cùng là dịch vụ avatar công
-// cộng DiceBear (initials — cộng đồng dev dùng phổ biến, miễn phí, không cần key)
-// với nền emerald đồng bộ theme app. Trả null khi không thể hiện thị bằng <img>.
+// từ OAuth), rồi avatar_emoji (nếu user đặt emoji HOẶC linh vật Codex dạng
+// `codex:<slug>` — resolve sang URL R2, HOẶC URL/đường dẫn tự nhập), cuối cùng là
+// dịch vụ avatar công cộng DiceBear (initials — cộng đồng dev dùng phổ biến, miễn
+// phí, không cần key) với nền emerald đồng bộ theme app.
 function resolveAvatar(profile: any, user: User | null, displayName: string): { type: 'url' | 'emoji' | 'dicebear'; value: string } {
   const meta = user?.user_metadata ?? {}
   const url = profile?.avatar_url || meta.avatar_url
-  if (typeof url === 'string' && url.startsWith('http')) return { type: 'url', value: url }
-  if (typeof profile?.avatar_emoji === 'string' && profile.avatar_emoji) {
-    return { type: 'emoji', value: profile.avatar_emoji }
+  if (typeof url === 'string' && url.trim().startsWith('http')) return { type: 'url', value: url.trim() }
+  const emoji = profile?.avatar_emoji
+  if (typeof emoji === 'string' && emoji.trim()) {
+    const trimmed = emoji.trim()
+    const lower = trimmed.toLowerCase()
+    // WHY: `codex:<slug>` — linh vật Codex Pets tự-host trên R2 (dữ liệu thật từ
+    // user_profiles của english-topics). Không hiện chuỗi thô nữa, resolve sang ảnh.
+    if (lower.startsWith('codex:')) {
+      const r2 = resolveCodexUrl(trimmed)
+      if (r2) return { type: 'url', value: r2 }
+    }
+    // WHY: URL / đường dẫn tự nhập (custom avatar) cũng hiện bằng <img>.
+    if (lower.startsWith('http') || trimmed.startsWith('/')) return { type: 'url', value: trimmed }
+    return { type: 'emoji', value: trimmed }
   }
   // WHY: DiceBear initials — seed = 2 chữ cái đầu (tối đa 2 từ), nền emerald 3 tông.
   const words = displayName.trim().split(/\s+/).filter(Boolean)
@@ -61,11 +121,17 @@ export default function UserMenu({ collapsed, user, onSignOut }: UserMenuProps) 
   const [pwLoading, setPwLoading] = useState(false)
   const busyRef = useRef(false)
   const menuRef = useRef<HTMLDivElement>(null)
+  // WHY: Ảnh avatar lỗi (vd slug codex:owl/dino đã bị gỡ upstream → 404) → fallback
+  // về emoji theo từ khóa slug thay vì hiện khung ảnh vỡ (giống web getEmojiFallback).
+  const [avatarError, setAvatarError] = useState(false)
 
   // WHY: Lấy thông tin profile (best-effort) khi mount — nếu bảng user_profiles không
   // tồn tại hoặc RLS chặn thì fallback về user_metadata + email. Không gây crash.
   useEffect(() => {
     let disposed = false
+    // WHY: Reset cờ lỗi ảnh mỗi khi (re)load profile (vd đăng xuất → đăng nhập user
+    // khác) — không để ảnh lỗi của user cũ ảnh hưởng avatar mới.
+    setAvatarError(false)
     ;(async () => {
       try {
         const supabase = getSupabase()
@@ -147,16 +213,17 @@ export default function UserMenu({ collapsed, user, onSignOut }: UserMenuProps) 
     }
   }
 
-  const avatarNode = profile?.avatarUrl ? (
+  const avatarNode = profile?.avatarUrl && !avatarError ? (
     <img
       src={profile.avatarUrl}
       alt={displayName}
       className="w-8 h-8 rounded-full object-cover shrink-0 bg-emerald-500/20"
       draggable={false}
+      onError={() => setAvatarError(true)}
     />
   ) : (
     <div className="w-8 h-8 rounded-full bg-gradient-to-br from-emerald-400 to-emerald-600 flex items-center justify-center text-sm shrink-0">
-      {profile?.avatarEmoji ?? '👤'}
+      {profile?.avatarEmoji ?? emojiFallbackFor(profile?.avatarUrl) }
     </div>
   )
 
