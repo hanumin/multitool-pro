@@ -259,7 +259,7 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
       <button
         type="button"
         onClick={minimizeToTray}
-        className="absolute top-3 right-3 z-20 w-9 h-9 bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white flex items-center justify-center transition-all cursor-pointer shadow-lg shadow-rose-950/40"
+        className="absolute top-3 right-3 z-20 w-9 h-9 rounded-lg bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white flex items-center justify-center transition-all cursor-pointer shadow-lg shadow-rose-950/40"
         title="Thu gọn xuống khay hệ thống (không tắt ứng dụng)"
         aria-label="Thu gọn xuống khay hệ thống"
       >
@@ -322,7 +322,8 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
                 </span>
                 <div className="min-w-0">
                   <div className="text-xs font-semibold text-slate-200">{f.title}</div>
-                  <div className="text-[11px] leading-snug text-slate-500 mt-0.5">{f.desc}</div>
+                  {/* WHY: Mô tả chuyển sang màu trắng theo yêu cầu (trước đây slate-500). */}
+                  <div className="text-[11px] leading-snug text-white mt-0.5">{f.desc}</div>
                 </div>
               </div>
             ))}
@@ -342,7 +343,8 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
 
           <div className="rounded-2xl border border-slate-800 bg-slate-900/90 backdrop-blur p-6 shadow-2xl">
             <h2 className="text-base font-bold text-white mb-1">Đăng nhập</h2>
-            <p className="text-[11px] text-slate-400 mb-5">Vui lòng đăng nhập để sử dụng phần mềm</p>
+            {/* WHY: Sub-label của card đăng nhập — chuyển trắng theo yêu cầu. */}
+            <p className="text-[11px] text-white mb-5">Vui lòng đăng nhập để sử dụng phần mềm</p>
 
             <form onSubmit={handleSubmit} className="space-y-3.5">
               <div>
@@ -386,7 +388,7 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
                   />
                   <span className="flex flex-col">
                     <span className="text-xs font-medium text-slate-300">Duy trì đăng nhập</span>
-                    <span className="text-[10px] text-slate-500">
+                    <span className="text-[10px] text-white">
                       {rememberMe
                         ? 'Giữ đăng nhập giữa các lần mở ứng dụng'
                         : 'Tự đăng xuất khi đóng ứng dụng & sau 30 phút không hoạt động'}
@@ -454,7 +456,7 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
           <button
             type="button"
             onClick={() => openExternal(ACCOUNT_PORTAL_URL)}
-            className="w-full text-center text-[10px] text-slate-500 hover:text-emerald-300 transition-colors bg-transparent border-0 cursor-pointer mt-5 leading-relaxed"
+            className="w-full text-center text-[10px] text-white hover:text-emerald-300 transition-colors bg-transparent border-0 cursor-pointer mt-5 leading-relaxed"
             title={`Mở ${ACCOUNT_PORTAL_URL} trong trình duyệt`}
           >
             Đăng nhập bằng tài khoản của hệ thống luongphamhanhnguyen.com
