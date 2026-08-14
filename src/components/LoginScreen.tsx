@@ -1,4 +1,7 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef } from 'react'
+import Particles, { ParticlesProvider } from '@tsparticles/react'
+import { loadSlim } from '@tsparticles/slim'
+import type { ISourceOptions } from '@tsparticles/engine'
 import { getSupabase } from '../lib/supabase'
 import type { Session } from '@supabase/supabase-js'
 
@@ -20,43 +23,79 @@ interface LoginScreenProps {
 // bấm vào dòng label dưới form đăng nhập (yêu cầu: nhấn vào mở tab mới trang này).
 const ACCOUNT_PORTAL_URL = 'https://luongphamhanhnguyen.com'
 
-// WHY: 3 hiệu ứng nền Vanta để user so sánh — WAVES (sóng ánh sáng), NET (mạng lưới
-// điểm), FOG (aurora). Chọn qua nút nhỏ góc phải dưới, lựa chọn persist localStorage.
-type BgEffect = 'waves' | 'net' | 'fog'
+// WHY: 3 preset nền động tsParticles để user so sánh — lights (quả cầu sáng trôi),
+// network (mạng lưới điểm nối), flow (hạt sáng bay lên). Chọn qua nút nhỏ góc phải
+// dưới, lựa chọn persist localStorage.
+type BgEffect = 'lights' | 'network' | 'flow'
 
 const BG_EFFECT_LABELS: Record<BgEffect, string> = {
-  waves: 'WAVES — sóng ánh sáng',
-  net: 'NET — mạng lưới điểm',
-  fog: 'FOG — aurora',
+  lights: 'ÁNH SÁNG — quả cầu sáng trôi',
+  network: 'LƯỚI — mạng lưới điểm',
+  flow: 'DÒNG — hạt sáng bay lên',
 }
 
-// WHY: Đường dẫn module dynamic-import theo effect (mỗi effect 1 file riêng trong
-// node_modules/vanta/dist — Vite tách chunk riêng, chỉ tải khi chọn).
-const EFFECT_MODULES: Record<BgEffect, string> = {
-  waves: 'vanta/dist/vanta.waves.min',
-  net: 'vanta/dist/vanta.net.min',
-  fog: 'vanta/dist/vanta.fog.min',
-}
-
-// WHY: Options riêng từng effect — đều giữ tông emerald/sky/slate của app. Vanta chỉ
-// đọc các key nó hiểu (setOptions bỏ qua key lạ) nên dùng chung object an toàn.
-const EFFECT_OPTIONS: Record<BgEffect, Record<string, unknown>> = {
-  waves: {
-    mouseControls: true, touchControls: true, gyroControls: false,
-    minHeight: 200, minWidth: 200,
-    color: 0x10b981, shininess: 30, waveHeight: 18, waveSpeed: 1.2, zoom: 0.9,
+// WHY: Options tsParticles (canvas 2D — ổn định trên mọi nền tảng, không dính lỗi
+// tương thích WebGL/three.js như Vanta). Giữ tông emerald/sky/slate của app; mọi
+// preset đều có tương tác chuột: hover → grab/link/repulse/attract, click → push hạt.
+const BG_PRESETS: Record<BgEffect, ISourceOptions> = {
+  lights: {
+    fullScreen: { enable: false },
+    background: { color: { value: 'transparent' } },
+    fpsLimit: 60,
+    detectRetina: true,
+    particles: {
+      number: { value: 42, density: { enable: true } },
+      color: { value: ['#10b981', '#34d399', '#0ea5e9'] },
+      shape: { type: 'circle' },
+      opacity: { value: 0.3 },
+      size: { value: { min: 10, max: 26 } },
+      links: { enable: true, distance: 170, color: '#10b981', opacity: 0.12, width: 1 },
+      move: { enable: true, speed: 0.7, direction: 'none', random: true, straight: false, outModes: { default: 'out' } },
+    },
+    interactivity: {
+      detectsOn: 'canvas',
+      events: { onHover: { enable: true, mode: ['grab', 'link'] }, onClick: { enable: true, mode: 'push' } },
+      modes: { grab: { distance: 160, links: { opacity: 0.3 } }, push: { quantity: 2 } },
+    },
   },
-  net: {
-    mouseControls: true, touchControls: true, gyroControls: false,
-    minHeight: 200, minWidth: 200,
-    color: 0x34d399, backgroundColor: 0x020617,
-    points: 10, maxDistance: 22, spacing: 16, showDots: true,
+  network: {
+    fullScreen: { enable: false },
+    background: { color: { value: 'transparent' } },
+    fpsLimit: 60,
+    detectRetina: true,
+    particles: {
+      number: { value: 70, density: { enable: true } },
+      color: { value: '#34d399' },
+      shape: { type: 'circle' },
+      opacity: { value: 0.7 },
+      size: { value: { min: 2, max: 4 } },
+      links: { enable: true, distance: 130, color: '#10b981', opacity: 0.45, width: 1 },
+      move: { enable: true, speed: 1.1, direction: 'none', random: true, outModes: { default: 'out' } },
+    },
+    interactivity: {
+      detectsOn: 'canvas',
+      events: { onHover: { enable: true, mode: 'repulse' }, onClick: { enable: true, mode: 'push' } },
+      modes: { repulse: { distance: 90, duration: 0.4 }, push: { quantity: 3 } },
+    },
   },
-  fog: {
-    mouseControls: true, touchControls: true, gyroControls: false,
-    minHeight: 200, minWidth: 200,
-    speed: 1.1,
-    highlightColor: 0x10b981, midtoneColor: 0x0ea5e9, lowlightColor: 0x1e293b, baseColor: 0x020617,
+  flow: {
+    fullScreen: { enable: false },
+    background: { color: { value: 'transparent' } },
+    fpsLimit: 60,
+    detectRetina: true,
+    particles: {
+      number: { value: 60, density: { enable: true } },
+      color: { value: ['#10b981', '#0ea5e9', '#a7f3d0'] },
+      shape: { type: 'circle' },
+      opacity: { value: 0.5, animation: { enable: true, speed: 1, sync: false } },
+      size: { value: { min: 4, max: 12 }, animation: { enable: true, speed: 3, sync: false } },
+      move: { enable: true, speed: 1.6, direction: 'top', random: true, straight: false, outModes: { default: 'out' } },
+    },
+    interactivity: {
+      detectsOn: 'canvas',
+      events: { onHover: { enable: true, mode: 'attract' }, onClick: { enable: true, mode: 'push' } },
+      modes: { attract: { distance: 200, duration: 0.5, speed: 4 }, push: { quantity: 2 } },
+    },
   },
 }
 
@@ -106,13 +145,13 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
   const [ripples, setRipples] = useState<{ id: number; x: number; y: number }[]>([])
   const rippleIdRef = useRef(0)
   // WHY: Hiệu ứng nền đang chọn — đọc từ localStorage (giữ lựa chọn trước đó), mặc
-  // định WAVES (sóng ánh sáng emerald, đẹp với tông hiện tại).
+  // định 'lights' (quả cầu sáng trôi — hiệu ứng ánh sáng phù hợp tông emerald).
   const [bgEffect, setBgEffect] = useState<BgEffect>(() => {
     try {
       const s = localStorage.getItem('sd-login-bg-effect')
-      if (s === 'waves' || s === 'net' || s === 'fog') return s
+      if (s === 'lights' || s === 'network' || s === 'flow') return s
     } catch {}
-    return 'waves'
+    return 'lights'
   })
 
   // WHY: Reset trạng thái lỗi/thông báo mỗi khi chuyển chế độ — tránh lỗi cũ hiện
@@ -127,10 +166,11 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
   // Không cần validate quá chặt — Supabase tự validate lại ở server.
   const isValidEmail = (e: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)
 
-  // WHY: Click TRỰC TIẾP vào nền (không phải form/nút) → tạo vòng sáng nổ tại vị trí
-  // chuột — hiệu ứng "chuột tác động lên nền". Vòng tự xóa sau 950ms (animation xong).
+  // WHY: Click vào NỀN (gồm cả canvas tsParticles — child của .login-bg) → tạo vòng
+  // sáng nổ tại vị trí chuột; click vào form/card (ngoài .login-bg) thì không. Dùng
+  // closest thay vì so sánh target để bắt cả click trên canvas. Vòng tự xóa sau 950ms.
   const handleBgClick = (e: React.MouseEvent) => {
-    if (e.target !== e.currentTarget) return
+    if (!(e.target as HTMLElement).closest?.('.login-bg')) return
     const rect = bgRef.current?.getBoundingClientRect()
     if (!rect) return
     const id = ++rippleIdRef.current
@@ -138,29 +178,11 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
     setTimeout(() => setRipples(r => r.filter(p => p.id !== id)), 950)
   }
 
-  // WHY: Nền động ánh sáng Vanta.js (repo nhiều sao) — khởi tạo lại mỗi khi đổi
-  // effect (bgEffect trong deps). Chạy LIÊN TỤC (có ánh sáng kể cả khi không di
-  // chuột) + mouseControls phản ứng chuột. Dynamic import → chỉ tải three.js khi
-  // hiện màn hình login; destroy() khi đổi effect/unmount để giải phóng GPU.
-  useEffect(() => {
-    let vanta: { destroy: () => void } | null = null
-    let cancelled = false
-    ;(async () => {
-      try {
-        const THREE = await import('three')
-        const mod = await import(EFFECT_MODULES[bgEffect])
-        if (cancelled || !bgRef.current) return
-        vanta = mod.default({ el: bgRef.current, THREE, ...EFFECT_OPTIONS[bgEffect] })
-      } catch {}
-    })()
-    return () => { cancelled = true; vanta?.destroy() }
-  }, [bgEffect])
-
-  // WHY: Vòng qua waves → net → fog khi bấm nút hiệu ứng — persist lựa chọn để lần
-  // mở sau giữ nguyên hiệu ứng user đã chọn.
+  // WHY: Vòng qua lights → network → flow khi bấm nút hiệu ứng — persist lựa chọn
+  // để lần mở sau giữ nguyên hiệu ứng user đã chọn.
   const cycleBgEffect = () => {
     setBgEffect(prev => {
-      const next: BgEffect = prev === 'waves' ? 'net' : prev === 'net' ? 'fog' : 'waves'
+      const next: BgEffect = prev === 'lights' ? 'network' : prev === 'network' ? 'flow' : 'lights'
       try { localStorage.setItem('sd-login-bg-effect', next) } catch {}
       return next
     })
@@ -244,10 +266,19 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
         style={{ opacity: passwordFocused ? 1 : 0 }}
       />
 
-      {/* WHY: Nền động ánh sáng Vanta.js (FOG aurora) — Vanta tự vẽ canvas vào đây,
-          chạy liên tục + phản ứng chuột. Canvas pointer-events-none (CSS) để click
-          xuyên xuống lớp nền tạo vòng sáng nổ. Gradient CSS bên dưới là fallback. */}
+      {/* WHY: Nền động ánh sáng tsParticles (repo nhiều sao, canvas 2D ổn định) —
+          canvas vẽ hạt sáng chạy liên tục + tương tác chuột (hover/click). Canvas giữ
+          pointer-events để nhận tương tác; click nền vẫn nổ vòng sáng qua handleBgClick. */}
       <div ref={bgRef} className="login-bg" onClick={handleBgClick}>
+        {/* WHY: Particles — ParticlesProvider nạp engine slim (links, grab, repulse,
+            push...) 1 lần; đổi bgEffect → options mới được áp lại trên cùng canvas. */}
+        <ParticlesProvider init={async engine => { await loadSlim(engine) }}>
+          <Particles
+            id="login-particles"
+            className="absolute inset-0"
+            options={BG_PRESETS[bgEffect]}
+          />
+        </ParticlesProvider>
         {/* WHY: Vòng sáng nổ tại vị trí click nền — vị trí tuyệt đối theo tọa độ click. */}
         {ripples.map(r => (
           <div key={r.id} className="login-ripple" style={{ left: r.x, top: r.y }} />
