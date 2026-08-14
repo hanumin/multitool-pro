@@ -11,6 +11,9 @@ interface LoginScreenProps {
   // WHY: rememberMe quyết định session có tồn tại qua lần mở app sau hay không
   // (xem logic duy trì đăng nhập bên dưới) — App cần biết để lưu flag + cài idle timeout.
   onAuthenticated: (session: Session, rememberMe: boolean) => void
+  // WHY: Version hiển thị dưới footer login — lấy từ App (đã đọc từ Tauri) để không
+  // phải duplicate logic lấy version trong LoginScreen.
+  appVersion?: string
 }
 
 // WHY: Cổng quản lý tài khoản của hệ sinh thái — mở bằng trình duyệt ngoài khi user
@@ -42,7 +45,7 @@ const openExternal = async (url: string) => {
 // WHY: Màn hình đăng nhập dùng Supabase Auth CHUNG của hệ sinh thái — tài khoản do
 // trang luongphamhanhnguyen.com quản lý, mọi app (MultiTool Pro, web tiếng Anh...)
 // đăng nhập chung 1 pool users. Chỉ giữ chế độ login + quên mật khẩu (ẩn đăng ký).
-export default function LoginScreen({ onAuthenticated }: LoginScreenProps) {
+export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreenProps) {
   const [mode, setMode] = useState<AuthMode>('login')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -133,7 +136,9 @@ export default function LoginScreen({ onAuthenticated }: LoginScreenProps) {
         <div className="absolute -bottom-32 -right-32 w-96 h-96 bg-sky-500/10 rounded-full blur-3xl" />
       </div>
 
-      <div className="relative z-10 w-full max-w-3xl mx-6 flex flex-col lg:flex-row items-center gap-10 lg:gap-14">
+      {/* WHY: max-w-7xl để layout trải đều 2 bên (cửa sổ desktop rộng) — không còn
+          khoảng trống thừa 2 bên như max-w-3xl trước đây. */}
+      <div className="relative z-10 w-full max-w-7xl mx-6 flex flex-col lg:flex-row items-center gap-10 lg:gap-16">
         {/* WHY: Panel giới thiệu bên trái — logo, mô tả và danh sách chức năng chính.
             Ẩn trên màn hình hẹp (lg:flex), hiện đầy đủ trên cửa sổ desktop. */}
         <div className="hidden lg:flex flex-col flex-1 min-w-0">
@@ -143,7 +148,9 @@ export default function LoginScreen({ onAuthenticated }: LoginScreenProps) {
             </div>
             <div>
               <h1 className="text-2xl font-bold text-white tracking-tight">MultiTool Pro</h1>
-              <p className="text-xs text-slate-400 mt-0.5">Hệ thống Quản trị & Dịch vụ Multi-App Nội bộ</p>
+              {/* WHY: "Phần mềm" (không phải "Hệ thống") — đây là phần mềm desktop,
+                  không phải trang web (yêu cầu đổi label). */}
+              <p className="text-xs text-slate-400 mt-0.5">Phần mềm Quản trị & Dịch vụ Multi-App Nội bộ</p>
             </div>
           </div>
 
@@ -153,7 +160,7 @@ export default function LoginScreen({ onAuthenticated }: LoginScreenProps) {
           </p>
 
           {/* WHY: Grid 2 cột liệt kê tính năng — mỗi mục icon + tiêu đề + mô tả ngắn. */}
-          <div className="grid grid-cols-2 gap-x-6 gap-y-4">
+          <div className="grid grid-cols-2 xl:grid-cols-3 gap-x-8 gap-y-5">
             {FEATURES.map(f => (
               <div key={f.title} className="flex items-start gap-3">
                 <span className="w-9 h-9 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-lg shrink-0">
@@ -285,18 +292,23 @@ export default function LoginScreen({ onAuthenticated }: LoginScreenProps) {
           </div>
 
           {/* WHY: Label footer — nhấn vào mở trang quản lý tài khoản hệ thống bằng
-              trình duyệt ngoài (yêu cầu: thay text cũ + mở tab mới). */}
+              trình duyệt ngoài. Cụm domain GIỮ NGUYÊN style như label (không đậm,
+              không gạch chân, không màu) nhưng vẫn click mở trang (yêu cầu). */}
           <button
             type="button"
             onClick={() => openExternal(ACCOUNT_PORTAL_URL)}
             className="w-full text-center text-[10px] text-slate-500 hover:text-emerald-300 transition-colors bg-transparent border-0 cursor-pointer mt-5 leading-relaxed"
             title={`Mở ${ACCOUNT_PORTAL_URL} trong trình duyệt`}
           >
-            Đăng nhập bằng tài khoản của hệ thống{' '}
-            <span className="text-emerald-400 font-medium underline decoration-emerald-400/40 underline-offset-2">
-              luongphamhanhnguyen.com
-            </span>
+            Đăng nhập bằng tài khoản của hệ thống luongphamhanhnguyen.com
           </button>
+
+          {/* WHY: Version hiển thị dưới footer login — nhỏ, mờ, không tương tác. */}
+          {appVersion && (
+            <div className="text-center text-[10px] text-slate-600 mt-1.5 select-none">
+              MultiTool Pro v{appVersion}
+            </div>
+          )}
         </div>
       </div>
     </div>

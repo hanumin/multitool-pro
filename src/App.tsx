@@ -1083,7 +1083,7 @@ function App() {
   }
 
   if (!authSession) {
-    return <LoginScreen onAuthenticated={(session, rememberMe) => {
+    return <LoginScreen appVersion={appVersion} onAuthenticated={(session, rememberMe) => {
       // WHY: Lưu lựa chọn "Duy trì đăng nhập" vào localStorage — App đọc lại lần mở
       // sau để quyết định giữ/xóa session và cài idle timeout (xem 2 effect trên).
       localStorage.setItem('sd-remember-me', rememberMe ? 'true' : 'false')
