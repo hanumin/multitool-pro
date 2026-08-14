@@ -365,9 +365,10 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
       <div className="relative w-full max-w-6xl mx-6 flex flex-col lg:flex-row items-center gap-10 lg:gap-14">
         {/* WHY: Panel giới thiệu bên trái — logo, mô tả và danh sách chức năng chính.
             Ẩn trên màn hình hẹp (lg:flex), hiện đầy đủ trên cửa sổ desktop.
-            lg:self-start → tiêu đề MultiTool Pro thẳng hàng ngang với cạnh TRÊN của
-            frame đăng nhập (yêu cầu: chỉnh label trái cao lên). */}
-        <div className="hidden lg:flex flex-col flex-1 min-w-0 lg:self-start">
+            lg:self-stretch + justify-between → panel trải ĐÚNG bằng chiều cao frame
+            đăng nhập (các mục dàn đều: logo trên, mô tả giữa, tính năng dưới), tiêu đề
+            MultiTool Pro vẫn thẳng hàng cạnh trên của card. */}
+        <div className="hidden lg:flex flex-col flex-1 min-w-0 lg:self-stretch lg:justify-between">
           <div className="flex items-center gap-3 mb-5">
             <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-emerald-400 to-emerald-600 flex items-center justify-center text-2xl shadow-lg shadow-emerald-500/25 shrink-0">
               🛠️
@@ -387,7 +388,7 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
 
           {/* WHY: Grid 2 cột liệt kê tính năng — mỗi mục icon + tiêu đề + mô tả ngắn.
               (2 cột để vừa với chiều rộng panel khi giảm container xuống max-w-6xl). */}
-          <div className="grid grid-cols-2 gap-x-8 gap-y-5">
+          <div className="grid grid-cols-2 gap-x-8 gap-y-7">
             {FEATURES.map(f => (
               <div key={f.title} className="flex items-start gap-3">
                 <span className="w-9 h-9 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-lg shrink-0">
