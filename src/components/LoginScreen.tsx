@@ -96,6 +96,9 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
   // nhớ phiên). Nếu user bỏ tick → session chỉ sống trong 1 phiên: tự đăng xuất khi
   // đóng app và sau 30 phút không hoạt động (App.tsx chịu trách nhiệm enforce).
   const [rememberMe, setRememberMe] = useState(true)
+  // WHY: Giảm sáng nền khi nhập mật khẩu (chống nhìn lén shoulder-surfing) — bật khi
+  // ô mật khẩu được focus, tắt khi blur; card đăng nhập vẫn sáng trên lớp phủ tối.
+  const [passwordFocused, setPasswordFocused] = useState(false)
   const busyRef = useRef(false)
   // WHY: Nền động ánh sáng tương tác chuột — bgRef để cập nhật trực tiếp biến CSS
   // --mx/--my khi mousemove (không re-render), ripples = vòng sáng nổ khi click nền.
@@ -233,6 +236,14 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
 
   return (
     <div className="h-screen flex items-center justify-center bg-slate-950 select-none overflow-hidden relative">
+      {/* WHY: Lớp giảm sáng khi nhập mật khẩu — phủ tối + blur nhẹ toàn màn hình
+          ngoại trừ card đăng nhập (card z-20 nằm trên overlay z-[15]). opacity chuyển
+          mượt 300ms khi focus/blur; pointer-events-none để không chặn thao tác gõ. */}
+      <div
+        className="fixed inset-0 z-[15] bg-slate-950/65 backdrop-blur-[2px] pointer-events-none transition-opacity duration-300"
+        style={{ opacity: passwordFocused ? 1 : 0 }}
+      />
+
       {/* WHY: Nền động ánh sáng Vanta.js (FOG aurora) — Vanta tự vẽ canvas vào đây,
           chạy liên tục + phản ứng chuột. Canvas pointer-events-none (CSS) để click
           xuyên xuống lớp nền tạo vòng sáng nổ. Gradient CSS bên dưới là fallback. */}
@@ -275,7 +286,10 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
 
       {/* WHY: max-w-6xl — trải 2 bên vừa phải (giảm nhẹ so với max-w-7xl) + card login
           rộng hơn (max-w-md) theo yêu cầu cân đối lại bố cục. */}
-      <div className="relative z-10 w-full max-w-6xl mx-6 flex flex-col lg:flex-row items-center gap-10 lg:gap-14">
+      {/* WHY: Container content — bỏ z-index (không tạo stacking context) để card
+          (z-20) vượt lên trên lớp giảm sáng (z-[15]) ở cấp trang; panel trái không
+          z-index nên nằm dưới lớp giảm sáng (bị tối khi nhập mật khẩu). */}
+      <div className="relative w-full max-w-6xl mx-6 flex flex-col lg:flex-row items-center gap-10 lg:gap-14">
         {/* WHY: Panel giới thiệu bên trái — logo, mô tả và danh sách chức năng chính.
             Ẩn trên màn hình hẹp (lg:flex), hiện đầy đủ trên cửa sổ desktop.
             lg:self-start → tiêu đề MultiTool Pro thẳng hàng ngang với cạnh TRÊN của
@@ -315,8 +329,9 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
           </div>
         </div>
 
-        {/* Card đăng nhập — max-w-md (448px) rộng hơn trước (384px) theo yêu cầu */}
-        <div className="w-full max-w-md shrink-0">
+        {/* Card đăng nhập — max-w-md (448px) rộng hơn trước (384px) theo yêu cầu.
+            relative z-20 → card luôn SÁNG trên lớp giảm sáng khi nhập mật khẩu. */}
+        <div className="relative z-20 w-full max-w-md shrink-0">
           {/* Logo mobile (chỉ hiện khi panel trái bị ẩn) */}
           <div className="flex flex-col items-center mb-6 lg:hidden">
             <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-emerald-400 to-emerald-600 flex items-center justify-center text-2xl shadow-lg shadow-emerald-500/25 mb-3">
@@ -350,6 +365,8 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
                     type="password"
                     value={password}
                     onChange={e => setPassword(e.target.value)}
+                    onFocus={() => setPasswordFocused(true)}
+                    onBlur={() => setPasswordFocused(false)}
                     placeholder="••••••••"
                     className={inputCls}
                     required
