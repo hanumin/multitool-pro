@@ -57,6 +57,11 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
   // đóng app và sau 30 phút không hoạt động (App.tsx chịu trách nhiệm enforce).
   const [rememberMe, setRememberMe] = useState(true)
   const busyRef = useRef(false)
+  // WHY: Nền động ánh sáng tương tác chuột — bgRef để cập nhật trực tiếp biến CSS
+  // --mx/--my khi mousemove (không re-render), ripples = vòng sáng nổ khi click nền.
+  const bgRef = useRef<HTMLDivElement>(null)
+  const [ripples, setRipples] = useState<{ id: number; x: number; y: number }[]>([])
+  const rippleIdRef = useRef(0)
 
   // WHY: Reset trạng thái lỗi/thông báo mỗi khi chuyển chế độ — tránh lỗi cũ hiện
   // khi user chuyển qua lại login/forgot.
@@ -69,6 +74,38 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
   // WHY: Validate email nhanh phía client trước khi gọi API (tránh request thừa).
   // Không cần validate quá chặt — Supabase tự validate lại ở server.
   const isValidEmail = (e: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)
+
+  // WHY: Cập nhật --mx/--my (px tính từ tâm) lên DOM mỗi khi chuột di chuyển — các
+  // quả cầu sáng dịch theo chuột qua CSS translate. Không setState → không re-render
+  // 60 lần/giây, animation chạy hoàn toàn trên GPU/CSS.
+  const handleBgMouseMove = (e: React.MouseEvent) => {
+    const el = bgRef.current
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    el.style.setProperty('--mx', `${e.clientX - rect.left - rect.width / 2}px`)
+    el.style.setProperty('--my', `${e.clientY - rect.top - rect.height / 2}px`)
+  }
+
+  // WHY: Click TRỰC TIẾP vào nền (không phải form/nút) → tạo vòng sáng nổ tại vị trí
+  // chuột — hiệu ứng "chuột tác động lên nền". Vòng tự xóa sau 950ms (animation xong).
+  const handleBgClick = (e: React.MouseEvent) => {
+    if (e.target !== e.currentTarget) return
+    const rect = bgRef.current?.getBoundingClientRect()
+    if (!rect) return
+    const id = ++rippleIdRef.current
+    setRipples(r => [...r, { id, x: e.clientX - rect.left, y: e.clientY - rect.top }])
+    setTimeout(() => setRipples(r => r.filter(p => p.id !== id)), 950)
+  }
+
+  // WHY: Thu gọn xuống khay hệ thống — logic giống nút thu gọn sau khi đăng nhập
+  // (App.minimizeToTray): ẩn cửa sổ, app VẪN chạy trong khay/taskbar, không tắt app.
+  // Dynamic import để không crash khi chạy browser dev (không có Tauri API).
+  const minimizeToTray = async () => {
+    try {
+      const { getCurrentWindow } = await import('@tauri-apps/api/window')
+      await getCurrentWindow().hide()
+    } catch {}
+  }
 
   // WHY: Handler chính theo mode — login (signInWithPassword) / forgot
   // (resetPasswordForEmail). busyRef chống double-click.
@@ -130,15 +167,61 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
 
   return (
     <div className="h-screen flex items-center justify-center bg-slate-950 select-none overflow-hidden relative">
-      {/* WHY: Hiệu ứng nền gradient mờ phía sau — tạo cảm giác hiện đại, không chói */}
-      <div className="absolute inset-0 pointer-events-none">
-        <div className="absolute -top-32 -left-32 w-96 h-96 bg-emerald-500/10 rounded-full blur-3xl" />
-        <div className="absolute -bottom-32 -right-32 w-96 h-96 bg-sky-500/10 rounded-full blur-3xl" />
+      {/* WHY: Nền động dạng ánh sáng — aurora xoay chậm + 2 quả cầu sáng DI CHUYỂN
+          THEO CHUỘT (--mx/--my) + vòng sáng nổ khi click nền. Các phần tử con đều
+          pointer-events-none để click/form ở trên không bị chặn. */}
+      <div
+        ref={bgRef}
+        className="login-bg"
+        onMouseMove={handleBgMouseMove}
+        onClick={handleBgClick}
+      >
+        <div className="login-aurora" />
+        {/* WHY: Quả cầu emerald — dịch theo chuột 0.35x (lớp gần), centered bằng
+            transform translate(-50%,-50%) + parallax bằng translate property. */}
+        <div
+          className="login-orb login-orb--follow"
+          style={{
+            width: 480, height: 480, left: '50%', top: '42%',
+            transform: 'translate(-50%, -50%)',
+            translate: 'calc(var(--mx, 0px) * 0.35) calc(var(--my, 0px) * 0.35)',
+            background: 'radial-gradient(circle, rgba(16,185,129,0.35), transparent 65%)',
+          }}
+        />
+        {/* WHY: Quả cầu xanh dương — dịch 0.2x (lớp xa, lag hơn) tạo chiều sâu parallax. */}
+        <div
+          className="login-orb login-orb--follow-delayed"
+          style={{
+            width: 360, height: 360, left: '50%', top: '58%',
+            transform: 'translate(-50%, -50%)',
+            translate: 'calc(var(--mx, 0px) * 0.2) calc(var(--my, 0px) * 0.2)',
+            background: 'radial-gradient(circle, rgba(14,165,233,0.3), transparent 65%)',
+          }}
+        />
+        {/* WHY: Vòng sáng nổ tại vị trí click nền — vị trí tuyệt đối theo tọa độ click. */}
+        {ripples.map(r => (
+          <div key={r.id} className="login-ripple" style={{ left: r.x, top: r.y }} />
+        ))}
       </div>
 
-      {/* WHY: max-w-7xl để layout trải đều 2 bên (cửa sổ desktop rộng) — không còn
-          khoảng trống thừa 2 bên như max-w-3xl trước đây. */}
-      <div className="relative z-10 w-full max-w-7xl mx-6 flex flex-col lg:flex-row items-center gap-10 lg:gap-16">
+      {/* WHY: Nút thu gọn xuống khay ở GÓC PHẢI TRÊN — nhấn vào ẩn cửa sổ nhưng app
+          vẫn chạy trong khay hệ thống (không tắt app), giống logic sau khi đăng nhập. */}
+      <button
+        type="button"
+        onClick={minimizeToTray}
+        className="absolute top-3 right-3 z-20 w-9 h-9 rounded-xl border flex items-center justify-center transition-all cursor-pointer hover:bg-white/10 active:scale-95 group"
+        style={{ borderColor: 'rgba(148,163,184,0.25)', color: '#94a3b8' }}
+        title="Thu gọn xuống khay hệ thống (không tắt ứng dụng)"
+        aria-label="Thu gọn xuống khay hệ thống"
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v9m0 0l-4-4m4 4l4-4M5 21h14" />
+        </svg>
+      </button>
+
+      {/* WHY: max-w-6xl — trải 2 bên vừa phải (giảm nhẹ so với max-w-7xl) + card login
+          rộng hơn (max-w-md) theo yêu cầu cân đối lại bố cục. */}
+      <div className="relative z-10 w-full max-w-6xl mx-6 flex flex-col lg:flex-row items-center gap-10 lg:gap-14">
         {/* WHY: Panel giới thiệu bên trái — logo, mô tả và danh sách chức năng chính.
             Ẩn trên màn hình hẹp (lg:flex), hiện đầy đủ trên cửa sổ desktop. */}
         <div className="hidden lg:flex flex-col flex-1 min-w-0">
@@ -159,8 +242,9 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
             từ máy chủ, tunnel, cơ sở dữ liệu đến giám sát máy in, âm thanh và nhật ký.
           </p>
 
-          {/* WHY: Grid 2 cột liệt kê tính năng — mỗi mục icon + tiêu đề + mô tả ngắn. */}
-          <div className="grid grid-cols-2 xl:grid-cols-3 gap-x-8 gap-y-5">
+          {/* WHY: Grid 2 cột liệt kê tính năng — mỗi mục icon + tiêu đề + mô tả ngắn.
+              (2 cột để vừa với chiều rộng panel khi giảm container xuống max-w-6xl). */}
+          <div className="grid grid-cols-2 gap-x-8 gap-y-5">
             {FEATURES.map(f => (
               <div key={f.title} className="flex items-start gap-3">
                 <span className="w-9 h-9 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-lg shrink-0">
@@ -175,8 +259,8 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
           </div>
         </div>
 
-        {/* Card đăng nhập */}
-        <div className="w-full max-w-sm shrink-0">
+        {/* Card đăng nhập — max-w-md (448px) rộng hơn trước (384px) theo yêu cầu */}
+        <div className="w-full max-w-md shrink-0">
           {/* Logo mobile (chỉ hiện khi panel trái bị ẩn) */}
           <div className="flex flex-col items-center mb-6 lg:hidden">
             <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-emerald-400 to-emerald-600 flex items-center justify-center text-2xl shadow-lg shadow-emerald-500/25 mb-3">

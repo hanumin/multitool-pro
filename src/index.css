@@ -1587,3 +1587,80 @@ gần như vô hình trên theme sáng và quá nhạt trên theme tối). */
     scroll-behavior: auto !important;
   }
 }
+
+/* ============================================================
+   Login screen — animated light background (mouse-reactive)
+   WHY: Nền động dạng ánh sáng cho màn hình đăng nhập. Biến
+   --mx/--my (px tính từ tâm cửa sổ) được JS cập nhật khi chuột
+   di chuyển → lớp sáng dịch theo chuột (parallax); click nền
+   tạo vòng sáng nổ. Dùng property translate/scale (tách khỏi
+   transform) để vừa chạy animation vừa nhận translate từ biến.
+   ============================================================ */
+.login-bg {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  background:
+    radial-gradient(ellipse 80% 60% at 50% 40%, rgba(16, 185, 129, 0.09), transparent 60%),
+    radial-gradient(ellipse 60% 50% at 72% 18%, rgba(14, 165, 233, 0.07), transparent 60%),
+    #020617;
+}
+
+.login-aurora {
+  position: absolute;
+  inset: -25%;
+  background: conic-gradient(from 0deg at 50% 50%,
+    transparent 0deg, rgba(16, 185, 129, 0.06) 60deg,
+    transparent 120deg, rgba(14, 165, 233, 0.06) 200deg,
+    transparent 280deg, rgba(139, 92, 246, 0.05) 330deg, transparent 360deg);
+  filter: blur(60px);
+  animation: login-aurora-spin 45s linear infinite;
+  pointer-events: none;
+}
+
+@keyframes login-aurora-spin {
+  to { transform: rotate(360deg); }
+}
+
+.login-orb {
+  position: absolute;
+  border-radius: 9999px;
+  filter: blur(70px);
+  pointer-events: none;
+}
+
+/* WHY: transition trên translate (không phải transform) → khi chuột dừng, quả cầu
+   sáng lướt mềm về vị trí tương ứng; animation chỉ chạy opacity/scale để không
+   xung đột với translate. */
+.login-orb--follow {
+  transition: translate 0.9s cubic-bezier(0.16, 1, 0.3, 1);
+  animation: login-orb-pulse 6s ease-in-out infinite;
+}
+
+.login-orb--follow-delayed {
+  transition: translate 1.5s cubic-bezier(0.16, 1, 0.3, 1);
+  animation: login-orb-pulse 8s ease-in-out infinite reverse;
+}
+
+@keyframes login-orb-pulse {
+  0%, 100% { opacity: 0.5; scale: 1; }
+  50% { opacity: 0.75; scale: 1.08; }
+}
+
+/* WHY: Vòng sáng nổ khi click vào nền — nở to + mờ dần rồi biến mất (~0.9s). */
+.login-ripple {
+  position: absolute;
+  border-radius: 9999px;
+  border: 1px solid rgba(16, 185, 129, 0.55);
+  background: radial-gradient(circle, rgba(16, 185, 129, 0.22), transparent 70%);
+  width: 24px;
+  height: 24px;
+  transform: translate(-50%, -50%);
+  animation: login-ripple-expand 0.9s ease-out forwards;
+  pointer-events: none;
+}
+
+@keyframes login-ripple-expand {
+  from { width: 24px; height: 24px; opacity: 0.9; }
+  to { width: 280px; height: 280px; opacity: 0; }
+}
