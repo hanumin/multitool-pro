@@ -1589,12 +1589,11 @@ gần như vô hình trên theme sáng và quá nhạt trên theme tối). */
 }
 
 /* ============================================================
-   Login screen — animated light background (mouse-reactive)
-   WHY: Nền động dạng ánh sáng cho màn hình đăng nhập. Biến
-   --mx/--my (px tính từ tâm cửa sổ) được JS cập nhật khi chuột
-   di chuyển → lớp sáng dịch theo chuột (parallax); click nền
-   tạo vòng sáng nổ. Dùng property translate/scale (tách khỏi
-   transform) để vừa chạy animation vừa nhận translate từ biến.
+   Login screen — animated light background (Vanta.js FOG)
+   WHY: Lớp nền chứa canvas của Vanta.js (effect FOG — aurora sáng
+   liên tục, phản ứng chuột). Gradient CSS bên dưới là fallback nếu
+   WebGL không khả dụng. Canvas pointer-events:none để click xuyên
+   xuống lớp nền → tạo vòng sáng nổ (ripple).
    ============================================================ */
 .login-bg {
   position: absolute;
@@ -1606,45 +1605,8 @@ gần như vô hình trên theme sáng và quá nhạt trên theme tối). */
     #020617;
 }
 
-.login-aurora {
-  position: absolute;
-  inset: -25%;
-  background: conic-gradient(from 0deg at 50% 50%,
-    transparent 0deg, rgba(16, 185, 129, 0.06) 60deg,
-    transparent 120deg, rgba(14, 165, 233, 0.06) 200deg,
-    transparent 280deg, rgba(139, 92, 246, 0.05) 330deg, transparent 360deg);
-  filter: blur(60px);
-  animation: login-aurora-spin 45s linear infinite;
+.login-bg canvas {
   pointer-events: none;
-}
-
-@keyframes login-aurora-spin {
-  to { transform: rotate(360deg); }
-}
-
-.login-orb {
-  position: absolute;
-  border-radius: 9999px;
-  filter: blur(70px);
-  pointer-events: none;
-}
-
-/* WHY: transition trên translate (không phải transform) → khi chuột dừng, quả cầu
-   sáng lướt mềm về vị trí tương ứng; animation chỉ chạy opacity/scale để không
-   xung đột với translate. */
-.login-orb--follow {
-  transition: translate 0.9s cubic-bezier(0.16, 1, 0.3, 1);
-  animation: login-orb-pulse 6s ease-in-out infinite;
-}
-
-.login-orb--follow-delayed {
-  transition: translate 1.5s cubic-bezier(0.16, 1, 0.3, 1);
-  animation: login-orb-pulse 8s ease-in-out infinite reverse;
-}
-
-@keyframes login-orb-pulse {
-  0%, 100% { opacity: 0.5; scale: 1; }
-  50% { opacity: 0.75; scale: 1.08; }
 }
 
 /* WHY: Vòng sáng nổ khi click vào nền — nở to + mờ dần rồi biến mất (~0.9s). */

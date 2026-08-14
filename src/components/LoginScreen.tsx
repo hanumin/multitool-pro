@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { getSupabase } from '../lib/supabase'
 import type { Session } from '@supabase/supabase-js'
 
@@ -75,17 +75,6 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
   // Không cần validate quá chặt — Supabase tự validate lại ở server.
   const isValidEmail = (e: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)
 
-  // WHY: Cập nhật --mx/--my (px tính từ tâm) lên DOM mỗi khi chuột di chuyển — các
-  // quả cầu sáng dịch theo chuột qua CSS translate. Không setState → không re-render
-  // 60 lần/giây, animation chạy hoàn toàn trên GPU/CSS.
-  const handleBgMouseMove = (e: React.MouseEvent) => {
-    const el = bgRef.current
-    if (!el) return
-    const rect = el.getBoundingClientRect()
-    el.style.setProperty('--mx', `${e.clientX - rect.left - rect.width / 2}px`)
-    el.style.setProperty('--my', `${e.clientY - rect.top - rect.height / 2}px`)
-  }
-
   // WHY: Click TRỰC TIẾP vào nền (không phải form/nút) → tạo vòng sáng nổ tại vị trí
   // chuột — hiệu ứng "chuột tác động lên nền". Vòng tự xóa sau 950ms (animation xong).
   const handleBgClick = (e: React.MouseEvent) => {
@@ -96,6 +85,38 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
     setRipples(r => [...r, { id, x: e.clientX - rect.left, y: e.clientY - rect.top }])
     setTimeout(() => setRipples(r => r.filter(p => p.id !== id)), 950)
   }
+
+  // WHY: Nền động ánh sáng từ thư viện Vanta.js (github.com/tengbao/vanta — repo
+  // nhiều sao, chuyên nền 3D). Effect FOG = aurora sáng LIÊN TỤC (có ánh sáng kể cả
+  // khi không di chuột) + mouseControls tự phản ứng chuột. Màu giữ tông emerald/sky/
+  // slate hiện tại. Dynamic import → chỉ tải three.js khi hiện màn hình login; hủy
+  // effect khi unmount (sau khi đăng nhập) để giải phóng GPU.
+  useEffect(() => {
+    let vanta: { destroy: () => void } | null = null
+    let cancelled = false
+    ;(async () => {
+      try {
+        const THREE = await import('three')
+        const mod = await import('vanta/dist/vanta.fog.min')
+        if (cancelled || !bgRef.current) return
+        vanta = mod.default({
+          el: bgRef.current,
+          THREE,
+          mouseControls: true,
+          touchControls: true,
+          gyroControls: false,
+          minHeight: 200,
+          minWidth: 200,
+          speed: 1.1,
+          highlightColor: 0x10b981, // emerald-500
+          midtoneColor: 0x0ea5e9,   // sky-500
+          lowlightColor: 0x1e293b,  // slate-800
+          baseColor: 0x020617,      // slate-950
+        })
+      } catch {}
+    })()
+    return () => { cancelled = true; vanta?.destroy() }
+  }, [])
 
   // WHY: Thu gọn xuống khay hệ thống — logic giống nút thu gọn sau khi đăng nhập
   // (App.minimizeToTray): ẩn cửa sổ, app VẪN chạy trong khay/taskbar, không tắt app.
@@ -167,55 +188,27 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
 
   return (
     <div className="h-screen flex items-center justify-center bg-slate-950 select-none overflow-hidden relative">
-      {/* WHY: Nền động dạng ánh sáng — aurora xoay chậm + 2 quả cầu sáng DI CHUYỂN
-          THEO CHUỘT (--mx/--my) + vòng sáng nổ khi click nền. Các phần tử con đều
-          pointer-events-none để click/form ở trên không bị chặn. */}
-      <div
-        ref={bgRef}
-        className="login-bg"
-        onMouseMove={handleBgMouseMove}
-        onClick={handleBgClick}
-      >
-        <div className="login-aurora" />
-        {/* WHY: Quả cầu emerald — dịch theo chuột 0.35x (lớp gần), centered bằng
-            transform translate(-50%,-50%) + parallax bằng translate property. */}
-        <div
-          className="login-orb login-orb--follow"
-          style={{
-            width: 480, height: 480, left: '50%', top: '42%',
-            transform: 'translate(-50%, -50%)',
-            translate: 'calc(var(--mx, 0px) * 0.35) calc(var(--my, 0px) * 0.35)',
-            background: 'radial-gradient(circle, rgba(16,185,129,0.35), transparent 65%)',
-          }}
-        />
-        {/* WHY: Quả cầu xanh dương — dịch 0.2x (lớp xa, lag hơn) tạo chiều sâu parallax. */}
-        <div
-          className="login-orb login-orb--follow-delayed"
-          style={{
-            width: 360, height: 360, left: '50%', top: '58%',
-            transform: 'translate(-50%, -50%)',
-            translate: 'calc(var(--mx, 0px) * 0.2) calc(var(--my, 0px) * 0.2)',
-            background: 'radial-gradient(circle, rgba(14,165,233,0.3), transparent 65%)',
-          }}
-        />
+      {/* WHY: Nền động ánh sáng Vanta.js (FOG aurora) — Vanta tự vẽ canvas vào đây,
+          chạy liên tục + phản ứng chuột. Canvas pointer-events-none (CSS) để click
+          xuyên xuống lớp nền tạo vòng sáng nổ. Gradient CSS bên dưới là fallback. */}
+      <div ref={bgRef} className="login-bg" onClick={handleBgClick}>
         {/* WHY: Vòng sáng nổ tại vị trí click nền — vị trí tuyệt đối theo tọa độ click. */}
         {ripples.map(r => (
           <div key={r.id} className="login-ripple" style={{ left: r.x, top: r.y }} />
         ))}
       </div>
 
-      {/* WHY: Nút thu gọn xuống khay ở GÓC PHẢI TRÊN — nhấn vào ẩn cửa sổ nhưng app
-          vẫn chạy trong khay hệ thống (không tắt app), giống logic sau khi đăng nhập. */}
+      {/* WHY: Nút X đỏ hình vuông ở GÓC PHẢI TRÊN — nhấn vào ẩn cửa sổ nhưng app vẫn
+          chạy trong khay hệ thống (không tắt app), giống logic sau khi đăng nhập. */}
       <button
         type="button"
         onClick={minimizeToTray}
-        className="absolute top-3 right-3 z-20 w-9 h-9 rounded-xl border flex items-center justify-center transition-all cursor-pointer hover:bg-white/10 active:scale-95 group"
-        style={{ borderColor: 'rgba(148,163,184,0.25)', color: '#94a3b8' }}
+        className="absolute top-3 right-3 z-20 w-9 h-9 bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white flex items-center justify-center transition-all cursor-pointer shadow-lg shadow-rose-950/40"
         title="Thu gọn xuống khay hệ thống (không tắt ứng dụng)"
         aria-label="Thu gọn xuống khay hệ thống"
       >
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
-          <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v9m0 0l-4-4m4 4l4-4M5 21h14" />
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
         </svg>
       </button>
 
@@ -223,8 +216,10 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
           rộng hơn (max-w-md) theo yêu cầu cân đối lại bố cục. */}
       <div className="relative z-10 w-full max-w-6xl mx-6 flex flex-col lg:flex-row items-center gap-10 lg:gap-14">
         {/* WHY: Panel giới thiệu bên trái — logo, mô tả và danh sách chức năng chính.
-            Ẩn trên màn hình hẹp (lg:flex), hiện đầy đủ trên cửa sổ desktop. */}
-        <div className="hidden lg:flex flex-col flex-1 min-w-0">
+            Ẩn trên màn hình hẹp (lg:flex), hiện đầy đủ trên cửa sổ desktop.
+            lg:self-start → tiêu đề MultiTool Pro thẳng hàng ngang với cạnh TRÊN của
+            frame đăng nhập (yêu cầu: chỉnh label trái cao lên). */}
+        <div className="hidden lg:flex flex-col flex-1 min-w-0 lg:self-start">
           <div className="flex items-center gap-3 mb-5">
             <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-emerald-400 to-emerald-600 flex items-center justify-center text-2xl shadow-lg shadow-emerald-500/25 shrink-0">
               🛠️
@@ -238,7 +233,7 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
           </div>
 
           <p className="text-[13px] leading-relaxed text-slate-300 mb-6">
-            Một bảng điều khiển duy nhất để quản lý toàn bộ dịch vụ trong hệ sinh thái —
+            Một phần mềm duy nhất để quản lý toàn bộ dịch vụ trong hệ sinh thái —
             từ máy chủ, tunnel, cơ sở dữ liệu đến giám sát máy in, âm thanh và nhật ký.
           </p>
 
@@ -271,7 +266,7 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
 
           <div className="rounded-2xl border border-slate-800 bg-slate-900/90 backdrop-blur p-6 shadow-2xl">
             <h2 className="text-base font-bold text-white mb-1">Đăng nhập</h2>
-            <p className="text-[11px] text-slate-400 mb-5">Vui lòng đăng nhập để sử dụng bảng điều khiển</p>
+            <p className="text-[11px] text-slate-400 mb-5">Vui lòng đăng nhập để sử dụng phần mềm</p>
 
             <form onSubmit={handleSubmit} className="space-y-3.5">
               <div>
