@@ -1,7 +1,7 @@
-// WHY: Vanta.js (github.com/tengbao/vanta) không ship kèm types — khai báo module
-// thủ công cho effect FOG (nền động dạng ánh sáng aurora) dùng ở màn hình login.
-// Giữ API lỏng (options là Record) vì mỗi effect nhận bộ options riêng.
-declare module 'vanta/dist/vanta.fog.min' {
+// WHY: Vanta.js (github.com/tengbao/vanta) không ship kèm types — khai báo wildcard
+// cho mọi effect (fog/waves/net...) dùng ở màn hình login. Giữ API lỏng (options là
+// Record) vì mỗi effect nhận bộ options riêng (màu, tốc độ, hình dạng...).
+declare module 'vanta/dist/*' {
   interface VantaEffect {
     destroy: () => void
   }
@@ -10,8 +10,8 @@ declare module 'vanta/dist/vanta.fog.min' {
     THREE: unknown
     [key: string]: unknown
   }
-  // WHY: FOG là factory function của effect — nhận el (element chứa canvas) + THREE
-  // instance + options màu/tốc độ, trả về object có destroy() để dọn khi unmount.
-  function FOG(options: VantaOptions): VantaEffect
-  export default FOG
+  // WHY: Hàm factory của effect — nhận el (element chứa canvas) + THREE instance +
+  // options (màu/tốc độ...), trả về object có destroy() để dọn khi đổi effect/unmount.
+  function vantaEffect(options: VantaOptions): VantaEffect
+  export default vantaEffect
 }

@@ -20,6 +20,46 @@ interface LoginScreenProps {
 // bấm vào dòng label dưới form đăng nhập (yêu cầu: nhấn vào mở tab mới trang này).
 const ACCOUNT_PORTAL_URL = 'https://luongphamhanhnguyen.com'
 
+// WHY: 3 hiệu ứng nền Vanta để user so sánh — WAVES (sóng ánh sáng), NET (mạng lưới
+// điểm), FOG (aurora). Chọn qua nút nhỏ góc phải dưới, lựa chọn persist localStorage.
+type BgEffect = 'waves' | 'net' | 'fog'
+
+const BG_EFFECT_LABELS: Record<BgEffect, string> = {
+  waves: 'WAVES — sóng ánh sáng',
+  net: 'NET — mạng lưới điểm',
+  fog: 'FOG — aurora',
+}
+
+// WHY: Đường dẫn module dynamic-import theo effect (mỗi effect 1 file riêng trong
+// node_modules/vanta/dist — Vite tách chunk riêng, chỉ tải khi chọn).
+const EFFECT_MODULES: Record<BgEffect, string> = {
+  waves: 'vanta/dist/vanta.waves.min',
+  net: 'vanta/dist/vanta.net.min',
+  fog: 'vanta/dist/vanta.fog.min',
+}
+
+// WHY: Options riêng từng effect — đều giữ tông emerald/sky/slate của app. Vanta chỉ
+// đọc các key nó hiểu (setOptions bỏ qua key lạ) nên dùng chung object an toàn.
+const EFFECT_OPTIONS: Record<BgEffect, Record<string, unknown>> = {
+  waves: {
+    mouseControls: true, touchControls: true, gyroControls: false,
+    minHeight: 200, minWidth: 200,
+    color: 0x10b981, shininess: 30, waveHeight: 18, waveSpeed: 1.2, zoom: 0.9,
+  },
+  net: {
+    mouseControls: true, touchControls: true, gyroControls: false,
+    minHeight: 200, minWidth: 200,
+    color: 0x34d399, backgroundColor: 0x020617,
+    points: 10, maxDistance: 22, spacing: 16, showDots: true,
+  },
+  fog: {
+    mouseControls: true, touchControls: true, gyroControls: false,
+    minHeight: 200, minWidth: 200,
+    speed: 1.1,
+    highlightColor: 0x10b981, midtoneColor: 0x0ea5e9, lowlightColor: 0x1e293b, baseColor: 0x020617,
+  },
+}
+
 // WHY: Danh sách chức năng chính hiển thị ở panel giới thiệu bên trái màn hình login
 // (đồng bộ với các module thực tế trong app — Máy chủ/Máy in/Âm thanh/Database...).
 const FEATURES = [
@@ -62,6 +102,15 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
   const bgRef = useRef<HTMLDivElement>(null)
   const [ripples, setRipples] = useState<{ id: number; x: number; y: number }[]>([])
   const rippleIdRef = useRef(0)
+  // WHY: Hiệu ứng nền đang chọn — đọc từ localStorage (giữ lựa chọn trước đó), mặc
+  // định WAVES (sóng ánh sáng emerald, đẹp với tông hiện tại).
+  const [bgEffect, setBgEffect] = useState<BgEffect>(() => {
+    try {
+      const s = localStorage.getItem('sd-login-bg-effect')
+      if (s === 'waves' || s === 'net' || s === 'fog') return s
+    } catch {}
+    return 'waves'
+  })
 
   // WHY: Reset trạng thái lỗi/thông báo mỗi khi chuyển chế độ — tránh lỗi cũ hiện
   // khi user chuyển qua lại login/forgot.
@@ -86,37 +135,33 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
     setTimeout(() => setRipples(r => r.filter(p => p.id !== id)), 950)
   }
 
-  // WHY: Nền động ánh sáng từ thư viện Vanta.js (github.com/tengbao/vanta — repo
-  // nhiều sao, chuyên nền 3D). Effect FOG = aurora sáng LIÊN TỤC (có ánh sáng kể cả
-  // khi không di chuột) + mouseControls tự phản ứng chuột. Màu giữ tông emerald/sky/
-  // slate hiện tại. Dynamic import → chỉ tải three.js khi hiện màn hình login; hủy
-  // effect khi unmount (sau khi đăng nhập) để giải phóng GPU.
+  // WHY: Nền động ánh sáng Vanta.js (repo nhiều sao) — khởi tạo lại mỗi khi đổi
+  // effect (bgEffect trong deps). Chạy LIÊN TỤC (có ánh sáng kể cả khi không di
+  // chuột) + mouseControls phản ứng chuột. Dynamic import → chỉ tải three.js khi
+  // hiện màn hình login; destroy() khi đổi effect/unmount để giải phóng GPU.
   useEffect(() => {
     let vanta: { destroy: () => void } | null = null
     let cancelled = false
     ;(async () => {
       try {
         const THREE = await import('three')
-        const mod = await import('vanta/dist/vanta.fog.min')
+        const mod = await import(EFFECT_MODULES[bgEffect])
         if (cancelled || !bgRef.current) return
-        vanta = mod.default({
-          el: bgRef.current,
-          THREE,
-          mouseControls: true,
-          touchControls: true,
-          gyroControls: false,
-          minHeight: 200,
-          minWidth: 200,
-          speed: 1.1,
-          highlightColor: 0x10b981, // emerald-500
-          midtoneColor: 0x0ea5e9,   // sky-500
-          lowlightColor: 0x1e293b,  // slate-800
-          baseColor: 0x020617,      // slate-950
-        })
+        vanta = mod.default({ el: bgRef.current, THREE, ...EFFECT_OPTIONS[bgEffect] })
       } catch {}
     })()
     return () => { cancelled = true; vanta?.destroy() }
-  }, [])
+  }, [bgEffect])
+
+  // WHY: Vòng qua waves → net → fog khi bấm nút hiệu ứng — persist lựa chọn để lần
+  // mở sau giữ nguyên hiệu ứng user đã chọn.
+  const cycleBgEffect = () => {
+    setBgEffect(prev => {
+      const next: BgEffect = prev === 'waves' ? 'net' : prev === 'net' ? 'fog' : 'waves'
+      try { localStorage.setItem('sd-login-bg-effect', next) } catch {}
+      return next
+    })
+  }
 
   // WHY: Thu gọn xuống khay hệ thống — logic giống nút thu gọn sau khi đăng nhập
   // (App.minimizeToTray): ẩn cửa sổ, app VẪN chạy trong khay/taskbar, không tắt app.
@@ -209,6 +254,22 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
       >
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5}>
           <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+        </svg>
+      </button>
+
+      {/* WHY: Nút đổi hiệu ứng nền ở GÓC PHẢI DƯỚI — bấm vòng qua WAVES/NET/FOG để
+          user tự so sánh cái nào đẹp hơn; tooltip hiện tên effect đang dùng. */}
+      <button
+        type="button"
+        onClick={cycleBgEffect}
+        className="absolute bottom-3 right-3 z-20 w-8 h-8 rounded-full border flex items-center justify-center transition-all cursor-pointer hover:bg-white/10 active:scale-95"
+        style={{ borderColor: 'rgba(148,163,184,0.25)', color: '#94a3b8' }}
+        title={`Đổi hiệu ứng nền (đang: ${BG_EFFECT_LABELS[bgEffect]}) — bấm để so sánh WAVES / NET / FOG`}
+        aria-label="Đổi hiệu ứng nền"
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v2m0 14v2m9-9h-2M5 12H3m14.5-6.5L16 6.6M8 17.4l-1.5 1.5m11 0L16 17.4M8 6.6L6.5 5.1" />
+          <circle cx="12" cy="12" r="3" />
         </svg>
       </button>
 
