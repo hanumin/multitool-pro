@@ -172,10 +172,20 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
 
   // WHY: Trạng thái kéo tay — dragRef lưu tọa độ chuột lúc bắt đầu + vị trí cửa sổ +
   // scaleFactor (đổi CSS px → physical px, đúng trên màn hình scale 125%/150%);
-  // latestMouseRef + rafRef cho vòng rAF áp vị trí mỗi frame (tránh flood IPC).
+  // latestMouseRef + rafRef cho vòng rAF áp vị trí mỗi frame (tránh flood IPC);
+  // dragMovedRef đánh dấu đã KÉO thật (phân biệt click vs drag), suppressClickRef
+  // nuốt click sau khi kéo (tránh vòng sáng nổ khi thả chuột sau khi kéo cửa sổ).
   const dragRef = useRef<{ startX: number; startY: number; winX: number; winY: number; scale: number } | null>(null)
   const latestMouseRef = useRef<{ x: number; y: number } | null>(null)
   const rafRef = useRef<number | null>(null)
+  const dragMovedRef = useRef(false)
+  const suppressClickRef = useRef(false)
+
+  // WHY: Chặn kéo bắt đầu từ phần tử tương tác (input/button/label...) — chuột trái
+  // trên form phải gõ/chọn bình thường; chỉ kéo khi bấm vào vùng KHÔNG tương tác
+  // (nền, panel tính năng, khoảng trống card...).
+  const isInteractive = (el: HTMLElement | null): boolean =>
+    !!el?.closest('input, button, textarea, select, label, a, [role="button"], [contenteditable="true"]')
 
   // WHY: Vòng lặp kéo — đọc vị trí chuột mới nhất, setPosition cửa sổ theo delta
   // (clientX là CSS px, nhân scaleFactor ra physical px). Chạy liên tục đến khi thả.
@@ -190,30 +200,38 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
     rafRef.current = requestAnimationFrame(applyDragLoop)
   }
 
-  // WHY: Bắt đầu kéo bằng chuột PHẢI (button===2). KHÔNG dùng startDragging vì Windows
-  // chỉ kéo được khi giữ chuột TRÁI (cơ chế WM_NCLBUTTONDOWN) — chuột phải bị bỏ qua.
-  // Hướng khác: tự kéo bằng setPosition (permission allow-set-position đã có) nên hoạt
-  // động với chuột phải, không cần titlebar. Lấy vị trí cửa sổ + scale rồi chạy rAF.
+  // WHY: Bắt đầu kéo bằng chuột TRÁI (button===0, đúng chuẩn Windows) — nhưng chỉ khi
+  // bấm vào vùng không tương tác (xem isInteractive). Tự kéo bằng setPosition (không
+  // dùng startDragging vì nó chiếm luôn click trên toàn vùng) — lấy vị trí cửa sổ +
+  // scaleFactor rồi chạy vòng rAF. Bỏ logic chuột phải theo yêu cầu.
   const handleRootMouseDown = (e: React.MouseEvent) => {
-    if (e.button !== 2) return
+    if (e.button !== 0) return
+    if (isInteractive(e.target as HTMLElement)) return
     e.preventDefault()
     const win = getCurrentWindow()
     Promise.all([win.outerPosition(), win.scaleFactor()])
       .then(([pos, scale]) => {
         dragRef.current = { startX: e.clientX, startY: e.clientY, winX: pos.x, winY: pos.y, scale }
         latestMouseRef.current = { x: e.clientX, y: e.clientY }
+        dragMovedRef.current = false
         if (rafRef.current == null) rafRef.current = requestAnimationFrame(applyDragLoop)
       })
       .catch(() => {})
   }
 
-  // WHY: Cập nhật vị trí chuột mới nhất trong lúc kéo — rAF loop đọc lại mỗi frame.
+  // WHY: Cập nhật vị trí chuột mới nhất trong lúc kéo; đánh dấu dragMoved khi di
+  // chuyển quá 4px (phân biệt click thường vs kéo thật).
   const handleRootMouseMove = (e: React.MouseEvent) => {
-    if (dragRef.current) latestMouseRef.current = { x: e.clientX, y: e.clientY }
+    if (!dragRef.current) return
+    latestMouseRef.current = { x: e.clientX, y: e.clientY }
+    const d = dragRef.current
+    if (!dragMovedRef.current && Math.abs(e.clientX - d.startX) + Math.abs(e.clientY - d.startY) > 4) {
+      dragMovedRef.current = true
+    }
   }
 
-  // WHY: Kết thúc kéo khi thả chuột phải hoặc chuột rời cửa sổ — dừng rAF, xóa trạng
-  // thái để lần kéo sau bắt đầu sạch.
+  // WHY: Kết thúc kéo khi thả chuột hoặc chuột rời cửa sổ — dừng rAF, xóa trạng thái.
+  // Nếu đã KÉO thật thì set suppressClick để click sau mouseup bị nuốt (không nổ ripple).
   const stopDrag = () => {
     if (rafRef.current != null) {
       cancelAnimationFrame(rafRef.current)
@@ -221,6 +239,8 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
     }
     dragRef.current = null
     latestMouseRef.current = null
+    if (dragMovedRef.current) suppressClickRef.current = true
+    dragMovedRef.current = false
   }
 
   // WHY: Dọn rAF khi unmount (đã đăng nhập) — tránh loop chạy trên component chết.
@@ -231,7 +251,12 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
   // WHY: Click vào NỀN (gồm cả canvas tsParticles — child của .login-bg) → tạo vòng
   // sáng nổ tại vị trí chuột; click vào form/card (ngoài .login-bg) thì không. Dùng
   // closest thay vì so sánh target để bắt cả click trên canvas. Vòng tự xóa sau 950ms.
+  // suppressClick nuốt click ngay sau khi KÉO cửa sổ (thả chuột không nổ vòng sáng).
   const handleBgClick = (e: React.MouseEvent) => {
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false
+      return
+    }
     if (!(e.target as HTMLElement).closest?.('.login-bg')) return
     const rect = bgRef.current?.getBoundingClientRect()
     if (!rect) return
@@ -321,13 +346,13 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
   return (
     <div
       className="h-screen flex items-center justify-center bg-slate-950 select-none overflow-hidden relative"
-      // WHY: Kéo tay bằng chuột phải — mousedown khởi tạo, mousemove cập nhật vị trí,
-      // mouseup/mouseleave kết thúc; onContextMenu chặn menu chuột phải mặc định.
+      // WHY: Kéo tay bằng chuột TRÁI (đúng chuẩn Windows) — mousedown khởi tạo (chỉ ở
+      // vùng không tương tác, xem isInteractive), mousemove cập nhật vị trí,
+      // mouseup/mouseleave kết thúc. Bỏ hoàn toàn logic chuột phải theo yêu cầu.
       onMouseDown={handleRootMouseDown}
       onMouseMove={handleRootMouseMove}
       onMouseUp={stopDrag}
       onMouseLeave={stopDrag}
-      onContextMenu={e => e.preventDefault()}
     >
       {/* WHY: Lớp giảm sáng khi nhập mật khẩu — phủ tối + blur nhẹ toàn màn hình
           ngoại trừ card đăng nhập (card z-20 nằm trên overlay z-[15]). opacity chuyển
