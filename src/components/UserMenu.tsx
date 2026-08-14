@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { getSupabase } from '../lib/supabase'
-import { emojiFallbackFor, safeAvatarBg, resolveCodexUrl, DEFAULT_AVATAR_BG } from '../lib/avatars'
+import {
+  emojiFallbackFor,
+  safeAvatarBg,
+  resolveAvatarValue,
+  MASCOTS_DIR_DEFAULT,
+  DEFAULT_AVATAR_BG,
+} from '../lib/avatars'
 import AvatarPickerDialog from './AvatarPickerDialog'
 import type { User } from '@supabase/supabase-js'
 
@@ -32,27 +38,19 @@ function resolveDisplayName(profile: any, user: User | null): string {
 }
 
 // WHY: Avatar ưu tiên URL thật (user_profiles.avatar_url / user_metadata.avatar_url
-// từ OAuth), rồi avatar_emoji (nếu user đặt emoji HOẶC linh vật Codex dạng
-// `codex:<slug>` — resolve sang URL R2, HOẶC URL/đường dẫn tự nhập), cuối cùng là
-// dịch vụ avatar công cộng DiceBear (initials — cộng đồng dev dùng phổ biến, miễn
-// phí, không cần key) với nền emerald đồng bộ theme app.
-function resolveAvatar(profile: any, user: User | null, displayName: string): { type: 'url' | 'emoji' | 'dicebear'; value: string } {
+// từ OAuth), rồi avatar_emoji (resolve qua resolveAvatarValue: linh vật Codex
+// `codex:<slug>` → R2, URL/đường dẫn tự nhập, tên file ảnh dog.png → linh vật CỤC BỘ
+// qua backend, còn lại là emoji), cuối cùng là dịch vụ avatar công cộng DiceBear
+// (initials — miễn phí, không cần key) với nền emerald đồng bộ theme app.
+function resolveAvatar(profile: any, user: User | null, displayName: string, mascotsDir: string): { type: 'url' | 'emoji' | 'dicebear'; value: string } {
   const meta = user?.user_metadata ?? {}
   const url = profile?.avatar_url || meta.avatar_url
   if (typeof url === 'string' && url.trim().startsWith('http')) return { type: 'url', value: url.trim() }
   const emoji = profile?.avatar_emoji
   if (typeof emoji === 'string' && emoji.trim()) {
-    const trimmed = emoji.trim()
-    const lower = trimmed.toLowerCase()
-    // WHY: `codex:<slug>` — linh vật Codex Pets tự-host trên R2 (dữ liệu thật từ
-    // user_profiles của english-topics). Không hiện chuỗi thô nữa, resolve sang ảnh.
-    if (lower.startsWith('codex:')) {
-      const r2 = resolveCodexUrl(trimmed)
-      if (r2) return { type: 'url', value: r2 }
-    }
-    // WHY: URL / đường dẫn tự nhập (custom avatar) cũng hiện bằng <img>.
-    if (lower.startsWith('http') || trimmed.startsWith('/')) return { type: 'url', value: trimmed }
-    return { type: 'emoji', value: trimmed }
+    const resolved = resolveAvatarValue(emoji.trim(), mascotsDir)
+    if (resolved.isImage) return { type: 'url', value: resolved.src }
+    return { type: 'emoji', value: resolved.emoji }
   }
   // WHY: DiceBear initials — seed = 2 chữ cái đầu (tối đa 2 từ), nền emerald 3 tông.
   const words = displayName.trim().split(/\s+/).filter(Boolean)
@@ -84,6 +82,9 @@ export default function UserMenu({ collapsed, user, onSignOut }: UserMenuProps) 
   // WHY: Màu nền avatar lấy từ user_settings.settings_json.avatar_bg (bên web cũng
   // đọc/ghi cột này) — dùng cho vòng tròn emoji; safeAvatarBg chặn class lạ từ DB.
   const [avatarBg, setAvatarBg] = useState<string>(DEFAULT_AVATAR_BG)
+  // WHY: Thư mục linh vật CỤC BỘ lấy từ settings_json.mascots_dir (được popup đổi
+  // avatar lưu) — dùng để render avatar dạng tên file (dog.png) qua backend.
+  const [mascotsDir, setMascotsDir] = useState<string>(MASCOTS_DIR_DEFAULT)
   // WHY: Popup đổi avatar — mở khi bấm vào vòng avatar hoặc mục "Đổi avatar" trong
   // dropdown. Popup tự lưu về Supabase rồi báo qua onSaved để refresh sidebar.
   const [pickerOpen, setPickerOpen] = useState(false)
@@ -104,21 +105,25 @@ export default function UserMenu({ collapsed, user, onSignOut }: UserMenuProps) 
             .eq('id', user.id)
             .maybeSingle()
           p = data ?? null
-          // WHY: Lấy màu nền avatar (best-effort) — settings_json.avatar_bg.
+          // WHY: Lấy màu nền avatar + thư mục linh vật cục bộ (best-effort) từ
+          // settings_json — nếu bảng không tồn tại/RLS chặn thì giữ mặc định.
           try {
             const { data: settings } = await supabase
               .from('user_settings')
               .select('settings_json')
               .eq('user_id', user.id)
               .maybeSingle()
-            const bg = (settings?.settings_json as Record<string, unknown> | null)?.avatar_bg
+            const sjson = settings?.settings_json as Record<string, unknown> | null
+            const bg = sjson?.avatar_bg
             if (typeof bg === 'string') setAvatarBg(safeAvatarBg(bg))
+            const dir = sjson?.mascots_dir
+            if (typeof dir === 'string' && dir.trim()) setMascotsDir(dir.trim())
           } catch {
-            // WHY: user_settings không tồn tại/RLS chặn → giữ màu mặc định.
+            // WHY: user_settings không tồn tại/RLS chặn → giữ mặc định.
           }
         }
         const displayName = resolveDisplayName(p, user)
-        const avatar = resolveAvatar(p, user, displayName)
+        const avatar = resolveAvatar(p, user, displayName, mascotsDir)
         setProfile({
           displayName,
           email: user?.email ?? '',
@@ -314,6 +319,7 @@ export default function UserMenu({ collapsed, user, onSignOut }: UserMenuProps) 
         userId={user?.id ?? ''}
         currentValue={profile?.rawAvatar ?? null}
         currentBg={avatarBg}
+        currentMascotsDir={mascotsDir}
         onClose={() => setPickerOpen(false)}
         onSaved={() => { setPickerOpen(false); loadProfile() }}
       />

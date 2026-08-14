@@ -5,9 +5,13 @@ import {
   AVATAR_EMOJIS,
   AVATAR_BG_OPTIONS,
   safeAvatarBg,
-  resolveCodexUrl,
   emojiFallbackFor,
+  isImageFileName,
+  localMascotUrl,
+  resolveAvatarValue,
   fetchCodexPets,
+  fetchLocalMascots,
+  MASCOTS_DIR_DEFAULT,
 } from '../lib/avatars'
 
 // WHY: Popup đổi avatar — tham khảo AvatarPickerDialog của web english-topics:
@@ -23,18 +27,21 @@ interface AvatarPickerDialogProps {
   currentValue: string | null
   // WHY: Class màu nền hiện tại (settings_json.avatar_bg) — null nếu chưa từng lưu.
   currentBg: string | null
+  // WHY: Thư mục linh vật CỤC BỘ hiện tại (settings_json.mascots_dir) — dùng để khởi
+  // tạo ô nhập thư mục trong tab "Cục bộ" và preview tên file ảnh.
+  currentMascotsDir: string | null
   onClose: () => void
   // WHY: Báo UserMenu biết đã lưu xong (kèm giá trị mới) để refresh avatar sidebar.
   onSaved: (value: string, bg: string) => void
 }
 
-type PickerTab = 'codex' | 'emoji' | 'url'
+type PickerTab = 'codex' | 'emoji' | 'local' | 'url'
 
 // WHY: Giá trị mặc định khi chưa có avatar — biểu tượng 👤 như bên web.
 const DEFAULT_AVATAR = '👤'
 
 export default function AvatarPickerDialog({
-  open, userId, currentValue, currentBg, onClose, onSaved,
+  open, userId, currentValue, currentBg, currentMascotsDir, onClose, onSaved,
 }: AvatarPickerDialogProps) {
   const [tab, setTab] = useState<PickerTab>('codex')
   // WHY: Giá trị avatar đang chọn (chưa lưu) — khởi tạo từ avatar hiện tại.
@@ -47,10 +54,27 @@ export default function AvatarPickerDialog({
   // WHY: Các slug linh vật bị 404 khi tải ảnh (bị gỡ khỏi upstream) → fallback emoji
   // thay vì hiện khung vỡ (giống logic getEmojiFallback bên web).
   const [brokenPets, setBrokenPets] = useState<Set<string>>(new Set())
+  // WHY: Thư mục linh vật CỤC BỘ — mặc định public/mascots của web english-topics; user
+  // có thể sửa đường dẫn máy thật. Lưu vào settings_json.mascots_dir khi save.
+  const [mascotsDir, setMascotsDir] = useState<string>(() => currentMascotsDir || MASCOTS_DIR_DEFAULT)
+  const [localMascots, setLocalMascots] = useState<string[]>([])
+  const [localLoading, setLocalLoading] = useState(false)
+  // WHY: File ảnh cục bộ bị lỗi khi tải (file hỏng/thiếu) → fallback emoji theo tên file.
+  const [localBroken, setLocalBroken] = useState<Set<string>>(new Set())
   const [previewError, setPreviewError] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
+
+  // WHY: (Re)load danh sách linh vật cục bộ từ thư mục (qua backend) — dùng cho cả lúc
+  // mở popup lẫn nút "Làm mới" khi user sửa đường dẫn thư mục.
+  const reloadLocal = async (dir: string) => {
+    setLocalLoading(true)
+    setLocalBroken(new Set())
+    const files = await fetchLocalMascots(dir)
+    setLocalMascots(files)
+    setLocalLoading(false)
+  }
 
   // WHY: Mỗi lần mở popup — reset trạng thái + nạp lại danh sách Codex Pets (fresh),
   // đồng thời đồng bộ lựa chọn với giá trị hiện tại (user có thể đã đổi từ nơi khác).
@@ -58,10 +82,13 @@ export default function AvatarPickerDialog({
     if (!open) return
     setValue(currentValue || DEFAULT_AVATAR)
     setBg(safeAvatarBg(currentBg))
+    const dir = currentMascotsDir || MASCOTS_DIR_DEFAULT
+    setMascotsDir(dir)
     setPreviewError(false)
     setError(null)
     setSaved(false)
     setBrokenPets(new Set())
+    setLocalBroken(new Set())
     let disposed = false
     ;(async () => {
       setLoadingPets(true)
@@ -72,6 +99,9 @@ export default function AvatarPickerDialog({
       setPetsError(list.length === 0)
       setLoadingPets(false)
     })()
+    // WHY: Load luôn danh sách linh vật cục bộ (thư mục mặc định/đã lưu) — tránh
+    // chờ user bấm "Làm mới" mới thấy có gì trong tab.
+    reloadLocal(dir)
     return () => { disposed = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open])
@@ -86,20 +116,12 @@ export default function AvatarPickerDialog({
 
   const trimmedValue = value.trim()
 
-  // WHY: Xác định loại hiển thị preview: ảnh (codex:/URL/đường dẫn) hay emoji.
-  const isImage = (() => {
-    const v = trimmedValue.toLowerCase()
-    return v.startsWith('codex:') || v.startsWith('http') || v.startsWith('/')
-  })()
-
-  // WHY: URL hiển thị preview nếu là ảnh — codex → R2 idle.webp, URL → dùng trực tiếp.
-  const previewSrc = (() => {
-    if (!trimmedValue) return ''
-    const lower = trimmedValue.toLowerCase()
-    if (lower.startsWith('codex:')) return resolveCodexUrl(trimmedValue)
-    if (lower.startsWith('http') || trimmedValue.startsWith('/')) return trimmedValue
-    return ''
-  })()
+  // WHY: Resolve giá trị avatar đang chọn sang cách hiển thị (ảnh/emoji) — xử lý cả
+  // codex:<slug> → R2, URL/path tự nhập, tên file ảnh (dog.png) → linh vật CỤC BỘ qua
+  // backend, còn lại là emoji (dùng chung resolveAvatarValue với sidebar).
+  const resolvedPreview = resolveAvatarValue(trimmedValue, mascotsDir)
+  const isImage = resolvedPreview.isImage && !!resolvedPreview.src
+  const previewSrc = resolvedPreview.src
 
   // WHY: Tên hiển thị dưới preview — slug pet có tên thật (Firefly...), URL lấy phần
   // cuối đường dẫn, emoji hiện thẳng emoji (giống web activeAvatarName).
@@ -119,6 +141,7 @@ export default function AvatarPickerDialog({
   const previewGroup = (() => {
     const v = trimmedValue.toLowerCase()
     if (v.startsWith('codex:')) return 'Thư viện Codex Pets'
+    if (isImageFileName(trimmedValue)) return 'Linh vật Cục bộ'
     if ((AVATAR_EMOJIS as readonly string[]).includes(trimmedValue)) return 'Bộ sưu tập Emojis'
     if (v.startsWith('http') || trimmedValue.startsWith('/')) return 'URL ảnh tùy chỉnh'
     return 'Emoji'
@@ -146,7 +169,13 @@ export default function AvatarPickerDialog({
           .select('settings_json')
           .eq('user_id', userId)
           .maybeSingle()
-        const nextJson = { ...((settings?.settings_json as Record<string, unknown>) || {}), avatar_bg: bg }
+        const nextJson = {
+          ...((settings?.settings_json as Record<string, unknown>) || {}),
+          avatar_bg: bg,
+          // WHY: Lưu thư mục linh vật cục bộ cùng avatar — sidebar cần biết thư mục
+          // để render avatar dạng tên file (dog.png) khi mở lại app.
+          mascots_dir: mascotsDir,
+        }
         if (settings) {
           await supabase
             .from('user_settings')
@@ -235,7 +264,7 @@ export default function AvatarPickerDialog({
                     onError={() => setPreviewError(true)}
                   />
                 ) : (
-                  <span className="select-none">{emojiFallbackFor(previewError ? value : trimmedValue)}</span>
+                  <span className="select-none">{resolvedPreview.emoji}</span>
                 )}
               </div>
               <div className="text-center mt-2.5 w-full">
@@ -274,6 +303,7 @@ export default function AvatarPickerDialog({
             <div className="flex gap-1.5 p-1 rounded-xl shrink-0" style={{ background: 'rgba(255,255,255,0.04)' }}>
               {tabBtn('codex', 'Codex Pets', '🐾')}
               {tabBtn('emoji', 'Emojis', '😀')}
+              {tabBtn('local', 'Cục bộ', '🗂️')}
               {tabBtn('url', 'Tự nhập', '🔗')}
             </div>
 
@@ -347,6 +377,78 @@ export default function AvatarPickerDialog({
                       {emoji}
                     </button>
                   ))}
+                </div>
+              )}
+
+              {tab === 'local' && (
+                <div className="flex flex-col gap-2.5 min-h-40">
+                  {/* WHY: Ô nhập đường dẫn thư mục linh vật CỤC BỘ — mặc định public/
+                      mascots của web english-topics trên cùng máy; user sửa đường dẫn
+                      máy thật rồi bấm Làm mới (giống web chỉ đọc public/mascots). */}
+                  <div className="flex gap-2 shrink-0">
+                    <input
+                      type="text"
+                      value={mascotsDir}
+                      onChange={e => setMascotsDir(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter') reloadLocal(mascotsDir) }}
+                      placeholder="Đường dẫn thư mục linh vật (vd .../english-topics_v2_nextjs/public/mascots)"
+                      className="flex-1 min-w-0 px-3 py-2 text-[11px] rounded-lg border transition-all focus:outline-none focus:ring-2 bg-slate-800/60 border-slate-700 text-slate-100 placeholder-slate-500 focus:border-emerald-500 focus:ring-emerald-500/20"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => reloadLocal(mascotsDir)}
+                      className="px-3.5 py-2 text-[11px] font-semibold rounded-lg border cursor-pointer transition-colors hover:bg-white/5 shrink-0"
+                      style={{ color: 'var(--fg-secondary)', borderColor: 'var(--border)' }}
+                    >
+                      🔄 Làm mới
+                    </button>
+                  </div>
+
+                  {localLoading ? (
+                    <div className="flex-1 min-h-32 flex flex-col items-center justify-center gap-2 text-xs" style={{ color: 'var(--fg-dim)' }}>
+                      <span className="w-5 h-5 border-2 border-emerald-400/20 border-t-emerald-400 rounded-full animate-spin" />
+                      Đang đọc thư mục...
+                    </div>
+                  ) : localMascots.length === 0 ? (
+                    <div className="flex-1 min-h-32 flex flex-col items-center justify-center gap-1.5 text-xs text-center px-4" style={{ color: 'var(--fg-dim)' }}>
+                      <span className="text-xl">🗂️</span>
+                      Không tìm thấy linh vật nào trong thư mục.
+                      <span className="text-[10px] max-w-xs">Đưa file ảnh (png/jpg/gif/webp/svg) vào thư mục rồi bấm Làm mới.</span>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-4 sm:grid-cols-5 gap-2">
+                      {localMascots.map(file => {
+                        const selected = trimmedValue === file
+                        const broken = localBroken.has(file)
+                        return (
+                          <button
+                            type="button"
+                            key={file}
+                            onClick={() => { setValue(file); setPreviewError(false) }}
+                            title={file}
+                            className={`w-full aspect-square rounded-xl border-2 transition-all duration-150 cursor-pointer flex items-center justify-center overflow-hidden p-0.5 ${
+                              selected
+                                ? 'border-emerald-400 ring-2 ring-emerald-400/30'
+                                : 'border-transparent hover:border-white/20 hover:bg-white/5'
+                            }`}
+                          >
+                            {broken ? (
+                              <span className="text-2xl select-none">{emojiFallbackFor(file)}</span>
+                            ) : (
+                              <img
+                                src={localMascotUrl(mascotsDir, file)}
+                                alt={file}
+                                loading="lazy"
+                                className="w-full h-full object-contain"
+                                draggable={false}
+                                onError={() => setLocalBroken(prev => new Set(prev).add(file))}
+                              />
+                            )}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  )}
                 </div>
               )}
 

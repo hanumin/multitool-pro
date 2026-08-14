@@ -1,3 +1,5 @@
+import { API } from '../utils/apiFetch'
+
 // ============================================================================
 // AVATARS — hằng số + helper dùng chung cho avatar hệ sinh thái english-topics
 // ============================================================================
@@ -127,4 +129,66 @@ export async function fetchCodexPets(): Promise<{ slug: string; name: string }[]
     }
   }
   return []
+}
+
+// ---------------------------------------------------------------------------
+// LINH VẬT CỤC BỘ (tab "Cục bộ") — file ảnh trong thư mục public/mascots của web
+// english-topics trên CÙNG MÁY, đọc qua backend localhost:5050 (không CORS).
+// ---------------------------------------------------------------------------
+
+// WHY: Thư mục mặc định — public/mascots của web english-topics (nguồn chân lý giống
+// web). Đường dẫn máy thật nên user có thể sửa trong popup; lựa chọn được lưu vào
+// settings_json.mascots_dir để lần sau + sidebar render đúng.
+export const MASCOTS_DIR_DEFAULT =
+  'C:/Users/nguyenthanhdat_pc/Desktop/1_LAM_WEB_HOC_BE_MINH/english-topics_v2_nextjs/public/mascots'
+
+// WHY: Đuôi file ảnh được chấp nhận — đồng bộ với backend + web (png/jpg/jpeg/gif/webp/svg).
+const LOCAL_IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg']
+
+// WHY: Kiểm tra chuỗi có phải tên file ảnh (vd dog.png) không — dùng để phân biệt
+// "linh vật cục bộ" với emoji khi avatar_emoji lưu chỉ tên file (giống web).
+export function isImageFileName(v: string): boolean {
+  const lower = v.toLowerCase()
+  return LOCAL_IMAGE_EXTS.some(ext => lower.endsWith(ext))
+}
+
+// WHY: URL ảnh linh vật cục bộ qua backend (localhost:5050 — cùng origin webview nên
+// không dính CORS như fetch thẳng web). encodeURIComponent 2 tham số dir + file.
+export function localMascotUrl(dir: string, file: string): string {
+  return `${API}/mascots/local?dir=${encodeURIComponent(dir)}&file=${encodeURIComponent(file)}`
+}
+
+// WHY: Fetch danh sách file ảnh trong thư mục cục bộ (qua backend). Trả [] khi thư
+// mục không tồn tại / backend chưa chạy / có lỗi — popup hiện trạng thái trống.
+export async function fetchLocalMascots(dir: string): Promise<string[]> {
+  try {
+    const res = await fetch(`${API}/api/mascots/local?dir=${encodeURIComponent(dir)}`)
+    if (!res.ok) return []
+    const data = await res.json()
+    return Array.isArray(data) ? data.filter((f): f is string => typeof f === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+// WHY: Resolve 1 giá trị avatar bất kỳ → cách hiển thị (ảnh/emoji) — dùng chung cho
+// preview popup + sidebar. Thứ tự: codex:<slug> → R2; http/path → nguyên URL; tên
+// file ảnh (dog.png) → linh vật cục bộ qua backend; còn lại là emoji.
+export function resolveAvatarValue(
+  value: string,
+  mascotsDir: string,
+): { isImage: boolean; src: string; emoji: string } {
+  const trimmed = value.trim()
+  const lower = trimmed.toLowerCase()
+  if (lower.startsWith('codex:')) {
+    const r2 = resolveCodexUrl(trimmed)
+    if (r2) return { isImage: true, src: r2, emoji: emojiFallbackFor(trimmed) }
+  }
+  if (lower.startsWith('http') || trimmed.startsWith('/')) {
+    return { isImage: true, src: trimmed, emoji: emojiFallbackFor(trimmed) }
+  }
+  if (isImageFileName(trimmed)) {
+    return { isImage: true, src: localMascotUrl(mascotsDir, trimmed), emoji: emojiFallbackFor(trimmed) }
+  }
+  return { isImage: false, src: '', emoji: trimmed || '👤' }
 }

@@ -934,6 +934,40 @@ def api_delete_project(name):
     _bump_config_version()
     return jsonify({"status": "deleted", "name": name})
 
+
+@app.route("/api/mascots/local")
+# WHY: Liệt kê file ảnh trong thư mục linh vật CỤC BỘ — tương đương /api/mascots bên
+# web english-topics (đọc public/mascots) nhưng đọc TRỰC TIẾP trên máy (không cần
+# biết domain web, không dính CORS). dir truyền qua query vì đường dẫn máy thật phụ
+# thuộc từng máy — frontend hiển thị ô nhập để user sửa; validate thư mục tồn tại.
+def api_mascots_local():
+    dir_str = (request.args.get("dir", "") or "").strip()
+    p = Path(dir_str)
+    if not p.is_dir():
+        return jsonify([])
+    exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
+    try:
+        files = sorted(
+            f.name for f in p.iterdir()
+            if f.is_file() and f.suffix.lower() in exts
+        )
+        return jsonify(files)
+    except Exception:
+        return jsonify([])
+
+
+@app.route("/mascots/local")
+# WHY: Phục vụ ảnh linh vật cục bộ cho <img> — cùng origin localhost:5050 nên không
+# dính CORS. send_from_directory tự chặn path traversal; thêm kiểm tra tên file
+# không chứa dấu phân cách đường dẫn để chắc chắn chỉ đọc file trong thư mục được chỉ định.
+def mascots_local_file():
+    dir_str = (request.args.get("dir", "") or "").strip()
+    file = (request.args.get("file", "") or "").strip()
+    p = Path(dir_str)
+    if not p.is_dir() or not file or "/" in file or "\\" in file or file in (".", ".."):
+        return ("", 404)
+    return send_from_directory(str(p), file)
+
 # WHY: Log file có thể bị process con (node.exe) khóa → PermissionError.
 # Fallback: truncate nội dung (mode "w") thay vì xóa file → log không bị mất file handle.
 def _safe_unlink_log(lf):
