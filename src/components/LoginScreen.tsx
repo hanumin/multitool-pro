@@ -1,8 +1,9 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import Particles, { ParticlesProvider } from '@tsparticles/react'
 import { loadSlim } from '@tsparticles/slim'
 import type { ISourceOptions } from '@tsparticles/engine'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { PhysicalPosition } from '@tauri-apps/api/dpi'
 import { getSupabase } from '../lib/supabase'
 import type { Session } from '@supabase/supabase-js'
 
@@ -169,18 +170,63 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
   // Không cần validate quá chặt — Supabase tự validate lại ở server.
   const isValidEmail = (e: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)
 
-  // WHY: Nhấn GIỮ chuột phải ở BẤT KỲ ĐÂU trên màn hình login → kéo cửa sổ đi chỗ
-  // khác. Gọi getCurrentWindow().startDragging() ĐỒNG BỘ trong mousedown (Windows yêu
-  // cầu gọi ngay trong event handler, async sẽ fail) — module import tĩnh an toàn ở
-  // browser dev (chỉ CALLING mới cần Tauri runtime, đã try/catch). Permission
-  // core:window:allow-start-dragging đã thêm vào capabilities/default.json.
+  // WHY: Trạng thái kéo tay — dragRef lưu tọa độ chuột lúc bắt đầu + vị trí cửa sổ +
+  // scaleFactor (đổi CSS px → physical px, đúng trên màn hình scale 125%/150%);
+  // latestMouseRef + rafRef cho vòng rAF áp vị trí mỗi frame (tránh flood IPC).
+  const dragRef = useRef<{ startX: number; startY: number; winX: number; winY: number; scale: number } | null>(null)
+  const latestMouseRef = useRef<{ x: number; y: number } | null>(null)
+  const rafRef = useRef<number | null>(null)
+
+  // WHY: Vòng lặp kéo — đọc vị trí chuột mới nhất, setPosition cửa sổ theo delta
+  // (clientX là CSS px, nhân scaleFactor ra physical px). Chạy liên tục đến khi thả.
+  const applyDragLoop = () => {
+    const d = dragRef.current
+    const m = latestMouseRef.current
+    if (d && m) {
+      getCurrentWindow()
+        .setPosition(new PhysicalPosition(d.winX + (m.x - d.startX) * d.scale, d.winY + (m.y - d.startY) * d.scale))
+        .catch(() => {})
+    }
+    rafRef.current = requestAnimationFrame(applyDragLoop)
+  }
+
+  // WHY: Bắt đầu kéo bằng chuột PHẢI (button===2). KHÔNG dùng startDragging vì Windows
+  // chỉ kéo được khi giữ chuột TRÁI (cơ chế WM_NCLBUTTONDOWN) — chuột phải bị bỏ qua.
+  // Hướng khác: tự kéo bằng setPosition (permission allow-set-position đã có) nên hoạt
+  // động với chuột phải, không cần titlebar. Lấy vị trí cửa sổ + scale rồi chạy rAF.
   const handleRootMouseDown = (e: React.MouseEvent) => {
     if (e.button !== 2) return
     e.preventDefault()
-    try {
-      getCurrentWindow().startDragging().catch(() => {})
-    } catch {}
+    const win = getCurrentWindow()
+    Promise.all([win.outerPosition(), win.scaleFactor()])
+      .then(([pos, scale]) => {
+        dragRef.current = { startX: e.clientX, startY: e.clientY, winX: pos.x, winY: pos.y, scale }
+        latestMouseRef.current = { x: e.clientX, y: e.clientY }
+        if (rafRef.current == null) rafRef.current = requestAnimationFrame(applyDragLoop)
+      })
+      .catch(() => {})
   }
+
+  // WHY: Cập nhật vị trí chuột mới nhất trong lúc kéo — rAF loop đọc lại mỗi frame.
+  const handleRootMouseMove = (e: React.MouseEvent) => {
+    if (dragRef.current) latestMouseRef.current = { x: e.clientX, y: e.clientY }
+  }
+
+  // WHY: Kết thúc kéo khi thả chuột phải hoặc chuột rời cửa sổ — dừng rAF, xóa trạng
+  // thái để lần kéo sau bắt đầu sạch.
+  const stopDrag = () => {
+    if (rafRef.current != null) {
+      cancelAnimationFrame(rafRef.current)
+      rafRef.current = null
+    }
+    dragRef.current = null
+    latestMouseRef.current = null
+  }
+
+  // WHY: Dọn rAF khi unmount (đã đăng nhập) — tránh loop chạy trên component chết.
+  useEffect(() => () => {
+    if (rafRef.current != null) cancelAnimationFrame(rafRef.current)
+  }, [])
 
   // WHY: Click vào NỀN (gồm cả canvas tsParticles — child của .login-bg) → tạo vòng
   // sáng nổ tại vị trí chuột; click vào form/card (ngoài .login-bg) thì không. Dùng
@@ -275,9 +321,12 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
   return (
     <div
       className="h-screen flex items-center justify-center bg-slate-950 select-none overflow-hidden relative"
-      // WHY: onMouseDown bắt chuột phải để kéo cửa sổ (button===2), onContextMenu chặn
-      // menu chuột phải mặc định (nếu không, menu hiện ra ngay khi thả chuột khi kéo).
+      // WHY: Kéo tay bằng chuột phải — mousedown khởi tạo, mousemove cập nhật vị trí,
+      // mouseup/mouseleave kết thúc; onContextMenu chặn menu chuột phải mặc định.
       onMouseDown={handleRootMouseDown}
+      onMouseMove={handleRootMouseMove}
+      onMouseUp={stopDrag}
+      onMouseLeave={stopDrag}
       onContextMenu={e => e.preventDefault()}
     >
       {/* WHY: Lớp giảm sáng khi nhập mật khẩu — phủ tối + blur nhẹ toàn màn hình
