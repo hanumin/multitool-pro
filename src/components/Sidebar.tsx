@@ -1,4 +1,6 @@
 import { ModuleId, PLATFORM_MODULES, ModuleDef } from '../types'
+import type { User } from '@supabase/supabase-js'
+import UserMenu from './UserMenu'
 
 interface SidebarProps {
   activeModule: ModuleId
@@ -7,11 +9,15 @@ interface SidebarProps {
   onToggleCollapse: () => void
   statusText: string
   appVersion?: string
+  // WHY: Thông tin user đăng nhập Supabase + callback đăng xuất — để UserMenu ở góc
+  // dưới sidebar hiển thị avatar/tên và xử lý đăng xuất qua App (cập nhật state).
+  user?: User | null
+  onSignOut?: () => void
 }
 
 // WHY: Collapsed = 56px (chỉ icon), expanded = 220px (icon + label + description).
 // Dùng --bg-sidebar CSS variable để theme-aware (dark sidebar riêng biệt với main bg).
-export default function Sidebar({ activeModule, onModuleChange, collapsed, onToggleCollapse, statusText, appVersion }: SidebarProps) {
+export default function Sidebar({ activeModule, onModuleChange, collapsed, onToggleCollapse, statusText, appVersion, user, onSignOut }: SidebarProps) {
   return (
     <aside
       className="flex flex-col border-r shrink-0 select-none"
@@ -109,6 +115,10 @@ export default function Sidebar({ activeModule, onModuleChange, collapsed, onTog
           {!collapsed && <span>Thu gọn thanh menu</span>}
         </button>
       </div>
+
+      {/* WHY: Khung user (avatar + tên) ở GÓC DƯỚI CÙNG sidebar — lấy từ Supabase,
+          nhấn vào mở menu đăng xuất/đổi mật khẩu (UserMenu). Chỉ render khi có session. */}
+      {user && onSignOut && <UserMenu collapsed={collapsed} user={user} onSignOut={onSignOut} />}
     </aside>
   )
 }

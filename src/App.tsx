@@ -302,7 +302,15 @@ function App() {
       try {
         const supabase = getSupabase()
         const { data } = await supabase.auth.getSession()
-        if (!disposed) setAuthSession(data.session)
+        // WHY: Duy trì đăng nhập — nếu lần trước KHÔNG tick "Duy trì đăng nhập" thì
+        // session chỉ sống trong 1 phiên: khi mở lại app, session trong localStorage bị
+        // xóa ngay (tự đăng xuất). Tick rồi thì giữ nguyên qua các lần mở app.
+        if (data.session && localStorage.getItem('sd-remember-me') !== 'true') {
+          await supabase.auth.signOut().catch(() => {})
+          if (!disposed) setAuthSession(null)
+        } else if (!disposed) {
+          setAuthSession(data.session)
+        }
         unsub = supabase.auth.onAuthStateChange((_event, session) => {
           if (!disposed) setAuthSession(session)
         }).data.subscription.unsubscribe
@@ -490,6 +498,33 @@ function App() {
     setAuthSession(null)
     setStatusText('Đã đăng xuất')
   }
+
+  // WHY: Idle timeout — áp dụng khi user KHÔNG tick "Duy trì đăng nhập" (chuẩn bảo
+  // mật của Google/Outlook web: logout sau 30 phút không hoạt động). Bất kỳ tương tác
+  // nào (chuột/bàn phím/scroll) đều reset timer; hết hạn thì tự đăng xuất.
+  useEffect(() => {
+    if (!authSession) return
+    const remember = localStorage.getItem('sd-remember-me') === 'true'
+    if (remember) return
+    let timer: ReturnType<typeof setTimeout>
+    // WHY: Reset timer đếm ngược idle — gọi lại mỗi khi user có tương tác; hết 30 phút
+    // không hoạt động thì tự đăng xuất (đã kiểm tra remember-me ở đầu effect).
+    const reset = () => {
+      clearTimeout(timer)
+      timer = setTimeout(async () => {
+        await signOut()
+        setStatusText('Tự động đăng xuất sau 30 phút không hoạt động')
+      }, 30 * 60 * 1000)
+    }
+    const events: (keyof WindowEventMap)[] = ['mousemove', 'mousedown', 'keydown', 'wheel', 'touchstart']
+    events.forEach(ev => window.addEventListener(ev, reset))
+    reset()
+    return () => {
+      clearTimeout(timer)
+      events.forEach(ev => window.removeEventListener(ev, reset))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authSession])
 
   // WHY: Đóng popup update với animation fade-out rồi reset phase về checking cho
   // lần mở sau (tránh giữ trạng thái cũ khi mở lại popup mới). Cũng đánh dấu ref
@@ -1048,7 +1083,12 @@ function App() {
   }
 
   if (!authSession) {
-    return <LoginScreen onAuthenticated={(session) => { setAuthSession(session) }} />
+    return <LoginScreen onAuthenticated={(session, rememberMe) => {
+      // WHY: Lưu lựa chọn "Duy trì đăng nhập" vào localStorage — App đọc lại lần mở
+      // sau để quyết định giữ/xóa session và cài idle timeout (xem 2 effect trên).
+      localStorage.setItem('sd-remember-me', rememberMe ? 'true' : 'false')
+      setAuthSession(session)
+    }} />
   }
 
   if (!appReady) {
@@ -1066,6 +1106,8 @@ function App() {
         onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
         statusText={statusText}
         appVersion={appVersion}
+        user={authSession.user}
+        onSignOut={signOut}
       />
 
       {/* Main content area */}
@@ -1276,12 +1318,6 @@ function App() {
               className="hover:underline cursor-pointer font-semibold text-sky-400 hover:text-sky-300 transition-colors bg-transparent border-0 group relative">
               Giới thiệu
               <span className="tooltip-text">Thông tin tác giả & các chức năng</span>
-            </button>
-            <span style={{ color: 'var(--fg-dim)' }}>|</span>
-            <button onClick={signOut}
-              className="hover:underline cursor-pointer font-semibold text-rose-400 hover:text-rose-300 transition-colors bg-transparent border-0 group relative">
-              Đăng xuất
-              <span className="tooltip-text">{authSession?.user?.email ?? 'Thoát tài khoản hiện tại'}</span>
             </button>
           </div>
         </footer>

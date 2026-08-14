@@ -7,7 +7,9 @@ import type { Session } from '@supabase/supabase-js'
 type AuthMode = 'login' | 'register' | 'forgot'
 
 interface LoginScreenProps {
-  onAuthenticated: (session: Session) => void
+  // WHY: rememberMe quyết định session có tồn tại qua lần mở app sau hay không
+  // (xem logic duy trì đăng nhập bên dưới) — App cần biết để lưu flag + cài idle timeout.
+  onAuthenticated: (session: Session, rememberMe: boolean) => void
 }
 
 // WHY: Màn hình đăng nhập dùng Supabase Auth CHUNG của project english-topics —
@@ -22,6 +24,10 @@ export default function LoginScreen({ onAuthenticated }: LoginScreenProps) {
   const [error, setError] = useState<string | null>(null)
   const [message, setMessage] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  // WHY: Mặc định BẬT duy trì đăng nhập (chuẩn app desktop: Discord/VS Code mặc định
+  // nhớ phiên). Nếu user bỏ tick → session chỉ sống trong 1 phiên: tự đăng xuất khi
+  // đóng app và sau 30 phút không hoạt động (App.tsx chịu trách nhiệm enforce).
+  const [rememberMe, setRememberMe] = useState(true)
   const busyRef = useRef(false)
 
   // WHY: Reset trạng thái lỗi/thông báo mỗi khi chuyển chế độ — tránh lỗi cũ hiện
@@ -110,11 +116,11 @@ export default function LoginScreen({ onAuthenticated }: LoginScreenProps) {
           setConfirmPassword('')
           return
         }
-        onAuthenticated(data.session)
+        onAuthenticated(data.session, rememberMe)
       } else {
         const { data, error } = await supabase.auth.signInWithPassword({ email, password })
         if (error) throw error
-        onAuthenticated(data.session)
+        onAuthenticated(data.session, rememberMe)
       }
     } catch (err: any) {
       setError(err?.message || 'Đăng nhập thất bại')
@@ -212,6 +218,28 @@ export default function LoginScreen({ onAuthenticated }: LoginScreenProps) {
 
             {/* WHY: Chỉ hiện "Quên mật khẩu" ở chế độ login — ở register/forgot không
                 cần (forgot đang hiển thị form nhập email rồi). */}
+            {/* WHY: Checkbox duy trì đăng nhập — nằm giữa mật khẩu và nút submit ở cả
+                login lẫn register. Nếu KHÔNG tick: session bị xóa khi đóng app và tự
+                đăng xuất sau 30 phút không hoạt động (chuẩn an toàn của các app web/desktop). */}
+            {mode !== 'forgot' && (
+              <label className="flex items-center gap-2.5 cursor-pointer select-none py-0.5">
+                <input
+                  type="checkbox"
+                  checked={rememberMe}
+                  onChange={e => setRememberMe(e.target.checked)}
+                  className="w-3.5 h-3.5 rounded accent-emerald-500 cursor-pointer"
+                />
+                <span className="flex flex-col">
+                  <span className="text-xs font-medium text-slate-300">Duy trì đăng nhập</span>
+                  <span className="text-[10px] text-slate-500">
+                    {rememberMe
+                      ? 'Giữ đăng nhập giữa các lần mở ứng dụng'
+                      : 'Tự đăng xuất khi đóng ứng dụng & sau 30 phút không hoạt động'}
+                  </span>
+                </span>
+              </label>
+            )}
+
             {mode === 'login' && (
               <div className="flex justify-end -mt-1">
                 <button
