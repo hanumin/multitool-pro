@@ -121,6 +121,17 @@ const openExternal = async (url: string) => {
   window.open(url, '_blank')
 }
 
+// WHY: Cache promise getCurrentWindow — gọi dynamic import 1 lần, các lần kéo sau
+// dùng lại instance sẵn (startDragging phải được gọi ngay trong sự kiện mousedown,
+// cache giúp giảm độ trễ lần đầu).
+let dragWindowPromise: Promise<{ startDragging: () => Promise<void> }> | null = null
+const getDragWindow = () => {
+  if (!dragWindowPromise) {
+    dragWindowPromise = import('@tauri-apps/api/window').then(m => m.getCurrentWindow()) as Promise<{ startDragging: () => Promise<void> }>
+  }
+  return dragWindowPromise
+}
+
 // WHY: Màn hình đăng nhập dùng Supabase Auth CHUNG của hệ sinh thái — tài khoản do
 // trang luongphamhanhnguyen.com quản lý, mọi app (MultiTool Pro, web tiếng Anh...)
 // đăng nhập chung 1 pool users. Chỉ giữ chế độ login + quên mật khẩu (ẩn đăng ký).
@@ -165,6 +176,15 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
   // WHY: Validate email nhanh phía client trước khi gọi API (tránh request thừa).
   // Không cần validate quá chặt — Supabase tự validate lại ở server.
   const isValidEmail = (e: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)
+
+  // WHY: Nhấn GIỮ chuột phải ở BẤT KỲ ĐÂU trên màn hình login → kéo cửa sổ đi chỗ
+  // khác (Tauri startDragging — OS tự xử lý việc kéo, không cần theo dõi mousemove).
+  // Cửa sổ decorations:false không có titlebar nên không kéo được như bình thường.
+  const handleRootMouseDown = (e: React.MouseEvent) => {
+    if (e.button !== 2) return
+    e.preventDefault()
+    getDragWindow().then(w => w.startDragging()).catch(() => {})
+  }
 
   // WHY: Click vào NỀN (gồm cả canvas tsParticles — child của .login-bg) → tạo vòng
   // sáng nổ tại vị trí chuột; click vào form/card (ngoài .login-bg) thì không. Dùng
@@ -257,7 +277,13 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
     'bg-slate-800/60 border-slate-700 text-slate-100 placeholder-slate-500 focus:border-emerald-500 focus:ring-emerald-500/20'
 
   return (
-    <div className="h-screen flex items-center justify-center bg-slate-950 select-none overflow-hidden relative">
+    <div
+      className="h-screen flex items-center justify-center bg-slate-950 select-none overflow-hidden relative"
+      // WHY: onMouseDown bắt chuột phải để kéo cửa sổ (button===2), onContextMenu chặn
+      // menu chuột phải mặc định (nếu không, menu hiện ra ngay khi thả chuột khi kéo).
+      onMouseDown={handleRootMouseDown}
+      onContextMenu={e => e.preventDefault()}
+    >
       {/* WHY: Lớp giảm sáng khi nhập mật khẩu — phủ tối + blur nhẹ toàn màn hình
           ngoại trừ card đăng nhập (card z-20 nằm trên overlay z-[15]). opacity chuyển
           mượt 300ms khi focus/blur; pointer-events-none để không chặn thao tác gõ. */}
