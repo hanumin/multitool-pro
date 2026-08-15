@@ -69,6 +69,15 @@ interface PendingSize {
 
 const CHANGELOGS: ChangelogEntry[] = [
   {
+    version: '1.11.9',
+    title: 'v1.11.9 - Sửa link đặt lại mật khẩu & kiểm tra email đã đăng ký',
+    items: [
+      'Sửa email đặt lại mật khẩu: trước đây link trỏ về domain cũ đã chết (english-topics.vercel.app) nên Supabase fallback về localhost:3000 → link hỏng. Giờ trỏ đúng về trang đặt mật khẩu của web LIVE (english.luongphamhanhnguyen.com/forgot-password).',
+      'Quên mật khẩu: kiểm tra email có đăng ký tài khoản chưa — nếu chưa thì báo rõ "Email chưa đăng ký" thay vì báo gửi email thành công. (Kiểm tra qua server web, không lộ service role key của Supabase.)',
+      'Bỏ tooltip "Mở https://..." khi hover vào label đăng nhập bằng tài khoản hệ thống.',
+    ]
+  },
+  {
     version: '1.11.8',
     title: 'v1.11.8 - Popup đổi avatar gọn hơn & Cấu hình hệ thống dễ đọc',
     items: [
@@ -219,7 +228,7 @@ function App() {
   const [openPrinter, setOpenPrinter] = useState<string | null>(null)
   const [statusText, setStatusText] = useState('Sẵn sàng')
   const [autostart, setAutostart] = useState(false)
-  const [appVersion, setAppVersion] = useState('1.11.8')
+  const [appVersion, setAppVersion] = useState('1.11.9')
   const [changelogOpen, setChangelogOpen] = useState(false)
   const [changelogAnim, setChangelogAnim] = useState<'enter' | 'exit'>('enter')
   // WHY: Popup auto-update chuyên nghiệp — thay cho window.confirm cũ. Một popup duy

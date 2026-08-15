@@ -279,10 +279,13 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
         }
         const supabase = getSupabase()
         const { error } = await supabase.auth.resetPasswordForEmail(email, {
-          // WHY: Redirect về trang login web english-topics (đã cấu hình trong
-          // Supabase Dashboard) — user bấm link trong email → đặt mật khẩu mới trên
-          // web → quay lại app đăng nhập bằng mật khẩu mới.
-          redirectTo: 'https://english-topics.vercel.app/login',
+          // WHY: Redirect về trang /forgot-password của web english-topics LIVE
+          // (english.luongphamhanhnguyen.com — không phải english-topics.vercel.app
+          // đã chết 404). Trang này đọc recovery token (hash/code) và cho đặt mật
+          // khẩu mới. QUAN TRỌNG: URL này PHẢI nằm trong Redirect URLs allowlist của
+          // Supabase Dashboard, nếu không Supabase fallback về Site URL (localhost)
+          // → email gửi ra redirect_to sai như lỗi đang gặp.
+          redirectTo: 'https://english.luongphamhanhnguyen.com/forgot-password',
         })
         if (error) throw error
         setMessage(`Đã gửi email đặt lại mật khẩu đến ${email}. Vui lòng kiểm tra hộp thư.`)
