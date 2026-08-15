@@ -69,6 +69,15 @@ interface PendingSize {
 
 const CHANGELOGS: ChangelogEntry[] = [
   {
+    version: '1.11.10',
+    title: 'v1.11.10 - Thông báo chờ rate limit dễ đọc hơn & email gửi từ domain riêng',
+    items: [
+      'Quên mật khẩu: khi bị giới hạn bảo mật, thông báo giờ hiển thị thời gian chờ dạng "59 giây / 5 phút / 1 giờ" thay vì số giây thô (vd "3600 giây").',
+      'Email đặt lại mật khẩu giờ gửi từ domain riêng auth.luongphamhanhnguyen.com (qua Resend SMTP) — không còn từ noreply@supabase.co, ít vào spam hơn.',
+      'Nâng giới hạn gửi email đặt lại mật khẩu lên 60 email/giờ (trước đây 2 email/giờ).',
+    ]
+  },
+  {
     version: '1.11.9',
     title: 'v1.11.9 - Sửa link đặt lại mật khẩu & kiểm tra email đã đăng ký',
     items: [
