@@ -193,6 +193,58 @@ Pipeline CI giống hệt `build-portable.ps1`: npm build → PyInstaller → em
 
 ---
 
+## 🔐 Đăng nhập & Quản lý tài khoản (Supabase Auth)
+
+App dùng **Supabase Auth dùng chung** với hệ sinh thái (web english-topics — cùng 1 pool tài khoản). Đăng nhập 1 nơi, dùng được ở mọi nơi trong hệ sinh thái.
+
+### Kiến trúc
+
+```
+┌─────────────────────────┐        ┌──────────────────────────────┐
+│  App desktop (Tauri)     │        │  Web english-topics          │
+│  - Supabase anon key     │──auth──▶  - Supabase anon key (client) │
+│    (nhúng, public)       │        │  - SERVICE ROLE key (server)  │
+└────────────┬────────────┘        └──────────────┬───────────────┘
+             │                                    │
+             └──────────────▶  Supabase Auth (xjfttrbucggqieykjqxu)  ◀────┘
+                               • 1 pool tài khoản dùng chung
+                               • RLS bảo vệ dữ liệu từng app
+```
+
+- **URL + anon key** là PUBLIC keys (thiết kế chính thức của Supabase cho client) — an toàn khi nhúng trong app.
+- **Service role key TUYỆT ĐỐI không được nhúng vào app** — chỉ nằm trên server web (Vercel) vì nó vô hiệu hóa RLS.
+
+### Màn hình đăng nhập
+
+- **Email + mật khẩu** (có tùy chọn **Duy trì đăng nhập** — session giữ qua các lần mở app)
+- **Quên mật khẩu**: kiểm tra email đã đăng ký chưa (gọi endpoint web `POST /api/auth/check-email` — service role key nằm server-side, không lộ ra app) → email thật mới gửi link đặt lại mật khẩu
+- Avatar sidebar: nhấn vào → popup đổi avatar + đăng xuất + đổi mật khẩu
+
+### Cấu hình bắt buộc (chỉ quản trị viên làm)
+
+**1. Supabase Dashboard** → Authentication → URL Configuration:
+
+| Mục | Giá trị |
+|-----|---------|
+| Site URL | `https://english.luongphamhanhnguyen.com` |
+| Redirect URLs | `https://english.luongphamhanhnguyen.com/**` (thêm cả path `/forgot-password` nếu cần) |
+
+> ⚠️ Nếu thiếu, link đặt lại mật khẩu trong email sẽ fallback về `localhost:3000` — user không đặt lại được mật khẩu.
+
+**2. Vercel (web project) — Environment Variables (Production):**
+
+```
+NEXT_PUBLIC_SITE_URL=https://english.luongphamhanhnguyen.com
+```
+
+> Dùng cho route `POST /api/auth/forgot-password` (web) tạo link khôi phục đúng domain. Sau khi đổi env → **redeploy production**.
+
+### Thay đổi project Supabase (dùng project khác)
+
+Sửa 2 chỗ trong `src/lib/supabase.ts`: `SUPABASE_URL` + `SUPABASE_ANON_KEY`, và đổi endpoint `CHECK_EMAIL_API` trong `src/components/LoginScreen.tsx` (nếu dùng web khác).
+
+---
+
 ## 📖 Hướng dẫn sử dụng
 
 ### Bảng điều khiển (Dashboard)
