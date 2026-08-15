@@ -69,6 +69,15 @@ interface PendingSize {
 
 const CHANGELOGS: ChangelogEntry[] = [
   {
+    version: '1.11.8',
+    title: 'v1.11.8 - Popup đổi avatar gọn hơn & Cấu hình hệ thống dễ đọc',
+    items: [
+      'Popup đổi avatar: bỏ tab "Linh vật Cục bộ" và "Tự nhập" — chỉ giữ Codex Pets + Emojis (gọn, ít phức tạp hơn).',
+      'Popup Cấu hình hệ thống: menu trái sáng rõ hơn, label + icon chưa chọn đổi sang màu sáng dễ đọc (trước đây xám đậm khó nhìn).',
+      'Sửa avatar cũ dạng URL/tên file vẫn hiển thị đúng (chỉ bỏ phần chọn mới, không phá dữ liệu đã lưu).',
+    ]
+  },
+  {
     version: '1.11.7',
     title: 'v1.11.7 - Đổi avatar từ sidebar & sửa màn hình login',
     items: [
@@ -210,7 +219,7 @@ function App() {
   const [openPrinter, setOpenPrinter] = useState<string | null>(null)
   const [statusText, setStatusText] = useState('Sẵn sàng')
   const [autostart, setAutostart] = useState(false)
-  const [appVersion, setAppVersion] = useState('1.11.7')
+  const [appVersion, setAppVersion] = useState('1.11.8')
   const [changelogOpen, setChangelogOpen] = useState(false)
   const [changelogAnim, setChangelogAnim] = useState<'enter' | 'exit'>('enter')
   // WHY: Popup auto-update chuyên nghiệp — thay cho window.confirm cũ. Một popup duy

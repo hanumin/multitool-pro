@@ -173,10 +173,11 @@ export async function fetchLocalMascots(dir: string): Promise<string[]> {
 
 // WHY: Resolve 1 giá trị avatar bất kỳ → cách hiển thị (ảnh/emoji) — dùng chung cho
 // preview popup + sidebar. Thứ tự: codex:<slug> → R2; http/path → nguyên URL; tên
-// file ảnh (dog.png) → linh vật cục bộ qua backend; còn lại là emoji.
+// file ảnh (dog.png) → linh vật cục bộ qua backend (chỉ khi truyền mascotsDir —
+// popup đổi avatar đã bỏ tab Cục bộ nên gọi 1 tham số); còn lại là emoji.
 export function resolveAvatarValue(
   value: string,
-  mascotsDir: string,
+  mascotsDir: string = MASCOTS_DIR_DEFAULT,
 ): { isImage: boolean; src: string; emoji: string } {
   const trimmed = value.trim()
   const lower = trimmed.toLowerCase()

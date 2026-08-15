@@ -306,21 +306,23 @@ export default function SettingsModal({
 
         {/* Modal Main Content — Professional 2-Column Layout */}
         <div className="flex-1 min-h-0 flex overflow-hidden">
-          {/* Left Navigation Sidebar */}
-          <div className="w-56 border-r shrink-0 p-2.5 space-y-1 bg-slate-950/40 backdrop-blur-sm" style={{ borderColor: 'var(--border)' }}>
+          {/* Left Navigation Sidebar — nền sáng hơn thân modal (var(--bg-card)) và
+              label inactive màu slate-300 (thay vì slate-400/đậm) để dễ đọc — trước
+              đây menu xám đen + chữ xám đậm bị khó nhìn. */}
+          <div className="w-56 border-r shrink-0 p-2.5 space-y-1 bg-white/[0.03]" style={{ borderColor: 'var(--border)', background: 'var(--bg-card)' }}>
             <button
               onClick={() => setActiveTab('general')}
               className={`relative w-full flex items-center gap-2.5 pl-4 pr-3 py-2.5 rounded-xl text-xs font-semibold transition-all cursor-pointer border-0 text-left ${
                 activeTab === 'general'
                   ? 'bg-emerald-500/12 text-emerald-400'
-                  : 'hover:bg-white/5 text-slate-400 hover:text-slate-200'
+                  : 'hover:bg-white/10 text-slate-300 hover:text-white'
               }`}
             >
               {/* WHY: Accent bar trái khi active — kiểu VSCode settings, dễ nhận tab đang chọn */}
               {activeTab === 'general' && (
                 <span className="absolute left-0 top-1/2 -translate-y-1/2 w-0.5 h-5 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]" />
               )}
-              <span className={`w-6 h-6 rounded-lg flex items-center justify-center text-sm shrink-0 transition-colors ${activeTab === 'general' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-white/5 text-slate-400'}`}>🎛️</span>
+              <span className={`w-6 h-6 rounded-lg flex items-center justify-center text-sm shrink-0 transition-colors ${activeTab === 'general' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-white/10 text-slate-300'}`}>🎛️</span>
               <span className="truncate">Cài đặt chung</span>
             </button>
 
@@ -329,14 +331,14 @@ export default function SettingsModal({
               className={`relative w-full flex items-center justify-between pl-4 pr-3 py-2.5 rounded-xl text-xs font-semibold transition-all cursor-pointer border-0 text-left ${
                 activeTab === 'projects'
                   ? 'bg-emerald-500/12 text-emerald-400'
-                  : 'hover:bg-white/5 text-slate-400 hover:text-slate-200'
+                  : 'hover:bg-white/10 text-slate-300 hover:text-white'
               }`}
             >
               {activeTab === 'projects' && (
                 <span className="absolute left-0 top-1/2 -translate-y-1/2 w-0.5 h-5 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]" />
               )}
               <div className="flex items-center gap-2.5 truncate">
-                <span className={`w-6 h-6 rounded-lg flex items-center justify-center text-sm shrink-0 transition-colors ${activeTab === 'projects' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-white/5 text-slate-400'}`}>🖥️</span>
+                <span className={`w-6 h-6 rounded-lg flex items-center justify-center text-sm shrink-0 transition-colors ${activeTab === 'projects' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-white/10 text-slate-300'}`}>🖥️</span>
                 <span className="truncate">Máy chủ ({projects.length})</span>
               </div>
               {projects.filter(p => runningStatus[p.name]).length > 0 && (
@@ -351,13 +353,13 @@ export default function SettingsModal({
               className={`relative w-full flex items-center gap-2.5 pl-4 pr-3 py-2.5 rounded-xl text-xs font-semibold transition-all cursor-pointer border-0 text-left ${
                 activeTab === 'logColors'
                   ? 'bg-emerald-500/12 text-emerald-400'
-                  : 'hover:bg-white/5 text-slate-400 hover:text-slate-200'
+                  : 'hover:bg-white/10 text-slate-300 hover:text-white'
               }`}
             >
               {activeTab === 'logColors' && (
                 <span className="absolute left-0 top-1/2 -translate-y-1/2 w-0.5 h-5 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]" />
               )}
-              <span className={`w-6 h-6 rounded-lg flex items-center justify-center text-sm shrink-0 transition-colors ${activeTab === 'logColors' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-white/5 text-slate-400'}`}>🎨</span>
+              <span className={`w-6 h-6 rounded-lg flex items-center justify-center text-sm shrink-0 transition-colors ${activeTab === 'logColors' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-white/10 text-slate-300'}`}>🎨</span>
               <span className="truncate">Màu sắc dòng log</span>
             </button>
           </div>

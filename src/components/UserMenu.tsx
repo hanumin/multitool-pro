@@ -319,7 +319,6 @@ export default function UserMenu({ collapsed, user, onSignOut }: UserMenuProps) 
         userId={user?.id ?? ''}
         currentValue={profile?.rawAvatar ?? null}
         currentBg={avatarBg}
-        currentMascotsDir={mascotsDir}
         onClose={() => setPickerOpen(false)}
         onSaved={() => { setPickerOpen(false); loadProfile() }}
       />
