@@ -24,6 +24,12 @@ interface LoginScreenProps {
 // bấm vào dòng label dưới form đăng nhập (yêu cầu: nhấn vào mở tab mới trang này).
 const ACCOUNT_PORTAL_URL = 'https://luongphamhanhnguyen.com'
 
+// WHY: Endpoint kiểm tra email đã đăng ký chưa — nằm trên WEB PROJECT english-topics
+// (english.luongphamhanhnguyen.com) vì service role key chỉ được phép ở SERVER-SIDE
+// (app desktop phân phối công khai trên GitHub — nhúng key vào exe là lộ toàn bộ
+// Supabase). App gọi qua HTTPS, server trả { exists: true/false } (rate-limited 5/15p).
+const CHECK_EMAIL_API = 'https://english.luongphamhanhnguyen.com/api/auth/check-email'
+
 // WHY: 3 preset nền động tsParticles để user so sánh — lights (quả cầu sáng trôi),
 // network (mạng lưới điểm nối), flow (hạt sáng bay lên). Chọn qua nút nhỏ góc phải
 // dưới, lựa chọn persist localStorage.
@@ -250,6 +256,27 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
       busyRef.current = true
       setLoading(true)
       try {
+        // WHY: Kiểm tra email ĐÃ ĐĂNG KÝ chưa trước khi gửi — resetPasswordForEmail
+        // của Supabase luôn trả OK kể cả email không tồn tại (chống dò tài khoản).
+        // Gọi endpoint trên web project english-topics (service role key server-side,
+        // không lộ key ra app). Lỗi mạng/5xx/server không phản hồi → bỏ qua bước này
+        // và gửi như cũ (không chặn luồng chính — tránh chặn nhầm user hợp lệ).
+        let emailExists: boolean | null = null
+        try {
+          const res = await fetch(CHECK_EMAIL_API, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email }),
+          })
+          const data = await res.json().catch(() => null)
+          if (res.ok && data && typeof data.exists === 'boolean') emailExists = data.exists
+        } catch {
+          // WHY: Mất mạng/server chết → bỏ qua kiểm tra, vẫn gửi email.
+        }
+        if (emailExists === false) {
+          setError('Email này chưa đăng ký tài khoản trong hệ thống. Vui lòng kiểm tra lại email hoặc liên hệ quản trị viên.')
+          return
+        }
         const supabase = getSupabase()
         const { error } = await supabase.auth.resetPasswordForEmail(email, {
           // WHY: Redirect về trang login web english-topics (đã cấu hình trong
@@ -381,30 +408,35 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
             <div>
               <h1 className="text-2xl font-bold text-white tracking-tight">MultiTool Pro</h1>
               {/* WHY: "Phần mềm" (không phải "Hệ thống") — đây là phần mềm desktop,
-                  không phải trang web (yêu cầu đổi label). */}
-              <p className="text-xs text-slate-400 mt-0.5">Phần mềm Quản trị & Dịch vụ Multi-App Nội bộ</p>
+                  không phải trang web (yêu cầu đổi label). text-sm — to hơn trước
+                  (text-xs) theo yêu cầu tăng size font các label. */}
+              <p className="text-sm text-slate-300 mt-0.5">Phần mềm Quản trị & Dịch vụ Multi-App Nội bộ</p>
             </div>
           </div>
 
-          <p className="text-[13px] leading-relaxed text-slate-300 mt-4 mb-12">
+          {/* WHY: Mô tả — tăng cỡ chữ text-[13px] → text-[15px] (to hơn rõ rệt) theo
+              yêu cầu tăng size font các label; màu slate-300 sáng dễ đọc. */}
+          <p className="text-[15px] leading-relaxed text-slate-300 mt-4 mb-12">
             Một phần mềm duy nhất để quản lý toàn bộ dịch vụ trong hệ sinh thái —
             từ máy chủ, tunnel, cơ sở dữ liệu đến giám sát máy in, âm thanh và nhật ký.
           </p>
 
           {/* WHY: Grid 2 cột liệt kê tính năng — mỗi mục icon + tiêu đề + mô tả ngắn.
               (2 cột để vừa với chiều rộng panel khi giảm container xuống max-w-6xl).
-              lg:flex-1 + lg:content-between → grid chiếm nốt chiều cao còn lại của
-              panel và dàn đều các hàng (giữ panel trải bằng chiều cao frame login). */}
-          <div className="grid grid-cols-2 gap-x-8 gap-y-7 lg:flex-1 lg:content-between">
+              gap-y-2.5 (10px) + KHÔNG content-between → 6 mục xếp RẤT sát nhau (trước
+              đây content-between dàn đều theo chiều cao panel làm chúng cách xa nhau).
+              Khoảng cách mô tả → cụm tính năng vẫn là mb-12 (48px) ở <p> trên. */}
+          <div className="grid grid-cols-2 gap-x-8 gap-y-2.5 lg:flex-1">
             {FEATURES.map(f => (
               <div key={f.title} className="flex items-start gap-3">
                 <span className="w-9 h-9 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-lg shrink-0">
                   {f.icon}
                 </span>
                 <div className="min-w-0">
-                  <div className="text-xs font-semibold text-slate-200">{f.title}</div>
-                  {/* WHY: Mô tả chuyển sang màu trắng theo yêu cầu (trước đây slate-500). */}
-                  <div className="text-[11px] leading-snug text-white mt-0.5">{f.desc}</div>
+                  <div className="text-sm font-semibold text-slate-100">{f.title}</div>
+                  {/* WHY: Mô tả chuyển sang màu trắng theo yêu cầu (trước đây slate-500),
+                      tăng cỡ chữ (text-xs) cho dễ đọc theo yêu cầu. */}
+                  <div className="text-xs leading-snug text-white mt-0.5">{f.desc}</div>
                 </div>
               </div>
             ))}
@@ -423,13 +455,14 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
           </div>
 
           <div className="rounded-2xl border border-slate-800 bg-slate-900/90 backdrop-blur p-6 shadow-2xl">
-            <h2 className="text-base font-bold text-white mb-1">Đăng nhập</h2>
-            {/* WHY: Sub-label của card đăng nhập — chuyển trắng theo yêu cầu. */}
-            <p className="text-[11px] text-white mb-5">Vui lòng đăng nhập để sử dụng phần mềm</p>
+            <h2 className="text-lg font-bold text-white mb-1">Đăng nhập</h2>
+            {/* WHY: Sub-label của card đăng nhập — chuyển trắng + tăng cỡ chữ
+                (text-xs) theo yêu cầu tăng size font. */}
+            <p className="text-xs text-white mb-5">Vui lòng đăng nhập để sử dụng phần mềm</p>
 
             <form onSubmit={handleSubmit} className="space-y-3.5">
               <div>
-                <label className="block text-[11px] font-medium text-slate-400 mb-1.5">Email</label>
+                <label className="block text-xs font-medium text-slate-300 mb-1.5">Email</label>
                 <input
                   type="email"
                   value={email}
@@ -443,7 +476,7 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
 
               {mode !== 'forgot' && (
                 <div>
-                  <label className="block text-[11px] font-medium text-slate-400 mb-1.5">Mật khẩu</label>
+                  <label className="block text-xs font-medium text-slate-300 mb-1.5">Mật khẩu</label>
                   <input
                     type="password"
                     value={password}
@@ -468,8 +501,8 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
                     className="w-3.5 h-3.5 rounded accent-emerald-500 cursor-pointer"
                   />
                   <span className="flex flex-col">
-                    <span className="text-xs font-medium text-slate-300">Duy trì đăng nhập</span>
-                    <span className="text-[10px] text-white">
+                    <span className="text-sm font-medium text-slate-200">Duy trì đăng nhập</span>
+                    <span className="text-xs text-white">
                       {rememberMe
                         ? 'Giữ đăng nhập giữa các lần mở ứng dụng'
                         : 'Tự đăng xuất khi đóng ứng dụng & sau 30 phút không hoạt động'}
@@ -483,7 +516,7 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
                   <button
                     type="button"
                     onClick={() => switchMode('forgot')}
-                    className="text-[11px] font-medium text-emerald-400 hover:text-emerald-300 transition-colors bg-transparent border-0 cursor-pointer"
+                    className="text-xs font-medium text-emerald-400 hover:text-emerald-300 transition-colors bg-transparent border-0 cursor-pointer"
                   >
                     Quên mật khẩu?
                   </button>
@@ -523,7 +556,7 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
                 <button
                   type="button"
                   onClick={() => switchMode('login')}
-                  className="w-full text-[11px] font-medium text-slate-400 hover:text-slate-200 transition-colors bg-transparent border-0 cursor-pointer py-1"
+                  className="w-full text-xs font-medium text-slate-300 hover:text-slate-100 transition-colors bg-transparent border-0 cursor-pointer py-1"
                 >
                   ← Quay lại đăng nhập
                 </button>
@@ -533,24 +566,27 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
 
           {/* WHY: Label footer — nhấn vào mở trang quản lý tài khoản hệ thống bằng
               trình duyệt ngoài. Cụm domain GIỮ NGUYÊN style như label (không đậm,
-              không gạch chân, không màu) nhưng vẫn click mở trang (yêu cầu). */}
+              không gạch chân, không màu) nhưng vẫn click mở trang (yêu cầu). KHÔNG
+              có title/tooltip — user không muốn thấy "Mở https://..." khi hover. */}
           <button
             type="button"
             onClick={() => openExternal(ACCOUNT_PORTAL_URL)}
-            className="w-full text-center text-[10px] text-white hover:text-emerald-300 transition-colors bg-transparent border-0 cursor-pointer mt-5 leading-relaxed"
-            title={`Mở ${ACCOUNT_PORTAL_URL} trong trình duyệt`}
+            className="w-full text-center text-xs text-white hover:text-emerald-300 transition-colors bg-transparent border-0 cursor-pointer mt-5 leading-relaxed"
           >
             Đăng nhập bằng tài khoản của hệ thống luongphamhanhnguyen.com
           </button>
-
-          {/* WHY: Version hiển thị dưới footer login — nhỏ, mờ, không tương tác. */}
-          {appVersion && (
-            <div className="text-center text-[10px] text-slate-600 mt-1.5 select-none">
-              MultiTool Pro v{appVersion}
-            </div>
-          )}
         </div>
       </div>
+
+      {/* WHY: Version ở DƯỚI CÙNG footer màn hình login (căn giữa, sát mép dưới) theo
+          yêu cầu — trước đây nằm ngay dưới label "Đăng nhập bằng tài khoản...".
+          absolute + inset-x-0 + bottom-2.5 → luôn dính đáy màn hình dù cửa sổ to/nhỏ;
+          z-20 để nằm trên lớp giảm sáng; không tương tác (select-none + pointer-events-none). */}
+      {appVersion && (
+        <div className="absolute inset-x-0 bottom-2.5 z-20 text-center text-xs text-slate-500 select-none pointer-events-none">
+          MultiTool Pro v{appVersion}
+        </div>
+      )}
     </div>
   )
 }
