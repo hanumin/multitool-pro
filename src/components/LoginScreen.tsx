@@ -270,8 +270,25 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
           })
           const data = await res.json().catch(() => null)
           if (res.ok && data && typeof data.exists === 'boolean') emailExists = data.exists
-        } catch {
-          // WHY: Mất mạng/server chết → bỏ qua kiểm tra, vẫn gửi email.
+          else {
+            // WHY: Log chi tiết khi check-email trả về trạng thái không mong đợi
+            // (5xx/429/body lạ) — để debug nhanh khi luồng kiểm tra email không chạy.
+            console.error('[check-email] unexpected response:', res.status, data)
+          }
+        } catch (err) {
+          // WHY: Mất mạng/server chết → LOG LỖI CỤ THỂ (type/name/message) để debug
+          // fetch thất bại trong WebView2 (nguyên nhân phổ biến: chặn mạng, cert,
+          // CSP) thay vì im lặng. Vẫn KHÔNG chặn luồng chính — vẫn gửi email để
+          // không chặn nhầm user hợp lệ khi server không phản hồi.
+          console.error('[check-email] fetch failed:', err)
+          const detail =
+            err instanceof TypeError
+              ? err.message // 'Failed to fetch' / 'NetworkError...'
+              : err instanceof Error
+                ? err.message
+                : String(err)
+          setError(`Không kiểm tra được email (lỗi mạng: ${detail}). Vẫn gửi email đặt lại mật khẩu nếu tài khoản đã đăng ký.`)
+          return
         }
         if (emailExists === false) {
           setError('Email này chưa đăng ký tài khoản trong hệ thống. Vui lòng kiểm tra lại email hoặc liên hệ quản trị viên.')
@@ -290,7 +307,24 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
         if (error) throw error
         setMessage(`Đã gửi email đặt lại mật khẩu đến ${email}. Vui lòng kiểm tra hộp thư.`)
       } catch (err: any) {
-        setError(err?.message || 'Không gửi được email đặt lại mật khẩu')
+        // WHY: Lỗi Supabase Auth trả về tiếng Anh (vd "For security purposes, you
+        // can only request this after 59 seconds." — rate limit 60s/lần chống
+        // spam). Dịch các lỗi phổ biến sang tiếng Việt để user không bối rối.
+        // Rate limit TỰ HẾT sau thời gian chờ (60s hoặc 1h nếu chạm 2 email/giờ)
+        // — không phải lỗi email hay lỗi hệ thống.
+        const msg: string = err?.message || ''
+        const isRateLimit =
+          err?.status === 429 ||
+          err?.code === 'over_request_rate_limit' ||
+          /you can only request this after/i.test(msg)
+        if (isRateLimit) {
+          // WHY: Lấy số giây chờ từ thông báo gốc ("after 59 seconds") để hiển thị
+          // chính xác; không bắt được thì mặc định 60s.
+          const secs = parseInt(msg.match(/after (\d+) seconds/i)?.[1] || '60', 10)
+          setError(`Bạn đã yêu cầu gửi email đặt lại mật khẩu quá nhiều lần trong thời gian ngắn (giới hạn bảo mật). Vui lòng chờ khoảng ${secs} giây rồi thử lại.`)
+        } else {
+          setError(msg || 'Không gửi được email đặt lại mật khẩu')
+        }
       } finally {
         busyRef.current = false
         setLoading(false)
