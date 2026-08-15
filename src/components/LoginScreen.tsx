@@ -308,20 +308,26 @@ export default function LoginScreen({ onAuthenticated, appVersion }: LoginScreen
         setMessage(`Đã gửi email đặt lại mật khẩu đến ${email}. Vui lòng kiểm tra hộp thư.`)
       } catch (err: any) {
         // WHY: Lỗi Supabase Auth trả về tiếng Anh (vd "For security purposes, you
-        // can only request this after 59 seconds." — rate limit 60s/lần chống
-        // spam). Dịch các lỗi phổ biến sang tiếng Việt để user không bối rối.
-        // Rate limit TỰ HẾT sau thời gian chờ (60s hoặc 1h nếu chạm 2 email/giờ)
-        // — không phải lỗi email hay lỗi hệ thống.
+        // can only request this after 59 seconds." — rate limit chống spam). Dịch
+        // các lỗi phổ biến sang tiếng Việt để user không bối rối. Rate limit TỰ HẾT
+        // sau thời gian chờ — không phải lỗi email hay lỗi hệ thống.
         const msg: string = err?.message || ''
         const isRateLimit =
           err?.status === 429 ||
           err?.code === 'over_request_rate_limit' ||
           /you can only request this after/i.test(msg)
         if (isRateLimit) {
-          // WHY: Lấy số giây chờ từ thông báo gốc ("after 59 seconds") để hiển thị
-          // chính xác; không bắt được thì mặc định 60s.
+          // WHY: Lấy số giây chờ từ thông báo gốc ("after 59 seconds"). Supabase có
+          // thể trả 3600s (khóa 1 giờ/email khi spam quên mật khẩu liên tục) nên
+          // định dạng lại thành giờ/phút/giây cho dễ đọc thay vì "3600 giây".
           const secs = parseInt(msg.match(/after (\d+) seconds/i)?.[1] || '60', 10)
-          setError(`Bạn đã yêu cầu gửi email đặt lại mật khẩu quá nhiều lần trong thời gian ngắn (giới hạn bảo mật). Vui lòng chờ khoảng ${secs} giây rồi thử lại.`)
+          const waitText =
+            secs >= 3600
+              ? `${Math.round(secs / 3600)} giờ`
+              : secs >= 60
+                ? `${Math.round(secs / 60)} phút`
+                : `${secs} giây`
+          setError(`Bạn đã yêu cầu gửi email đặt lại mật khẩu quá nhiều lần trong thời gian ngắn (giới hạn bảo mật). Vui lòng chờ khoảng ${waitText} rồi thử lại.`)
         } else {
           setError(msg || 'Không gửi được email đặt lại mật khẩu')
         }
