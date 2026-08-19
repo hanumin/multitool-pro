@@ -1,5 +1,9 @@
 # Server Dashboard — Handoff cho Agent tiếp theo
 
+## Phát triển với Freebuff
+
+Dự án này được phát triển với sự hỗ trợ của **Freebuff** (AI coding agent). Chủ repo là nhà khoa học, không phải developer chuyên nghiệp — workflow chính là **mô tả vấn đề/workflow muốn giải quyết** → Freebuff chuyển thành code, debug, refactor và tích hợp. Trước Freebuff, dự án từng dùng Claude, Codex và Antigravity. Khi nhận việc, hãy ưu tiên đọc kỹ yêu cầu từ chủ repo thay vì tự suy diễn chi tiết triển khai.
+
 ## Tổng quan
 App Tauri v2 (Rust) + React (Vite, TypeScript, Tailwind v4) + Flask backend.
 Quản lý nhiều dev server (Next.js, Node.js) từ system tray Windows.
